@@ -1,3 +1,9 @@
+import {
+  isBitcoinChainId,
+  isDashChainId,
+  isPearlChainId,
+  isZcashChainId
+} from './registry/chain-ids'
 import { parseChainId } from './registry'
 
 const CHAIN_ENDPOINT_SETTINGS_SCHEMA_VERSION = 1 as const
@@ -5,6 +11,7 @@ const CHAIN_ENDPOINT_SETTINGS_SCHEMA_VERSION = 1 as const
 export type ChainRpcProtocol =
   | 'evm-json-rpc'
   | 'bitcoin-esplora'
+  | 'dash-insight'
   | 'pearl-blockbook'
   | 'pearl-json-rpc'
   | 'zcash-lightwalletd'
@@ -12,6 +19,7 @@ export type ChainRpcProtocol =
   | 'tron-http-api'
   | 'near-json-rpc'
   | 'quantus-json-rpc'
+  | 'starknet-json-rpc'
 
 export interface CustomChainRpcEndpoint {
   readonly protocol: ChainRpcProtocol
@@ -92,11 +100,15 @@ export function getChainEndpointRuntimeKey(settings: ChainEndpointSettings): str
 const RPC_PROTOCOLS = new Set<ChainRpcProtocol>([
   'evm-json-rpc',
   'bitcoin-esplora',
+  'dash-insight',
+  'pearl-blockbook',
+  'pearl-json-rpc',
   'zcash-lightwalletd',
   'solana-json-rpc',
   'tron-http-api',
   'near-json-rpc',
-  'quantus-json-rpc'
+  'quantus-json-rpc',
+  'starknet-json-rpc'
 ])
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/
 
@@ -219,6 +231,8 @@ function protocolForChainId(chainId: string): ChainRpcProtocol {
       return 'near-json-rpc'
     case 'quantus':
       return 'quantus-json-rpc'
+    case 'starknet':
+      return 'starknet-json-rpc'
     default:
       throw new Error('Unsupported custom RPC chain namespace')
   }
@@ -234,14 +248,22 @@ function parseChainEndpointOverride(value: unknown): ChainEndpointOverride {
   }
   let rpc: CustomChainRpcEndpoint | undefined
   if (value.rpc !== undefined) {
-    const expected = chainId.startsWith('bip122:') ? undefined : protocolForChainId(chainId)
+    const registeredBip122 =
+      isBitcoinChainId(chainId) ||
+      isZcashChainId(chainId) ||
+      isDashChainId(chainId) ||
+      isPearlChainId(chainId)
+    const expected =
+      registeredBip122 || chainId.startsWith('bip122:') ? undefined : protocolForChainId(chainId)
     rpc = parseRpcEndpoint(value.rpc, expected)
     if (
-      chainId.startsWith('bip122:') &&
-      rpc.protocol !== 'bitcoin-esplora' &&
-      rpc.protocol !== 'zcash-lightwalletd' &&
-      rpc.protocol !== 'pearl-blockbook' &&
-      rpc.protocol !== 'pearl-json-rpc'
+      isDashChainId(chainId)
+        ? rpc.protocol !== 'dash-insight'
+        : chainId.startsWith('bip122:') &&
+          rpc.protocol !== 'bitcoin-esplora' &&
+          rpc.protocol !== 'zcash-lightwalletd' &&
+          rpc.protocol !== 'pearl-blockbook' &&
+          rpc.protocol !== 'pearl-json-rpc'
     ) {
       throw new Error('Invalid BIP-122 RPC protocol')
     }

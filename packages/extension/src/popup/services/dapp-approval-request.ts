@@ -21,6 +21,9 @@ const SUPPORTED_APPROVAL_ACTIONS = [
   'bitcoinConnect',
   'bitcoinTransaction',
   'bitcoinMessage',
+  'dashConnect',
+  'dashTransaction',
+  'dashMessage',
   'pearlConnect',
   'pearlTransaction',
   'pearlMessage',
@@ -32,7 +35,10 @@ const SUPPORTED_APPROVAL_ACTIONS = [
   'solanaMessage',
   'nearConnect',
   'nearTransaction',
-  'nearMessage'
+  'nearMessage',
+  'starknetConnect',
+  'starknetTransaction',
+  'starknetMessage'
 ] as const
 
 export type DAppApprovalAction = (typeof SUPPORTED_APPROVAL_ACTIONS)[number]

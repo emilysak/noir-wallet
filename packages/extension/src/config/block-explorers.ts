@@ -64,6 +64,22 @@ export const CHAIN_BLOCK_EXPLORER_ALTERNATIVES: Readonly<
   [BITCOIN_CHAIN_IDS.testnet]: [
     { label: 'Blockstream', baseUrl: 'https://blockstream.info/testnet', transactionPath: 'tx' }
   ],
+  [DASH_CHAIN_IDS.mainnet]: [
+    {
+      label: 'Blockexplorer.one',
+      baseUrl: DASH_NETWORKS.mainnet.explorerBaseUrl,
+      transactionPath: DASH_NETWORKS.mainnet.transactionExplorerPath,
+      addressPath: DASH_NETWORKS.mainnet.addressExplorerPath
+    }
+  ],
+  [DASH_CHAIN_IDS.testnet]: [
+    {
+      label: 'Blockexplorer.one',
+      baseUrl: DASH_NETWORKS.testnet.explorerBaseUrl,
+      transactionPath: DASH_NETWORKS.testnet.transactionExplorerPath,
+      addressPath: DASH_NETWORKS.testnet.addressExplorerPath
+    }
+  ],
   [SOLANA_NETWORKS.mainnet.chainId]: [
     { label: 'Solana Explorer', baseUrl: 'https://explorer.solana.com', transactionPath: 'tx' }
   ],
@@ -78,6 +94,8 @@ export const CHAIN_BLOCK_EXPLORER_ALTERNATIVES: Readonly<
       addressPath: 'account'
     }
   ],
+  [STARKNET_NETWORKS.mainnet.chainId]: STARKNET_NETWORKS.mainnet.alternateExplorers,
+  [STARKNET_NETWORKS.testnet.chainId]: STARKNET_NETWORKS.testnet.alternateExplorers,
   'eip155:1': [
     { label: 'Blockscout', baseUrl: 'https://eth.blockscout.com', transactionPath: 'tx' }
   ],
@@ -115,5 +133,5 @@ export const CHAIN_BLOCK_EXPLORER_ALTERNATIVES: Readonly<
     }
   ]
 }
-import { BITCOIN_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
-import { SOLANA_NETWORKS } from './networks'
+import { BITCOIN_CHAIN_IDS, DASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
+import { DASH_NETWORKS, SOLANA_NETWORKS, STARKNET_NETWORKS } from './networks'

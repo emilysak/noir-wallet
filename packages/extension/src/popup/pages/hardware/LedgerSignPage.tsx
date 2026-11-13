@@ -123,7 +123,16 @@ export function LedgerSignPage() {
       }
       setStep('success')
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Ledger signing failed')
+      const message = cause instanceof Error ? cause.message : 'Ledger signing failed'
+      if (view.request.kind === 'dash-message' || view.request.kind === 'dash-psbt') {
+        await cancelLedgerSigningView(view, message).then(
+          () => {
+            terminal.current = true
+          },
+          () => {}
+        )
+      }
+      setError(message)
       setStep('error')
     } finally {
       signing.current = false
@@ -182,6 +191,15 @@ export function LedgerSignPage() {
               {view.request.kind === 'bip322-simple' && (
                 <p className="text-sm text-muted">
                   Your Ledger will display a zero-amount transaction for this message signature.
+                </p>
+              )}
+              {(view.request.kind === 'starknet-invoke' ||
+                view.request.kind === 'starknet-deploy-account' ||
+                view.request.kind === 'starknet-typed-data') && (
+                <p className="text-sm text-muted">
+                  {view.request.blindSigning
+                    ? 'This request needs blind signing on the Starknet app. Arbitrary calls, USDC transfers, and SNIP-12 signatures are not clear-signed. A single STRK, ETH, or USDT transfer does not need blind signing.'
+                    : 'This STRK, ETH, or USDT transfer is clear-signed. Arbitrary calls, USDC transfers, and SNIP-12 signatures need blind signing on the device.'}
                 </p>
               )}
             </>

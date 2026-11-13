@@ -428,12 +428,20 @@ test.describe('Runtime message security', () => {
         request: { method: 'signMessage', params: ['hello', 'bip322-simple'] }
       })
     ).toMatchObject({ chainId: 'pearl', request: { method: 'signMessage' } })
-    expect(() =>
+    expect(
       parseDAppRuntimeRequestMessage({
         type: 'DAPP_REQUEST',
         requestId: 'request-3q',
         chainId: 'pearl',
         request: { method: 'signPsbt', params: ['70736274ff'] }
+      })
+    ).toMatchObject({ chainId: 'pearl', request: { method: 'signPsbt' } })
+    expect(() =>
+      parseDAppRuntimeRequestMessage({
+        type: 'DAPP_REQUEST',
+        requestId: 'request-3r',
+        chainId: 'pearl',
+        request: { method: 'eth_accounts' }
       })
     ).toThrow(/provider/i)
     expect(
@@ -968,6 +976,21 @@ test.describe('Runtime message security', () => {
         displayName: 'Imported NEAR Wallet'
       })
     ).toMatchObject({ type: 'IMPORT_PRIVATE_KEY_WALLET', chainFamily: 'near' })
+    expect(
+      parseTrustedExtensionRuntimeMessage({
+        type: 'IMPORT_PRIVATE_KEY_WALLET',
+        privateKey: 'X' + '1'.repeat(51),
+        chainFamily: 'dash',
+        displayName: 'Imported Dash Wallet'
+      })
+    ).toMatchObject({ type: 'IMPORT_PRIVATE_KEY_WALLET', chainFamily: 'dash' })
+    expect(() =>
+      parseTrustedExtensionRuntimeMessage({
+        type: 'PREVIEW_PRIVATE_KEY_WALLET',
+        privateKey: '1'.repeat(64),
+        chainFamily: 'tron'
+      })
+    ).toThrow(/schema/i)
     expect(() =>
       parseTrustedExtensionRuntimeMessage({
         type: 'PREVIEW_PRIVATE_KEY_WALLET',
@@ -1756,5 +1779,37 @@ test.describe('Runtime message security', () => {
         request: { ...request, appFees: [{ recipient: 'forged', fee: 20 }] }
       })
     ).toThrow(/schema/i)
+  })
+
+  test('accepts a Starknet Ledger address request only from an extension page', () => {
+    const message = {
+      type: 'COMPUTE_STARKNET_LEDGER_ADDRESS',
+      publicKey: '0x1'
+    }
+    const connectUrl = `chrome-extension://${extensionId}/index.html#/hardware/ledger-connect`
+    expect(parseTrustedExtensionRuntimeMessage(message)).toEqual(message)
+    expect(() =>
+      parseTrustedExtensionRuntimeMessage({ ...message, publicKey: 'not-a-felt' })
+    ).toThrow(/schema/i)
+    expect(() => parseTrustedExtensionRuntimeMessage({ ...message, seed: 'secret' })).toThrow(
+      /schema/i
+    )
+    expect(
+      isTrustedRuntimeMessageSender(message.type, { id: extensionId, url: connectUrl }, extensionId)
+    ).toBe(true)
+    expect(
+      isOwnExtensionRouteSender(
+        { id: extensionId, url: connectUrl },
+        extensionId,
+        '/hardware/ledger-connect'
+      )
+    ).toBe(true)
+    expect(
+      isTrustedRuntimeMessageSender(
+        message.type,
+        { id: extensionId, url: 'https://dapp.example/' },
+        extensionId
+      )
+    ).toBe(false)
   })
 })

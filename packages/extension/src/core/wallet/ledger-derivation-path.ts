@@ -110,6 +110,23 @@ export function validateLedgerSolanaDerivationPath(path: string): string {
   return path
 }
 
+export function ledgerDashDerivationPath(accountIndex: number): string {
+  return `m/44'/5'/${index(accountIndex)}'`
+}
+
+export function validateLedgerDashDerivationPath(path: string): string {
+  const parts = components(path, 'Dash')
+  if (
+    parts.length !== 3 ||
+    parts[0] !== "44'" ||
+    parts[1] !== "5'" ||
+    !/^(?:0|[1-9][0-9]*)'$/.test(parts[2])
+  ) {
+    throw new Error('Unsupported Ledger Dash derivation path')
+  }
+  return path
+}
+
 export function validateLedgerNearDerivationPath(path: string): string {
   const parts = components(path, 'NEAR')
   if (
@@ -121,4 +138,29 @@ export function validateLedgerNearDerivationPath(path: string): string {
     throw new Error('Invalid Ledger NEAR derivation path')
   }
   return path
+}
+
+export function validateLedgerStarknetDerivationPath(path: string): string {
+  const parts = components(path, 'Starknet')
+  const index = parts[5]
+  if (
+    parts.length !== 6 ||
+    parts[0] !== "2645'" ||
+    parts[1] !== "1195502025'" ||
+    parts[2] !== "1148870696'" ||
+    parts[3] !== "0'" ||
+    parts[4] !== "0'" ||
+    index === undefined ||
+    !/^(?:0|[1-9][0-9]*)$/.test(index)
+  ) {
+    throw new Error('Invalid Ledger Starknet derivation path')
+  }
+  return path
+}
+
+export function ledgerStarknetDerivationPath(index: number): string {
+  if (!Number.isSafeInteger(index) || index < 0 || index > MAX_INDEX) {
+    throw new Error('Invalid Ledger derivation index')
+  }
+  return `m/2645'/1195502025'/1148870696'/0'/0'/${index}`
 }

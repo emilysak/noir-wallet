@@ -5,8 +5,18 @@ import type {
   PearlBip322MessageSummary,
   PearlPsbtSummary,
   QuantusTransferSummary,
-  SigningSummary
+  SigningSummary,
+  StarknetCallSummary,
+  StarknetDeployAccountSummary,
+  StarknetInvokeSummary,
+  StarknetResourceBoundsSummary,
+  StarknetTypedDataSummary
 } from '@/core/keyring/domain'
+import type {
+  DashMessageSummary,
+  DashOutputSummary,
+  DashPsbtSummary
+} from '@/core/keyring/domain/signing-summary'
 import {
   bitcoinMessageReview,
   bitcoinPsbtReview,
@@ -23,8 +33,11 @@ import {
 } from './signing-summary-review-model-other'
 import { tronMessageReview, tronTransactionReview } from './signing-summary-review-model-tron'
 import {
+  canonicalContentRows,
+  completeReviewModel,
   reviewRow,
   type SigningSummaryReviewModel,
+  type SigningSummaryReviewRow,
   type SigningSummaryReviewSection
 } from './signing-summary-review-model-types'
 
@@ -60,6 +73,61 @@ function pearlReview(
       }
     ]
   }
+}
+
+function dashAmount(duffs: string): string {
+  return `${duffs} duffs`
+}
+
+function dashOutputRows(
+  label: 'Recipient' | 'Change' | 'Unclassified output',
+  output: DashOutputSummary
+): readonly SigningSummaryReviewRow[] {
+  return [
+    reviewRow(label, output.address ?? 'Unknown', { code: true, breakAll: true }),
+    reviewRow(label === 'Change' ? 'Change amount' : 'Amount', dashAmount(output.amountDuffs), {
+      code: true
+    })
+  ]
+}
+
+function dashPsbtReview(summary: DashPsbtSummary): SigningSummaryReviewModel {
+  const recipients = summary.fields.outputs.filter(output => output.classification === 'recipient')
+  const change = summary.fields.outputs.filter(output => output.classification === 'change')
+  const unclassified = summary.fields.outputs.filter(output => output.classification === 'unknown')
+  return completeReviewModel(summary, {
+    title: 'Sign Dash transaction',
+    description:
+      'Review the recipient, amount, fee, and change. Dash transfers are visible on-chain.',
+    sections: [
+      {
+        title: 'Transaction',
+        rows: [
+          reviewRow('Signer', summary.fields.signer, { code: true, breakAll: true }),
+          ...recipients.flatMap(output => dashOutputRows('Recipient', output)),
+          reviewRow('Total fee', dashAmount(summary.fields.feeDuffs), { code: true }),
+          ...change.flatMap(output => dashOutputRows('Change', output)),
+          ...unclassified.flatMap(output => dashOutputRows('Unclassified output', output))
+        ]
+      }
+    ]
+  })
+}
+
+function dashMessageReview(summary: DashMessageSummary): SigningSummaryReviewModel {
+  return completeReviewModel(summary, {
+    title: 'Sign Dash message',
+    description: 'This signature proves control of the selected Dash address.',
+    sections: [
+      {
+        title: 'Message',
+        rows: [
+          reviewRow('Address', summary.fields.signer, { code: true, breakAll: true }),
+          ...canonicalContentRows('Content', summary.fields.message)
+        ]
+      }
+    ]
+  })
 }
 
 function issueDescription(code: string): { title: string; description: string } {
@@ -164,6 +232,10 @@ export function buildSigningSummaryReviewModel(
     case 'pearl.psbt.v1':
     case 'pearl.bip322-message.v1':
       return pearlReview(summary)
+    case 'dash.psbt.v1':
+      return dashPsbtReview(summary)
+    case 'dash.message.v1':
+      return dashMessageReview(summary)
     case 'solana.transaction.v1':
       return solanaTransactionReview(summary)
     case 'solana.message.v1':
@@ -178,9 +250,104 @@ export function buildSigningSummaryReviewModel(
       return nearMessageReview(summary)
     case 'quantus.transfer.v1':
       return quantusTransactionReview(summary)
+    case 'starknet.invoke.v1':
+      return starknetInvokeReview(summary)
+    case 'starknet.deploy-account.v1':
+      return starknetDeployAccountReview(summary)
+    case 'starknet.typed-data.v1':
+      return starknetTypedDataReview(summary)
     default:
       return assertNever(summary)
   }
+}
+
+function starknetBoundRows(
+  bounds: StarknetResourceBoundsSummary
+): readonly SigningSummaryReviewRow[] {
+  return (['l1Gas', 'l2Gas', 'l1DataGas'] as const).flatMap(name => [
+    reviewRow(`${name} max amount`, bounds[name].maxAmount, { code: true }),
+    reviewRow(`${name} max price`, bounds[name].maxPricePerUnit, { code: true })
+  ])
+}
+
+function starknetCallRows(
+  calls: readonly StarknetCallSummary[]
+): readonly SigningSummaryReviewRow[] {
+  return calls.flatMap((call, index) => [
+    reviewRow(`Call ${index + 1} contract`, call.to, { code: true, breakAll: true }),
+    reviewRow(`Call ${index + 1} selector`, call.selector, { code: true, breakAll: true }),
+    reviewRow(`Call ${index + 1} calldata count`, String(call.calldata.length), { code: true })
+  ])
+}
+
+function starknetInvokeReview(summary: StarknetInvokeSummary): SigningSummaryReviewModel {
+  return completeReviewModel(summary, {
+    title: 'Sign Starknet transaction',
+    description:
+      'Each call is unrecognized. Verify the destination and calldata before continuing.',
+    sections: [
+      {
+        title: 'Transaction',
+        rows: [
+          reviewRow('Sender', summary.fields.senderAddress, { code: true, breakAll: true }),
+          reviewRow('Nonce', summary.fields.nonce, { code: true, breakAll: true }),
+          reviewRow('Tip', summary.fields.tip, { code: true }),
+          reviewRow('Nonce data', summary.fields.nonceDataAvailabilityMode),
+          reviewRow('Fee data', summary.fields.feeDataAvailabilityMode),
+          ...starknetBoundRows(summary.fields.resourceBounds)
+        ]
+      },
+      {
+        title: `Calls (${summary.fields.calls.length})`,
+        rows: starknetCallRows(summary.fields.calls)
+      }
+    ]
+  })
+}
+
+function starknetDeployAccountReview(
+  summary: StarknetDeployAccountSummary
+): SigningSummaryReviewModel {
+  return completeReviewModel(summary, {
+    title: 'Deploy Starknet account',
+    description: 'This creates a new account contract. Verify the class hash and constructor data.',
+    sections: [
+      {
+        title: 'Account',
+        rows: [
+          reviewRow('Contract', summary.fields.contractAddress, { code: true, breakAll: true }),
+          reviewRow('Class hash', summary.fields.classHash, { code: true, breakAll: true }),
+          reviewRow('Salt', summary.fields.salt, { code: true, breakAll: true }),
+          reviewRow('Constructor calldata', summary.fields.constructorCalldata.join(', '), {
+            code: true,
+            breakAll: true
+          }),
+          reviewRow('Nonce', summary.fields.nonce, { code: true, breakAll: true }),
+          reviewRow('Tip', summary.fields.tip, { code: true }),
+          reviewRow('Nonce data', summary.fields.nonceDataAvailabilityMode),
+          reviewRow('Fee data', summary.fields.feeDataAvailabilityMode),
+          ...starknetBoundRows(summary.fields.resourceBounds)
+        ]
+      }
+    ]
+  })
+}
+
+function starknetTypedDataReview(summary: StarknetTypedDataSummary): SigningSummaryReviewModel {
+  return completeReviewModel(summary, {
+    title: 'Sign Starknet typed data',
+    description: 'The message contents are opaque. Read the full typed data before continuing.',
+    sections: [
+      {
+        title: 'Typed data',
+        rows: [
+          reviewRow('Account', summary.fields.accountAddress, { code: true, breakAll: true }),
+          reviewRow('Public key', summary.fields.publicKey, { code: true, breakAll: true }),
+          ...canonicalContentRows('Content', summary.fields.typedData)
+        ]
+      }
+    ]
+  })
 }
 
 export type {

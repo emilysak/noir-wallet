@@ -184,7 +184,59 @@ export interface RawWalletEngine {
   prepareQuantusCall(sessionId: number, request: unknown): unknown
   prepareQuantusTransfer(sessionId: number, request: unknown): unknown
   confirmQuantusCall(sessionId: number, requestId: number): unknown
+  deriveStarknetAccount(
+    sessionId: number,
+    chainId: string,
+    accountIndex: number,
+    addressIndex: number,
+    classHash: string
+  ): unknown
+  prepareStarknetInvoke(sessionId: number, requestJson: string): unknown
+  confirmStarknetInvoke(sessionId: number, requestId: number): unknown
+  prepareStarknetDeployAccount(sessionId: number, requestJson: string): unknown
+  confirmStarknetDeployAccount(sessionId: number, requestId: number): unknown
+  prepareStarknetTypedData(sessionId: number, requestJson: string): unknown
+  confirmStarknetTypedData(sessionId: number, requestId: number): unknown
+  computeStarknetAccountAddress(requestJson: string): unknown
+  prepareStarknetInvokeExternal(requestJson: string): unknown
+  assembleStarknetInvokeExternal(requestJson: string): unknown
+  prepareStarknetDeployAccountExternal(requestJson: string): unknown
+  assembleStarknetDeployAccountExternal(requestJson: string): unknown
+  hashStarknetTypedData(requestJson: string): unknown
+  verifyStarknetSignature(requestJson: string): unknown
   verifyBitcoinMessage(
+    chainId: string,
+    address: string,
+    message: Uint8Array,
+    signature: string
+  ): boolean
+  deriveDashAccount(
+    sessionId: number,
+    chainId: string,
+    accountIndex: number,
+    change: boolean,
+    addressIndex: number
+  ): unknown
+  deriveDashAccounts(
+    sessionId: number,
+    chainId: string,
+    accountIndex: number,
+    change: boolean,
+    startAddressIndex: number,
+    count: number
+  ): unknown
+  prepareDashPsbt(sessionId: number, chainId: string, accountIndex: number, psbt: string): unknown
+  confirmDashPsbt(sessionId: number, requestId: number): unknown
+  prepareDashMessage(
+    sessionId: number,
+    chainId: string,
+    accountIndex: number,
+    change: boolean,
+    addressIndex: number,
+    message: Uint8Array
+  ): unknown
+  confirmDashMessage(sessionId: number, requestId: number): unknown
+  verifyDashMessage(
     chainId: string,
     address: string,
     message: Uint8Array,
@@ -366,6 +418,7 @@ export function parseRawEncryptedVault(value: unknown): RawEncryptedVault {
   const memoryKib = readSafeInteger(params.memoryKib, 'EncryptedVault.kdfParams.memoryKib')
   const iterations = readSafeInteger(params.iterations, 'EncryptedVault.kdfParams.iterations')
   const parallelism = readSafeInteger(params.parallelism, 'EncryptedVault.kdfParams.parallelism')
+  // Existing vaults use 19 MiB and 2 iterations. New wallets use version 2 with 64 MiB and 3 iterations.
   const legacyKdf = memoryKib === 19 * 1024 && iterations === 2
   const currentKdf = memoryKib === 64 * 1024 && iterations === 3
   if (parallelism !== 1 || (!legacyKdf && !(version === 2 && currentKdf))) {

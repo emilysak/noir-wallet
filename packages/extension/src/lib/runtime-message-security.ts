@@ -4,6 +4,7 @@ import {
   type BitcoinDAppRuntimeMethod
 } from '@/core/dapp/bitcoin-provider'
 import { PEARL_DAPP_RUNTIME_METHODS, type PearlDAppRuntimeMethod } from '@/core/dapp/pearl-provider'
+import { DASH_DAPP_RUNTIME_METHODS, type DashDAppRuntimeMethod } from '@/core/dapp/dash-provider'
 import {
   QUANTUS_DAPP_RUNTIME_METHODS,
   type QuantusDAppRuntimeMethod
@@ -15,6 +16,10 @@ import {
   type NativeTransferDAppRuntimeMethod,
   type SolanaDAppRuntimeMethod
 } from '@/core/dapp/native-transfer-provider'
+import {
+  STARKNET_DAPP_RUNTIME_METHODS,
+  type StarknetDAppRuntimeMethod
+} from '@/core/dapp/starknet-provider'
 import { CAIP25_RUNTIME_METHODS, type Caip25RuntimeMethod } from '@/core/dapp/caip25'
 import {
   RHEA_SWAP_CHAIN_CATALOG,
@@ -60,10 +65,12 @@ export const DAPP_RUNTIME_METHODS = Object.freeze([
   ...ZCASH_DAPP_RUNTIME_METHODS,
   ...EVM_DAPP_RUNTIME_METHODS,
   ...BITCOIN_DAPP_RUNTIME_METHODS,
+  ...DASH_DAPP_RUNTIME_METHODS,
   ...PEARL_DAPP_RUNTIME_METHODS,
   ...QUANTUS_DAPP_RUNTIME_METHODS,
   ...SOLANA_DAPP_RUNTIME_METHODS,
   ...NEAR_DAPP_RUNTIME_METHODS,
+  ...STARKNET_DAPP_RUNTIME_METHODS,
   ...CAIP25_RUNTIME_METHODS
 ] as const)
 
@@ -72,11 +79,13 @@ export type DAppRuntimeMethod =
   | ZcashDAppRuntimeMethod
   | EvmDAppRuntimeMethod
   | BitcoinDAppRuntimeMethod
+  | DashDAppRuntimeMethod
   | PearlDAppRuntimeMethod
   | QuantusDAppRuntimeMethod
   | NativeTransferDAppRuntimeMethod
   | SolanaDAppRuntimeMethod
   | NearDAppRuntimeMethod
+  | StarknetDAppRuntimeMethod
   | Caip25RuntimeMethod
 
 export interface DAppRuntimeRequestMessage {
@@ -86,10 +95,12 @@ export interface DAppRuntimeRequestMessage {
     | 'zcash'
     | 'evm'
     | 'bitcoin'
-    | 'pearl'
-    | 'quantus'
+    | 'dash'
     | 'solana'
     | 'near'
+    | 'pearl'
+    | 'quantus'
+    | 'starknet'
     | 'multichain'
   readonly siteMetadata?: {
     readonly faviconUrl: string
@@ -119,10 +130,12 @@ export interface NoirRuntimeEventMessage {
     | 'zcash'
     | 'evm'
     | 'bitcoin'
-    | 'pearl'
-    | 'quantus'
+    | 'dash'
     | 'solana'
     | 'near'
+    | 'pearl'
+    | 'quantus'
+    | 'starknet'
     | 'multichain'
   readonly eventName:
     | 'accountsChanged'
@@ -195,6 +208,8 @@ const isFiniteNumber: RuntimeFieldValidator = value =>
 const isNullableNumber: RuntimeFieldValidator = value => value === null || isFiniteNumber(value)
 const isShortString: RuntimeFieldValidator = value =>
   typeof value === 'string' && value.length > 0 && value.length <= 4_096
+const isStarknetFelt: RuntimeFieldValidator = value =>
+  typeof value === 'string' && /^0x[0-9a-fA-F]{1,64}$/.test(value)
 const isWalletBackupVerification: RuntimeFieldValidator = value => {
   if (!isRuntimeRecord(value) || !hasExactRuntimeKeys(value, ['wordIndices', 'words'])) return false
   const { wordIndices, words } = value
@@ -331,7 +346,8 @@ const isPrivateKeyChainFamily: RuntimeFieldValidator = value =>
   value === 'bip122' ||
   value === 'pearl' ||
   value === 'solana' ||
-  value === 'near'
+  value === 'near' ||
+  value === 'dash'
 const isBitcoinAddressType: RuntimeFieldValidator = value =>
   value === 'p2pkh' || value === 'p2sh-p2wpkh' || value === 'p2wpkh' || value === 'p2tr'
 const isBirthdayHeight: RuntimeFieldValidator = value =>
@@ -529,9 +545,13 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
     }
   },
   GET_LEDGER_PROVISIONING_CREDENTIAL: { required: { walletId: isShortString } },
+  COMPUTE_STARKNET_LEDGER_ADDRESS: { required: { publicKey: isStarknetFelt } },
   GET_LEDGER_SIGNING_REQUEST: { required: { requestId: isShortString } },
   SUBMIT_LEDGER_SIGNING_RESPONSE: { required: { requestId: isShortString, response: isRecord } },
-  CANCEL_LEDGER_SIGNING_REQUEST: { required: { requestId: isShortString } },
+  CANCEL_LEDGER_SIGNING_REQUEST: {
+    required: { requestId: isShortString },
+    optional: { reason: isShortString }
+  },
   GET_HARDWARE_TRANSFER_VENDOR: {
     required: {
       transactionId: isShortString,
@@ -757,6 +777,14 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
   },
   REJECT_NEAR_TRANSFER: { required: { transactionId: isShortString } },
   RESUME_NEAR_TRANSFER: { required: { transactionId: isShortString } },
+  PREPARE_STARKNET_TRANSFER: { required: { intent: isRecord } },
+  QUOTE_STARKNET_TRANSFER_MAX: { required: { intent: isRecord } },
+  GET_PENDING_STARKNET_TRANSFER: { required: { transactionId: isShortString } },
+  APPROVE_STARKNET_TRANSFER: {
+    required: { transactionId: isShortString, payloadFingerprint: isEvmPayloadFingerprint }
+  },
+  REJECT_STARKNET_TRANSFER: { required: { transactionId: isShortString } },
+  RESUME_STARKNET_TRANSFER: { required: { transactionId: isShortString } },
   PREPARE_BITCOIN_TRANSFER: {
     required: { intent: isRecord },
     optional: {
@@ -794,6 +822,14 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
   },
   REJECT_PEARL_TRANSFER: { required: { transactionId: isShortString } },
   RESUME_PEARL_TRANSFER: { required: { transactionId: isShortString } },
+  PREPARE_DASH_TRANSFER: { required: { intent: isRecord } },
+  GET_PENDING_DASH_TRANSFER: { required: { transactionId: isShortString } },
+  APPROVE_DASH_TRANSFER: {
+    required: { transactionId: isShortString, payloadFingerprint: isEvmPayloadFingerprint }
+  },
+  REJECT_DASH_TRANSFER: { required: { transactionId: isShortString } },
+  RESUME_DASH_TRANSFER: { required: { transactionId: isShortString } },
+  REFRESH_DASH_TRANSFER_STATUS: { required: { transactionId: isShortString } },
   INSPECT_NEXT_ZCASH_ACCOUNT_HISTORY: {
     required: { walletId: isShortString }
   },
@@ -951,6 +987,7 @@ const TRUSTED_RUNTIME_CONTEXTS: Readonly<Record<string, readonly OwnExtensionSen
     PROVISION_KEYSTONE_HARDWARE: ['extension-page'],
     PROVISION_LEDGER_HARDWARE: ['extension-page'],
     GET_LEDGER_PROVISIONING_CREDENTIAL: ['extension-page'],
+    COMPUTE_STARKNET_LEDGER_ADDRESS: ['extension-page'],
     GET_LEDGER_SIGNING_REQUEST: ['extension-page'],
     SUBMIT_LEDGER_SIGNING_RESPONSE: ['extension-page'],
     CANCEL_LEDGER_SIGNING_REQUEST: ['extension-page'],
@@ -1047,6 +1084,12 @@ const TRUSTED_RUNTIME_CONTEXTS: Readonly<Record<string, readonly OwnExtensionSen
     APPROVE_NEAR_TRANSFER: ['extension-page'],
     REJECT_NEAR_TRANSFER: ['extension-page'],
     RESUME_NEAR_TRANSFER: ['extension-page'],
+    PREPARE_STARKNET_TRANSFER: ['extension-page'],
+    QUOTE_STARKNET_TRANSFER_MAX: ['extension-page'],
+    GET_PENDING_STARKNET_TRANSFER: ['extension-page'],
+    APPROVE_STARKNET_TRANSFER: ['extension-page'],
+    REJECT_STARKNET_TRANSFER: ['extension-page'],
+    RESUME_STARKNET_TRANSFER: ['extension-page'],
     PREPARE_BITCOIN_TRANSFER: ['extension-page'],
     GET_PENDING_BITCOIN_TRANSFER: ['extension-page'],
     APPROVE_BITCOIN_TRANSFER: ['extension-page'],
@@ -1059,6 +1102,12 @@ const TRUSTED_RUNTIME_CONTEXTS: Readonly<Record<string, readonly OwnExtensionSen
     APPROVE_PEARL_TRANSFER: ['extension-page'],
     REJECT_PEARL_TRANSFER: ['extension-page'],
     RESUME_PEARL_TRANSFER: ['extension-page'],
+    PREPARE_DASH_TRANSFER: ['extension-page'],
+    GET_PENDING_DASH_TRANSFER: ['extension-page'],
+    APPROVE_DASH_TRANSFER: ['extension-page'],
+    REJECT_DASH_TRANSFER: ['extension-page'],
+    RESUME_DASH_TRANSFER: ['extension-page'],
+    REFRESH_DASH_TRANSFER_STATUS: ['extension-page'],
     INSPECT_NEXT_ZCASH_ACCOUNT_HISTORY: ['extension-page'],
     ADD_ACCOUNT: ['extension-page'],
     SWITCH_ACCOUNT: ['extension-page'],
@@ -1107,10 +1156,12 @@ const dappMethodSet = new Set<string>(DAPP_RUNTIME_METHODS)
 const zcashDappMethodSet = new Set<string>(ZCASH_DAPP_RUNTIME_METHODS)
 const evmDappMethodSet = new Set<string>(EVM_DAPP_RUNTIME_METHODS)
 const bitcoinDappMethodSet = new Set<string>(BITCOIN_DAPP_RUNTIME_METHODS)
+const dashDappMethodSet = new Set<string>(DASH_DAPP_RUNTIME_METHODS)
 const pearlDappMethodSet = new Set<string>(PEARL_DAPP_RUNTIME_METHODS)
 const quantusDappMethodSet = new Set<string>(QUANTUS_DAPP_RUNTIME_METHODS)
 const solanaDappMethodSet = new Set<string>(SOLANA_DAPP_RUNTIME_METHODS)
 const nearDappMethodSet = new Set<string>(NEAR_DAPP_RUNTIME_METHODS)
+const starknetDappMethodSet = new Set<string>(STARKNET_DAPP_RUNTIME_METHODS)
 const caip25DappMethodSet = new Set<string>(CAIP25_RUNTIME_METHODS)
 const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
@@ -1384,18 +1435,22 @@ export function parseDAppRuntimeRequestMessage(value: unknown): DAppRuntimeReque
     (value.chainId === 'zcash' && !zcashDappMethodSet.has(value.request.method)) ||
     (value.chainId === 'evm' && !evmDappMethodSet.has(value.request.method)) ||
     (value.chainId === 'bitcoin' && !bitcoinDappMethodSet.has(value.request.method)) ||
+    (value.chainId === 'dash' && !dashDappMethodSet.has(value.request.method)) ||
     (value.chainId === 'pearl' && !pearlDappMethodSet.has(value.request.method)) ||
     (value.chainId === 'quantus' && !quantusDappMethodSet.has(value.request.method)) ||
     (value.chainId === 'solana' && !solanaDappMethodSet.has(value.request.method)) ||
     (value.chainId === 'near' && !nearDappMethodSet.has(value.request.method)) ||
+    (value.chainId === 'starknet' && !starknetDappMethodSet.has(value.request.method)) ||
     (value.chainId === 'multichain' && !caip25DappMethodSet.has(value.request.method)) ||
     (value.chainId !== 'zcash' &&
       value.chainId !== 'evm' &&
       value.chainId !== 'bitcoin' &&
+      value.chainId !== 'dash' &&
       value.chainId !== 'pearl' &&
       value.chainId !== 'quantus' &&
       value.chainId !== 'solana' &&
       value.chainId !== 'near' &&
+      value.chainId !== 'starknet' &&
       value.chainId !== 'multichain')
   ) {
     throw new Error('dApp runtime method does not match its provider')
@@ -1404,9 +1459,14 @@ export function parseDAppRuntimeRequestMessage(value: unknown): DAppRuntimeReque
   const paramsAreEvmRecord = value.chainId === 'evm' && isRuntimeRecord(value.request.params)
   const paramsAreMultichainRecord =
     value.chainId === 'multichain' && isRuntimeRecord(value.request.params)
+  const paramsAreStarknetRecord =
+    value.chainId === 'starknet' && isRuntimeRecord(value.request.params)
   if (
     value.request.params !== undefined &&
-    ((!paramsAreArray && !paramsAreEvmRecord && !paramsAreMultichainRecord) ||
+    ((!paramsAreArray &&
+      !paramsAreEvmRecord &&
+      !paramsAreMultichainRecord &&
+      !paramsAreStarknetRecord) ||
       (paramsAreArray && (value.request.params as unknown[]).length > 16))
   ) {
     throw new Error('Invalid dApp runtime params')
@@ -1453,10 +1513,12 @@ export function parseNoirRuntimeEventMessage(value: unknown): NoirRuntimeEventMe
     (value.chainId !== 'zcash' &&
       value.chainId !== 'evm' &&
       value.chainId !== 'bitcoin' &&
+      value.chainId !== 'dash' &&
       value.chainId !== 'pearl' &&
       value.chainId !== 'quantus' &&
       value.chainId !== 'solana' &&
       value.chainId !== 'near' &&
+      value.chainId !== 'starknet' &&
       value.chainId !== 'multichain') ||
     (value.eventName !== 'accountsChanged' &&
       value.eventName !== 'accountCapabilitiesChanged' &&

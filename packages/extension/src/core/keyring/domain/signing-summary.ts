@@ -8,6 +8,8 @@ export const SIGNING_SUMMARY_SCHEMAS = Object.freeze([
   'evm.typed-data.v1',
   'bitcoin.psbt.v1',
   'bitcoin.bip322-message.v1',
+  'dash.psbt.v1',
+  'dash.message.v1',
   'pearl.psbt.v1',
   'pearl.bip322-message.v1',
   'solana.transaction.v1',
@@ -16,7 +18,10 @@ export const SIGNING_SUMMARY_SCHEMAS = Object.freeze([
   'tron.sign-message-v2.v1',
   'near.transaction.v1',
   'near.nep413-message.v1',
-  'quantus.transfer.v1'
+  'quantus.transfer.v1',
+  'starknet.invoke.v1',
+  'starknet.deploy-account.v1',
+  'starknet.typed-data.v1'
 ] as const)
 
 export type SigningSummarySchema = (typeof SIGNING_SUMMARY_SCHEMAS)[number]
@@ -24,11 +29,13 @@ export type SigningSummaryFamily =
   | 'zcash'
   | 'evm'
   | 'bitcoin'
+  | 'dash'
   | 'pearl'
   | 'solana'
   | 'tron'
   | 'near'
   | 'quantus'
+  | 'starknet'
 export type SigningOperation = 'transaction' | 'message'
 export type SigningReviewLevel = 'standard' | 'caution' | 'blocked'
 export type SigningReviewIssueCode =
@@ -219,6 +226,53 @@ export type BitcoinBip322MessageSummary = SigningSummaryEnvelope<
   {
     readonly address: string
     readonly message: CanonicalContent
+  }
+>
+
+export interface DashInputSummary {
+  readonly index: number
+  readonly transactionId: string
+  readonly outputIndex: number
+  readonly amountDuffs: string
+  readonly sequence: number
+  readonly scriptType: 'p2pkh'
+  readonly sighashType: string
+  readonly ownership: 'signing-account' | 'external'
+  readonly derivationPath: string | null
+}
+
+export interface DashOutputSummary {
+  readonly index: number
+  readonly address: string | null
+  readonly scriptPubKeyHex: string
+  readonly amountDuffs: string
+  readonly classification: 'recipient' | 'change' | 'unknown'
+  readonly derivationPath: string | null
+}
+
+export type DashPsbtSummary = SigningSummaryEnvelope<
+  'dash.psbt.v1',
+  'transaction',
+  {
+    readonly psbtVersion: 0
+    readonly signer: string
+    readonly accountIndex: number
+    readonly inputs: readonly DashInputSummary[]
+    readonly outputs: readonly DashOutputSummary[]
+    readonly signingInputIndexes: readonly number[]
+    readonly totalInputDuffs: string
+    readonly totalOutputDuffs: string
+    readonly feeDuffs: string
+  }
+>
+
+export type DashMessageSummary = SigningSummaryEnvelope<
+  'dash.message.v1',
+  'message',
+  {
+    readonly signer: string
+    readonly message: CanonicalContent
+    readonly messageHash: string
   }
 >
 
@@ -567,6 +621,64 @@ export type QuantusTransferSummary = SigningSummaryEnvelope<
   }
 >
 
+export interface StarknetResourceBoundSummary {
+  readonly maxAmount: string
+  readonly maxPricePerUnit: string
+}
+
+export interface StarknetResourceBoundsSummary {
+  readonly l1Gas: StarknetResourceBoundSummary
+  readonly l2Gas: StarknetResourceBoundSummary
+  readonly l1DataGas: StarknetResourceBoundSummary
+}
+
+export interface StarknetCallSummary {
+  readonly to: string
+  readonly selector: string
+  readonly entrypoint: null
+  readonly calldata: readonly string[]
+}
+
+export type StarknetInvokeSummary = SigningSummaryEnvelope<
+  'starknet.invoke.v1',
+  'transaction',
+  {
+    readonly senderAddress: string
+    readonly nonce: string
+    readonly tip: string
+    readonly resourceBounds: StarknetResourceBoundsSummary
+    readonly calls: readonly StarknetCallSummary[]
+    readonly nonceDataAvailabilityMode: 'l1' | 'l2'
+    readonly feeDataAvailabilityMode: 'l1' | 'l2'
+  }
+>
+
+export type StarknetDeployAccountSummary = SigningSummaryEnvelope<
+  'starknet.deploy-account.v1',
+  'transaction',
+  {
+    readonly contractAddress: string
+    readonly classHash: string
+    readonly salt: string
+    readonly constructorCalldata: readonly string[]
+    readonly nonce: string
+    readonly tip: string
+    readonly resourceBounds: StarknetResourceBoundsSummary
+    readonly nonceDataAvailabilityMode: 'l1' | 'l2'
+    readonly feeDataAvailabilityMode: 'l1' | 'l2'
+  }
+>
+
+export type StarknetTypedDataSummary = SigningSummaryEnvelope<
+  'starknet.typed-data.v1',
+  'message',
+  {
+    readonly accountAddress: string
+    readonly publicKey: string
+    readonly typedData: CanonicalContent
+  }
+>
+
 export type SigningSummary =
   | ZcashTransactionSummary
   | ZcashMessageSummary
@@ -575,6 +687,8 @@ export type SigningSummary =
   | EvmTypedDataSummary
   | BitcoinPsbtSummary
   | BitcoinBip322MessageSummary
+  | DashPsbtSummary
+  | DashMessageSummary
   | PearlPsbtSummary
   | PearlBip322MessageSummary
   | SolanaTransactionSummary
@@ -584,6 +698,9 @@ export type SigningSummary =
   | NearTransactionSummary
   | NearNep413MessageSummary
   | QuantusTransferSummary
+  | StarknetInvokeSummary
+  | StarknetDeployAccountSummary
+  | StarknetTypedDataSummary
 
 export interface SigningSummaryExpectation {
   readonly chainId: ChainId

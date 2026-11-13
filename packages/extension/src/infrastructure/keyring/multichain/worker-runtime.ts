@@ -45,7 +45,6 @@ import {
   parseRawExportedPrivateKey,
   parseRawPearlAccount,
   parseRawQuantusAccount,
-  parseRawSessionInfo,
   RAW_BITCOIN_ADDRESS_TYPES,
   RAW_QUANTUS_SCHEMES,
   readArray,
@@ -54,6 +53,7 @@ import {
   readRecord,
   readSafeInteger,
   readString,
+  type UnknownRecord,
   type RawBitcoinAddressType,
   type RawBitcoinNetwork,
   type RawDerivedAccount,
@@ -68,6 +68,40 @@ import {
   type RawWalletEngine
 } from './raw-wallet-engine'
 import { bindMultichainVaultPassword } from './password-binding'
+import { BITCOIN_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
+import type { RawDashAccount } from './dash-codecs'
+import { parseDashOrRawSession } from './dash-codecs'
+import {
+  assertDashDerivationSession,
+  assertDashSigningSession,
+  confirmDashSigningRaw,
+  dashChainIdForNetwork,
+  dashExportRequest,
+  deriveDashAccountsRaw,
+  parseDashAccountDerivation,
+  parseDashExportedPrivateKey,
+  parseDerivedDashAccount,
+  parseDerivedDashAccountBatch,
+  prepareDashSigningRaw,
+  verifyDashMessageRaw,
+  type DashAccountDerivation,
+  type DashSigningPreparePayload
+} from './worker-dash-runtime'
+import {
+  assertStarknetPublicResult,
+  parseRawStarknetAccount,
+  parseStarknetAssembledDeploy,
+  parseStarknetAssembledInvoke,
+  parseStarknetExternalPrepareResult,
+  readOptionalFeltList,
+  readStarknetCalls,
+  readStarknetChainId,
+  readStarknetFelt,
+  readStarknetResourceBounds,
+  readStarknetSignature,
+  type RawDerivedStarknetAccount
+} from './starknet-codecs'
+import { starknetSessionRequestJson } from './signing-adapter-starknet'
 
 const DEFAULT_MAX_PENDING_SIGNING = 64
 const DEFAULT_SIGNING_TTL_MS = 5 * 60_000
@@ -102,9 +136,10 @@ interface CredentialSession {
   readonly globalUnlockEpoch: string
   readonly rawSessionId: number
   readonly kind: 'mnemonic' | 'private_key'
-  readonly chainFamily?: RawPrivateKeyChainFamily
+  readonly chainFamily?: RawPrivateKeyChainFamily | 'dash'
   readonly bitcoinNetwork?: RawBitcoinNetwork
   readonly pearlNetwork?: ProductPearlNetwork
+  readonly dashNetwork?: 'mainnet' | 'testnet'
 }
 
 interface PendingSigning {
@@ -123,6 +158,8 @@ interface PendingSigning {
     | RawDerivedQuantusAccount
     | RawDerivedPeaAccount
     | RawPeaExecutionAccount
+    | RawDashAccount
+    | RawDerivedStarknetAccount
   readonly expiresAt: number
 }
 
@@ -259,6 +296,15 @@ function callRaw<T>(
   }
 }
 
+function requireDashNetwork(value: 'mainnet' | 'testnet' | undefined): 'mainnet' | 'testnet' {
+  if (value !== 'mainnet' && value !== 'testnet') throw new KeyringError('INVALID_CREDENTIAL')
+  return value
+}
+
+function isExactBitcoinChainId(chainId: string): boolean {
+  return chainId === BITCOIN_CHAIN_IDS.mainnet || chainId === BITCOIN_CHAIN_IDS.testnet
+}
+
 function parseAccountDerivation(value: unknown):
   | {
       readonly family: 'pea'
@@ -333,11 +379,19 @@ function parseAccountDerivation(value: unknown):
       readonly family: 'near'
       readonly chainId: string
       readonly accountIndex: number
-    } {
+    }
+  | {
+      readonly family: 'starknet'
+      readonly chainId: string
+      readonly accountIndex: number
+      readonly addressIndex: number
+      readonly classHash: string
+    }
+  | DashAccountDerivation {
   const record = readRecord(value, 'account.derive-public payload')
   const family = readLiteral(
     record.family,
-    ['evm', 'pea', 'bitcoin', 'pearl', 'quantus', 'solana', 'near'],
+    ['evm', 'pea', 'bitcoin', 'dash', 'solana', 'near', 'pearl', 'quantus', 'starknet'],
     'account family'
   )
   if (family === 'quantus') {
@@ -418,6 +472,25 @@ function parseAccountDerivation(value: unknown):
       accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_BIP32_INDEX)
     })
   }
+  if (family === 'starknet') {
+    assertExactKeys(
+      record,
+      ['family', 'chainId', 'accountIndex', 'addressIndex', 'classHash'],
+      [],
+      'derive payload'
+    )
+    const chainId = readString(record.chainId, 'chainId', 64)
+    if (chainId !== 'starknet:SN_MAIN' && chainId !== 'starknet:SN_SEPOLIA') {
+      throw new KeyringError('UNSUPPORTED_CHAIN')
+    }
+    return Object.freeze({
+      family,
+      chainId,
+      accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_BIP32_INDEX),
+      addressIndex: readSafeInteger(record.addressIndex, 'addressIndex', MAX_BIP32_INDEX),
+      classHash: readStarknetFelt(record.classHash, 'classHash')
+    })
+  }
   if (family === 'pea') {
     assertExactKeys(record, ['family', 'addressIndex'], [], 'derive payload')
     return Object.freeze({
@@ -466,6 +539,8 @@ function parseAccountDerivation(value: unknown):
       addressIndex: readSafeInteger(record.addressIndex, 'addressIndex', MAX_BIP32_INDEX)
     })
   }
+  if (family === 'dash') return parseDashAccountDerivation(record)
+  if (family !== 'bitcoin') throw new KeyringError('UNSUPPORTED_CHAIN')
   const batch = !Object.prototype.hasOwnProperty.call(record, 'addressIndex')
   assertExactKeys(
     record,
@@ -476,10 +551,7 @@ function parseAccountDerivation(value: unknown):
     'derive payload'
   )
   const chainId = readString(record.chainId, 'chainId', 64)
-  if (
-    chainId !== 'bip122:000000000019d6689c085ae165831e93' &&
-    chainId !== 'bip122:000000000933ea01ad0ee984209779ba'
-  ) {
+  if (!isExactBitcoinChainId(chainId)) {
     throw new KeyringError('UNSUPPORTED_CHAIN')
   }
   const common = {
@@ -515,7 +587,9 @@ function publicAccount(
     | RawDerivedBitcoinAccount
     | RawDerivedPearlAccount
     | RawDerivedQuantusAccount
-    | RawDerivedEd25519Account,
+    | RawDerivedEd25519Account
+    | RawDashAccount
+    | RawDerivedStarknetAccount,
   purpose: 'identity' | 'receive' | 'change'
 ) {
   return Object.freeze({
@@ -545,8 +619,91 @@ function publicAccount(
             ? { redeemScript: account.redeemScript }
             : {})
         }
+      : {}),
+    ...('classHash' in account
+      ? { classHash: account.classHash, implementation: account.implementation }
       : {})
   })
+}
+
+const STARKNET_INVOKE_OPTIONAL_FIELDS = Object.freeze([
+  'accountAddress',
+  'classHash',
+  'salt',
+  'implementation',
+  'tip',
+  'nonceDataAvailabilityMode',
+  'feeDataAvailabilityMode',
+  'paymasterData',
+  'accountDeploymentData',
+  'proofFacts',
+  'proof'
+])
+
+const STARKNET_DEPLOY_OPTIONAL_FIELDS = Object.freeze([
+  'accountAddress',
+  'classHash',
+  'salt',
+  'implementation',
+  'tip',
+  'nonceDataAvailabilityMode',
+  'feeDataAvailabilityMode',
+  'paymasterData'
+])
+
+function readOptionalStarknetFelt(value: unknown, label: string): void {
+  if (value !== undefined) readStarknetFelt(value, label)
+}
+
+function readOptionalStarknetAccountSelectors(payload: UnknownRecord): void {
+  readOptionalStarknetFelt(payload.classHash, 'classHash')
+  readOptionalStarknetFelt(payload.salt, 'salt')
+  if (payload.implementation !== undefined) {
+    readLiteral(payload.implementation, ['open_zeppelin', 'argent_v04'], 'implementation')
+  }
+}
+
+function readOptionalStarknetFeeFields(payload: UnknownRecord, includeInvokeFields: boolean): void {
+  if (payload.tip !== undefined) {
+    const tip = readString(payload.tip, 'tip', 32)
+    if (!/^(0|[1-9][0-9]*)$/.test(tip)) throw new Error('tip must be a decimal amount')
+  }
+  if (payload.nonceDataAvailabilityMode !== undefined) {
+    readLiteral(payload.nonceDataAvailabilityMode, ['l1', 'l2'], 'nonceDataAvailabilityMode')
+  }
+  if (payload.feeDataAvailabilityMode !== undefined) {
+    readLiteral(payload.feeDataAvailabilityMode, ['l1', 'l2'], 'feeDataAvailabilityMode')
+  }
+  if (payload.paymasterData !== undefined) {
+    readOptionalFeltList(payload.paymasterData, 'paymasterData')
+  }
+  if (!includeInvokeFields) return
+  if (payload.accountDeploymentData !== undefined) {
+    readOptionalFeltList(payload.accountDeploymentData, 'accountDeploymentData')
+  }
+  if (payload.proofFacts !== undefined) readOptionalFeltList(payload.proofFacts, 'proofFacts')
+  if (payload.proof !== undefined) readString(payload.proof, 'proof', 131_072)
+}
+
+function readStarknetExternalInvoke(payload: UnknownRecord): void {
+  readStarknetChainId(payload.chainId)
+  readStarknetFelt(payload.publicKey, 'publicKey')
+  readOptionalStarknetFelt(payload.accountAddress, 'accountAddress')
+  readOptionalStarknetAccountSelectors(payload)
+  readStarknetCalls(payload.calls)
+  readStarknetFelt(payload.nonce, 'nonce')
+  readStarknetResourceBounds(payload.resourceBounds)
+  readOptionalStarknetFeeFields(payload, true)
+}
+
+function readStarknetExternalDeploy(payload: UnknownRecord): void {
+  readStarknetChainId(payload.chainId)
+  readStarknetFelt(payload.publicKey, 'publicKey')
+  readOptionalStarknetFelt(payload.accountAddress, 'accountAddress')
+  readOptionalStarknetAccountSelectors(payload)
+  readStarknetFelt(payload.nonce, 'nonce')
+  readStarknetResourceBounds(payload.resourceBounds)
+  readOptionalStarknetFeeFields(payload, false)
 }
 
 export class MultichainWorkerRuntime {
@@ -653,9 +810,148 @@ export class MultichainWorkerRuntime {
         return this.cancelAllSigning(command)
       case 'command.cancel':
         return this.cancelProductCommand(command)
+      case 'starknet.compute-address':
+      case 'starknet.prepare-invoke-external':
+      case 'starknet.assemble-invoke-external':
+      case 'starknet.prepare-deploy-external':
+      case 'starknet.assemble-deploy-external':
+      case 'starknet.hash-typed-data':
+      case 'starknet.verify-signature':
+        return this.executeStarknetPublic(command)
       case 'identity.get-public':
         throw new KeyringError('UNSUPPORTED_OPERATION')
     }
+  }
+
+  private executeStarknetPublic(command: KeyringCommand) {
+    if (command.binding.kind !== 'unbound') throw new KeyringError('INVALID_COMMAND')
+    const requestJson = parseInput(() => {
+      const payload = readRecord(command.payload, 'Starknet public payload')
+      for (const key of Object.keys(payload)) {
+        if (key === 'sessionId' || key === 'privateKey' || key === 'seed' || key === 'mnemonic') {
+          throw new Error('Starknet public payload contains a secret field')
+        }
+      }
+      switch (command.operation) {
+        case 'starknet.compute-address':
+          assertExactKeys(
+            payload,
+            ['chainId', 'publicKey'],
+            ['classHash', 'salt', 'implementation'],
+            'compute address'
+          )
+          readStarknetChainId(payload.chainId)
+          readStarknetFelt(payload.publicKey, 'publicKey')
+          readOptionalStarknetAccountSelectors(payload)
+          break
+        case 'starknet.prepare-invoke-external':
+          assertExactKeys(
+            payload,
+            ['chainId', 'publicKey', 'calls', 'nonce', 'resourceBounds'],
+            STARKNET_INVOKE_OPTIONAL_FIELDS,
+            'prepare invoke'
+          )
+          readStarknetExternalInvoke(payload)
+          break
+        case 'starknet.assemble-invoke-external':
+          assertExactKeys(
+            payload,
+            ['chainId', 'publicKey', 'calls', 'nonce', 'resourceBounds', 'signature'],
+            STARKNET_INVOKE_OPTIONAL_FIELDS,
+            'assemble invoke'
+          )
+          readStarknetExternalInvoke(payload)
+          readStarknetSignature(payload.signature)
+          break
+        case 'starknet.prepare-deploy-external':
+          assertExactKeys(
+            payload,
+            ['chainId', 'publicKey', 'nonce', 'resourceBounds'],
+            STARKNET_DEPLOY_OPTIONAL_FIELDS,
+            'prepare deploy'
+          )
+          readStarknetExternalDeploy(payload)
+          break
+        case 'starknet.assemble-deploy-external':
+          assertExactKeys(
+            payload,
+            ['chainId', 'publicKey', 'nonce', 'resourceBounds', 'signature'],
+            STARKNET_DEPLOY_OPTIONAL_FIELDS,
+            'assemble deploy'
+          )
+          readStarknetExternalDeploy(payload)
+          readStarknetSignature(payload.signature)
+          break
+        case 'starknet.hash-typed-data':
+          assertExactKeys(
+            payload,
+            ['chainId', 'accountAddress', 'publicKey', 'typedData'],
+            ['classHash', 'salt', 'implementation'],
+            'typed data hash'
+          )
+          readStarknetChainId(payload.chainId)
+          readStarknetFelt(payload.accountAddress, 'accountAddress')
+          readStarknetFelt(payload.publicKey, 'publicKey')
+          readString(payload.typedData, 'typedData', 65_536)
+          readOptionalStarknetAccountSelectors(payload)
+          break
+        case 'starknet.verify-signature':
+          assertExactKeys(payload, ['hash', 'publicKey', 'signature'], [], 'verify signature')
+          readStarknetFelt(payload.hash, 'hash')
+          readStarknetFelt(payload.publicKey, 'publicKey')
+          readStarknetSignature(payload.signature)
+          break
+        default:
+          throw new KeyringError('UNSUPPORTED_OPERATION')
+      }
+      return JSON.stringify(payload)
+    }, 'INVALID_COMMAND')
+    return callRaw(
+      command,
+      () => {
+        switch (command.operation) {
+          case 'starknet.compute-address':
+            return this.engine.computeStarknetAccountAddress(requestJson)
+          case 'starknet.prepare-invoke-external':
+            return this.engine.prepareStarknetInvokeExternal(requestJson)
+          case 'starknet.assemble-invoke-external':
+            return this.engine.assembleStarknetInvokeExternal(requestJson)
+          case 'starknet.prepare-deploy-external':
+            return this.engine.prepareStarknetDeployAccountExternal(requestJson)
+          case 'starknet.assemble-deploy-external':
+            return this.engine.assembleStarknetDeployAccountExternal(requestJson)
+          case 'starknet.hash-typed-data':
+            return this.engine.hashStarknetTypedData(requestJson)
+          case 'starknet.verify-signature':
+            return this.engine.verifyStarknetSignature(requestJson)
+          default:
+            throw new KeyringError('UNSUPPORTED_OPERATION')
+        }
+      },
+      value => {
+        switch (command.operation) {
+          case 'starknet.compute-address':
+            assertStarknetPublicResult(value)
+            return parseRawStarknetAccount(value)
+          case 'starknet.prepare-invoke-external':
+          case 'starknet.prepare-deploy-external':
+            return parseStarknetExternalPrepareResult(value)
+          case 'starknet.assemble-invoke-external':
+            return parseStarknetAssembledInvoke(value)
+          case 'starknet.assemble-deploy-external':
+            return parseStarknetAssembledDeploy(value)
+          case 'starknet.verify-signature': {
+            const verified = assertStarknetPublicResult(value)
+            if (typeof verified !== 'boolean') {
+              throw new Error('Starknet signature verification must be boolean')
+            }
+            return verified
+          }
+          default:
+            return assertStarknetPublicResult(value)
+        }
+      }
+    )
   }
 
   private async createCredential(command: KeyringCommand) {
@@ -701,12 +997,12 @@ export class MultichainWorkerRuntime {
       assertExactKeys(
         value,
         ['privateKey', 'password', 'chainFamily'],
-        ['bitcoinNetwork', 'pearlNetwork'],
+        ['bitcoinNetwork', 'pearlNetwork', 'dashNetwork'],
         'credential.import-private-key payload'
       )
       const chainFamily = readLiteral(
         value.chainFamily,
-        ['eip155', 'bip122', 'solana', 'near', 'pearl'],
+        ['eip155', 'bip122', 'solana', 'near', 'pearl', 'dash'],
         'chainFamily'
       )
       const bitcoinNetwork =
@@ -717,11 +1013,17 @@ export class MultichainWorkerRuntime {
         value.pearlNetwork === undefined
           ? undefined
           : readLiteral(value.pearlNetwork, ['mainnet', 'testnet'], 'pearlNetwork')
+      const dashNetwork =
+        value.dashNetwork === undefined
+          ? undefined
+          : readLiteral(value.dashNetwork, ['mainnet', 'testnet'], 'dashNetwork')
       if (
         (chainFamily !== 'bip122' && bitcoinNetwork !== undefined) ||
         (chainFamily === 'bip122' && bitcoinNetwork === undefined) ||
         (chainFamily !== 'pearl' && pearlNetwork !== undefined) ||
-        (chainFamily === 'pearl' && pearlNetwork === undefined)
+        (chainFamily === 'pearl' && pearlNetwork === undefined) ||
+        (chainFamily !== 'dash' && dashNetwork !== undefined) ||
+        (chainFamily === 'dash' && dashNetwork === undefined)
       ) {
         throw new KeyringError('INVALID_CREDENTIAL')
       }
@@ -730,7 +1032,8 @@ export class MultichainWorkerRuntime {
         password: parseSecret(value.password),
         chainFamily,
         ...(bitcoinNetwork === undefined ? {} : { bitcoinNetwork }),
-        ...(pearlNetwork === undefined ? {} : { pearlNetwork })
+        ...(pearlNetwork === undefined ? {} : { pearlNetwork }),
+        ...(dashNetwork === undefined ? {} : { dashNetwork })
       })
     }, 'INVALID_CREDENTIAL')
     const vaultPassword = await bindMultichainVaultPassword(payload.password)
@@ -746,7 +1049,8 @@ export class MultichainWorkerRuntime {
               : { bitcoinNetwork: payload.bitcoinNetwork }),
             ...(payload.pearlNetwork === undefined
               ? {}
-              : { pearlNetwork: toWasmPearlNetwork(payload.pearlNetwork) })
+              : { pearlNetwork: toWasmPearlNetwork(payload.pearlNetwork) }),
+            ...(payload.dashNetwork === undefined ? {} : { dashNetwork: payload.dashNetwork })
           },
           vaultPassword
         ),
@@ -810,7 +1114,22 @@ export class MultichainWorkerRuntime {
           })
         })
       }
-      if (!chainId.startsWith('bip122:')) throw new KeyringError('UNSUPPORTED_CHAIN')
+      if (
+        chainId === dashChainIdForNetwork('mainnet') ||
+        chainId === dashChainIdForNetwork('testnet')
+      ) {
+        if (value.addressType !== undefined) throw new KeyringError('INVALID_COMMAND')
+        const accountIndex = readSafeInteger(value.accountIndex, 'accountIndex', MAX_BIP32_INDEX)
+        const change = readBoolean(value.change, 'change')
+        if (change || addressIndex !== 0) throw new KeyringError('INVALID_COMMAND')
+        return Object.freeze({
+          vault: parseRawEncryptedVault(value.vault),
+          password: parseSecret(value.password),
+          request: dashExportRequest(chainId, accountIndex),
+          dash: true as const
+        })
+      }
+      if (!isExactBitcoinChainId(chainId)) throw new KeyringError('UNSUPPORTED_CHAIN')
       return Object.freeze({
         vault: parseRawEncryptedVault(value.vault),
         password: parseSecret(value.password),
@@ -833,7 +1152,8 @@ export class MultichainWorkerRuntime {
           vaultPassword,
           payload.request
         ),
-      parseRawExportedPrivateKey
+      value =>
+        'dash' in payload ? parseDashExportedPrivateKey(value) : parseRawExportedPrivateKey(value)
     )
   }
 
@@ -844,12 +1164,12 @@ export class MultichainWorkerRuntime {
       assertExactKeys(
         value,
         ['vault', 'currentPassword', 'newPassword', 'chainFamily'],
-        ['bitcoinNetwork', 'pearlNetwork'],
+        ['bitcoinNetwork', 'pearlNetwork', 'dashNetwork'],
         'credential.rewrap-private-key payload'
       )
       const chainFamily = readLiteral(
         value.chainFamily,
-        ['eip155', 'bip122', 'solana', 'near', 'pearl'],
+        ['eip155', 'bip122', 'solana', 'near', 'pearl', 'dash'],
         'chainFamily'
       )
       const bitcoinNetwork =
@@ -860,11 +1180,17 @@ export class MultichainWorkerRuntime {
         value.pearlNetwork === undefined
           ? undefined
           : readLiteral(value.pearlNetwork, ['mainnet', 'testnet'], 'pearlNetwork')
+      const dashNetwork =
+        value.dashNetwork === undefined
+          ? undefined
+          : readLiteral(value.dashNetwork, ['mainnet', 'testnet'], 'dashNetwork')
       if (
         (chainFamily !== 'bip122' && bitcoinNetwork !== undefined) ||
         (chainFamily === 'bip122' && bitcoinNetwork === undefined) ||
         (chainFamily !== 'pearl' && pearlNetwork !== undefined) ||
-        (chainFamily === 'pearl' && pearlNetwork === undefined)
+        (chainFamily === 'pearl' && pearlNetwork === undefined) ||
+        (chainFamily !== 'dash' && dashNetwork !== undefined) ||
+        (chainFamily === 'dash' && dashNetwork === undefined)
       ) {
         throw new KeyringError('INVALID_CREDENTIAL')
       }
@@ -874,7 +1200,8 @@ export class MultichainWorkerRuntime {
         newPassword: parseSecret(value.newPassword),
         chainFamily,
         ...(bitcoinNetwork === undefined ? {} : { bitcoinNetwork }),
-        ...(pearlNetwork === undefined ? {} : { pearlNetwork })
+        ...(pearlNetwork === undefined ? {} : { pearlNetwork }),
+        ...(dashNetwork === undefined ? {} : { dashNetwork })
       })
     }, 'INVALID_CREDENTIAL')
     const currentVaultPassword = await bindMultichainVaultPassword(payload.currentPassword)
@@ -884,20 +1211,25 @@ export class MultichainWorkerRuntime {
       const session = callRaw(
         command,
         () => this.engine.unlock(payload.vault, currentVaultPassword),
-        parseRawSessionInfo
+        parseDashOrRawSession
       )
       rawSessionId = session.sessionId
+      const sessionBitcoinNetwork = 'bitcoinNetwork' in session ? session.bitcoinNetwork : undefined
+      const sessionDashNetwork = 'dashNetwork' in session ? session.dashNetwork : undefined
+      const sessionPearlNetwork = 'pearlNetwork' in session ? session.pearlNetwork : undefined
       if (
         session.kind !== 'private_key' ||
         session.chainFamily !== payload.chainFamily ||
-        session.bitcoinNetwork !== payload.bitcoinNetwork ||
-        (session.pearlNetwork === undefined
+        sessionBitcoinNetwork !== payload.bitcoinNetwork ||
+        (sessionPearlNetwork === undefined
           ? payload.pearlNetwork !== undefined
           : payload.pearlNetwork === undefined ||
-            fromWasmPearlNetwork(session.pearlNetwork) !== payload.pearlNetwork)
+            fromWasmPearlNetwork(sessionPearlNetwork) !== payload.pearlNetwork) ||
+        sessionDashNetwork !== payload.dashNetwork
       ) {
         throw new KeyringError('INVALID_CREDENTIAL')
       }
+      const dashNetwork = payload.dashNetwork
       const chainId =
         payload.chainFamily === 'eip155'
           ? 'eip155:1'
@@ -909,9 +1241,11 @@ export class MultichainWorkerRuntime {
                 ? payload.pearlNetwork === 'mainnet'
                   ? 'bip122:a18d3093b7ff618f0cdd073fa3d10374'
                   : 'bip122:b0c86d0cd8825f4d72260d2de46f4704'
-                : payload.bitcoinNetwork === 'mainnet'
-                  ? 'bip122:000000000019d6689c085ae165831e93'
-                  : 'bip122:000000000933ea01ad0ee984209779ba'
+                : payload.chainFamily === 'dash'
+                  ? dashChainIdForNetwork(requireDashNetwork(dashNetwork))
+                  : payload.bitcoinNetwork === 'mainnet'
+                    ? BITCOIN_CHAIN_IDS.mainnet
+                    : BITCOIN_CHAIN_IDS.testnet
       const exported = callRaw(
         command,
         () =>
@@ -930,15 +1264,17 @@ export class MultichainWorkerRuntime {
                       change: false,
                       addressIndex: 0
                     }
-                  : {
-                      chainId,
-                      addressType: 'p2wpkh',
-                      accountIndex: 0,
-                      change: false,
-                      addressIndex: 0
-                    }
+                  : payload.chainFamily === 'dash'
+                    ? dashExportRequest(chainId, 0)
+                    : {
+                        chainId,
+                        addressType: 'p2wpkh' as const,
+                        accountIndex: 0,
+                        change: false,
+                        addressIndex: 0
+                      }
           ),
-        parseRawExportedPrivateKey
+        payload.chainFamily === 'dash' ? parseDashExportedPrivateKey : parseRawExportedPrivateKey
       )
       return callRaw(
         command,
@@ -952,7 +1288,8 @@ export class MultichainWorkerRuntime {
                 : { bitcoinNetwork: payload.bitcoinNetwork }),
               ...(payload.pearlNetwork === undefined
                 ? {}
-                : { pearlNetwork: toWasmPearlNetwork(payload.pearlNetwork) })
+                : { pearlNetwork: toWasmPearlNetwork(payload.pearlNetwork) }),
+              ...(payload.dashNetwork === undefined ? {} : { dashNetwork: payload.dashNetwork })
             },
             newVaultPassword
           ),
@@ -988,7 +1325,7 @@ export class MultichainWorkerRuntime {
     const rawSession = callRaw(
       command,
       () => this.engine.unlock(vault, vaultPassword),
-      parseRawSessionInfo
+      parseDashOrRawSession
     )
     this.sessions.set(
       binding.keyDomainId,
@@ -999,12 +1336,13 @@ export class MultichainWorkerRuntime {
         rawSessionId: rawSession.sessionId,
         kind: rawSession.kind,
         ...(rawSession.chainFamily === undefined ? {} : { chainFamily: rawSession.chainFamily }),
-        ...(rawSession.bitcoinNetwork === undefined
-          ? {}
-          : { bitcoinNetwork: rawSession.bitcoinNetwork }),
-        ...(rawSession.pearlNetwork === undefined
-          ? {}
-          : { pearlNetwork: fromWasmPearlNetwork(rawSession.pearlNetwork) })
+        ...('bitcoinNetwork' in rawSession && rawSession.bitcoinNetwork !== undefined
+          ? { bitcoinNetwork: rawSession.bitcoinNetwork }
+          : {}),
+        ...('pearlNetwork' in rawSession && rawSession.pearlNetwork !== undefined
+          ? { pearlNetwork: fromWasmPearlNetwork(rawSession.pearlNetwork) }
+          : {}),
+        ...('dashNetwork' in rawSession ? { dashNetwork: rawSession.dashNetwork } : {})
       })
     )
     return Object.freeze({ state: 'unlocked' })
@@ -1090,6 +1428,32 @@ export class MultichainWorkerRuntime {
             session.kind === 'private_key'
           )
           return account
+        }
+      )
+      return publicAccount(derivation.chainId, account, 'identity')
+    }
+    if (derivation.family === 'starknet') {
+      if (session.kind === 'private_key') throw new KeyringError('UNSUPPORTED_CHAIN')
+      const account = callRaw(
+        command,
+        () =>
+          this.engine.deriveStarknetAccount(
+            session.rawSessionId,
+            derivation.chainId,
+            derivation.accountIndex,
+            derivation.addressIndex,
+            derivation.classHash
+          ),
+        value => {
+          const derived = parseRawStarknetAccount(value)
+          const expectedPath = `m/44'/9004'/${derivation.accountIndex}'/0/${derivation.addressIndex}`
+          if (
+            derived.derivationPath !== expectedPath ||
+            derived.implementation !== 'open_zeppelin'
+          ) {
+            throw new Error('Starknet account does not match the software derivation')
+          }
+          return derived
         }
       )
       return publicAccount(derivation.chainId, account, 'identity')
@@ -1239,6 +1603,29 @@ export class MultichainWorkerRuntime {
       )
       return publicAccount(derivation.chainId, account, derivation.change ? 'change' : 'receive')
     }
+    if (derivation.family === 'dash') {
+      assertDashDerivationSession(session.kind, derivation)
+      const imported = session.kind === 'private_key'
+      if (derivation.batch) {
+        const accounts = callRaw(
+          command,
+          () => deriveDashAccountsRaw(this.engine, session.rawSessionId, derivation),
+          value => parseDerivedDashAccountBatch(value, derivation, imported)
+        )
+        return Object.freeze(
+          accounts.map(account =>
+            publicAccount(derivation.chainId, account, derivation.change ? 'change' : 'receive')
+          )
+        )
+      }
+      const account = callRaw(
+        command,
+        () => deriveDashAccountsRaw(this.engine, session.rawSessionId, derivation),
+        value => parseDerivedDashAccount(value, derivation, imported)
+      )
+      return publicAccount(derivation.chainId, account, derivation.change ? 'change' : 'receive')
+    }
+    if (derivation.family !== 'bitcoin') throw new KeyringError('UNSUPPORTED_CHAIN')
     if (derivation.batch) {
       const accounts = callRaw(
         command,
@@ -1323,7 +1710,7 @@ export class MultichainWorkerRuntime {
     if (!Number.isSafeInteger(expiresAt)) throw new KeyringError('INTERNAL_ERROR')
 
     let raw: unknown
-    let bitcoinAccount: RawDerivedBitcoinAccount | undefined
+    let bitcoinAccount: RawDerivedBitcoinAccount | RawDashAccount | undefined
     let pearlAccount: RawDerivedPearlAccount | undefined
     try {
       if (payload.kind === 'evm-transaction') {
@@ -1438,6 +1825,35 @@ export class MultichainWorkerRuntime {
           addressIndex: payload.addressIndex,
           message: payload.message
         })
+      } else if (payload.kind === 'dash-psbt' || payload.kind === 'dash-message') {
+        const dashPayload: DashSigningPreparePayload = payload
+        assertDashSigningSession(session.kind, dashPayload)
+        const imported = session.kind === 'private_key'
+        bitcoinAccount = callRaw(
+          command,
+          () =>
+            this.engine.deriveDashAccount(
+              session.rawSessionId,
+              dashPayload.chainId,
+              dashPayload.accountIndex,
+              dashPayload.kind === 'dash-message' ? dashPayload.change : false,
+              dashPayload.kind === 'dash-message' ? dashPayload.addressIndex : 0
+            ),
+          value =>
+            parseDerivedDashAccount(
+              value,
+              {
+                family: 'dash',
+                batch: false,
+                chainId: dashPayload.chainId,
+                accountIndex: dashPayload.accountIndex,
+                change: dashPayload.kind === 'dash-message' ? dashPayload.change : false,
+                addressIndex: dashPayload.kind === 'dash-message' ? dashPayload.addressIndex : 0
+              },
+              imported
+            )
+        )
+        raw = prepareDashSigningRaw(this.engine, session.rawSessionId, dashPayload)
       } else if (payload.kind === 'solana-transaction') {
         raw = this.engine.prepareSolanaTransaction(
           session.rawSessionId,
@@ -1462,9 +1878,25 @@ export class MultichainWorkerRuntime {
         // The binding is immutable per reference, so an endpoint that later reports
         // a different chain fails closed instead of signing on the wrong network.
         if (requiresQuantusGenesisBinding(payload.transfer.chainId)) {
-          this.engine.registerQuantusNetwork(payload.transfer.chainId, payload.transfer.genesisHash)
+          this.engine.registerQuantusNetwork(
+            payload.transfer.chainId,
+            payload.transfer.genesisHash
+          )
         }
         raw = this.engine.prepareQuantusTransfer(session.rawSessionId, payload.transfer)
+      } else if (
+        payload.kind === 'starknet-invoke' ||
+        payload.kind === 'starknet-deploy-account' ||
+        payload.kind === 'starknet-typed-data'
+      ) {
+        if (session.kind === 'private_key') throw new KeyringError('UNSUPPORTED_CHAIN')
+        const requestJson = starknetSessionRequestJson(payload)
+        raw =
+          payload.kind === 'starknet-invoke'
+            ? this.engine.prepareStarknetInvoke(session.rawSessionId, requestJson)
+            : payload.kind === 'starknet-deploy-account'
+              ? this.engine.prepareStarknetDeployAccount(session.rawSessionId, requestJson)
+              : this.engine.prepareStarknetTypedData(session.rawSessionId, requestJson)
       } else {
         raw = this.engine.prepareBitcoinMessage(session.rawSessionId, {
           chainId: payload.chainId,
@@ -1558,6 +1990,15 @@ export class MultichainWorkerRuntime {
         case 'pearl-bip322-message':
           raw = this.engine.confirmPearlMessage(pending.rawSessionId, pending.rawRequestId)
           break
+        case 'dash-psbt':
+        case 'dash-message':
+          raw = confirmDashSigningRaw(
+            this.engine,
+            pending.rawSessionId,
+            pending.rawRequestId,
+            pending.kind
+          )
+          break
         case 'solana-transaction':
           raw = this.engine.confirmSolanaTransaction(pending.rawSessionId, pending.rawRequestId)
           break
@@ -1574,6 +2015,15 @@ export class MultichainWorkerRuntime {
           // Both Quantus prepare entry points store a `QuantusCall` request and
           // only `confirmQuantusCall` exists upstream.
           raw = this.engine.confirmQuantusCall(pending.rawSessionId, pending.rawRequestId)
+          break
+        case 'starknet-invoke':
+          raw = this.engine.confirmStarknetInvoke(pending.rawSessionId, pending.rawRequestId)
+          break
+        case 'starknet-deploy-account':
+          raw = this.engine.confirmStarknetDeployAccount(pending.rawSessionId, pending.rawRequestId)
+          break
+        case 'starknet-typed-data':
+          raw = this.engine.confirmStarknetTypedData(pending.rawSessionId, pending.rawRequestId)
           break
       }
     } catch (error) {
@@ -1611,6 +2061,32 @@ export class MultichainWorkerRuntime {
       )
       return value
     }, 'UNSUPPORTED_PAYLOAD')
+    if (payload.kind === 'dash-message') {
+      const chainId = readString(payload.chainId, 'chainId', 64)
+      if (
+        !(payload.message instanceof Uint8Array) ||
+        payload.message.byteLength === 0 ||
+        payload.message.byteLength > 4 * 1024
+      ) {
+        throw new KeyringError('UNSUPPORTED_PAYLOAD')
+      }
+      const address = readString(payload.address, 'address', 128)
+      const signature = readString(payload.signature, 'signature', 16_384)
+      let verified: boolean
+      try {
+        verified = verifyDashMessageRaw(
+          this.engine,
+          chainId,
+          address,
+          new Uint8Array(payload.message),
+          signature
+        )
+      } catch (error) {
+        if (error instanceof KeyringError) throw error
+        throw mapRawError(error, command.operation)
+      }
+      return Object.freeze({ verified })
+    }
     if (payload.kind !== 'bitcoin-bip322-message' && payload.kind !== 'pearl-bip322-message') {
       throw new KeyringError('UNSUPPORTED_PAYLOAD')
     }
@@ -1623,10 +2099,7 @@ export class MultichainWorkerRuntime {
       ) {
         throw new KeyringError('UNSUPPORTED_CHAIN')
       }
-    } else if (
-      chainId !== 'bip122:000000000019d6689c085ae165831e93' &&
-      chainId !== 'bip122:000000000933ea01ad0ee984209779ba'
-    ) {
+    } else if (!isExactBitcoinChainId(chainId)) {
       throw new KeyringError('UNSUPPORTED_CHAIN')
     }
     const maximumMessageBytes = isPearl ? 80 : 4 * 1024

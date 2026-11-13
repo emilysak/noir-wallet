@@ -2,8 +2,10 @@ import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import type { ChainEndpointSettings } from '@/core/chains/chain-endpoint-settings'
 import type { RpcEndpointGroup } from '@/config/rpc-endpoints'
 import { attestBitcoinEsploraEndpoint } from '@/infrastructure/chains/bitcoin'
+import { attestDashInsightEndpoint } from '@/infrastructure/chains/dash'
 import { attestEvmRpcEndpoint } from '@/infrastructure/chains/evm'
 import { attestNearRpcEndpoint } from '@/infrastructure/chains/near/near-network-attestation'
+import { attestStarknetRpcEndpoint } from '@/infrastructure/chains/starknet/starknet-network-attestation'
 import { attestPearlBlockbookEndpoint } from '@/infrastructure/chains/pearl'
 import { attestQuantusRpcEndpoint } from '@/infrastructure/chains/quantus'
 import { attestSolanaRpcEndpoint } from '@/infrastructure/chains/solana/solana-network-attestation'
@@ -76,6 +78,9 @@ export async function probeChainRpcEndpoint(
       case 'bitcoin-esplora':
         await attestBitcoinEsploraEndpoint(option.chainId, url, controller.signal)
         break
+      case 'dash-insight':
+        await attestDashInsightEndpoint(option.chainId, url, controller.signal)
+        break
       case 'pearl-blockbook':
       case 'pearl-json-rpc':
         await attestPearlBlockbookEndpoint(option.chainId, url, controller.signal)
@@ -96,6 +101,13 @@ export async function probeChainRpcEndpoint(
         break
       case 'quantus-json-rpc':
         await attestQuantusRpcEndpoint({
+          chainId: option.chainId,
+          rpcUrl: url,
+          signal: controller.signal
+        })
+        break
+      case 'starknet-json-rpc':
+        await attestStarknetRpcEndpoint({
           chainId: option.chainId,
           rpcUrl: url,
           signal: controller.signal

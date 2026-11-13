@@ -17,6 +17,7 @@ import {
   IndexedDbStorageV2Repository
 } from '@/infrastructure/persistence/repositories'
 import type { StorageV2Snapshot } from '@/ports/repositories'
+import type { Network } from '@/types'
 import { parseAccountId } from '@/core/accounts/domain'
 import { keySourceSupportsChainFamily, resolveKeyDomain } from '@/core/accounts/application'
 import { parseKeyDomainId, type CredentialSetManifest } from '@/core/keyring/domain'
@@ -31,6 +32,7 @@ import {
   type LedgerHardwareProvisioningInput,
   type LedgerHardwareProvisioningResult
 } from '@/infrastructure/keyring/ledger-hardware-provisioning-coordinator'
+import { LedgerStarknetNetworkProjectionCoordinator } from '@/infrastructure/keyring/ledger-starknet-network-projection'
 import { isNativeHardwareWalletId } from '@/core/wallet/native-hardware-identity'
 import type { ActiveWalletSetMode } from '@/core/wallet/wallet-unlock-path'
 import {
@@ -80,6 +82,13 @@ import type { NetworkAccountMetadataInput } from '@/infrastructure/keyring/netwo
 import type { KeyringCommandBinding, KeyringCommandPayload } from '@/core/keyring/ports'
 import { BackgroundMultichainTransport } from '@/infrastructure/keyring/multichain/background-transport'
 import { parseRawExportedPrivateKey } from '@/infrastructure/keyring/multichain/raw-wallet-engine'
+import { parseDashExportedPrivateKey } from '@/infrastructure/keyring/multichain/dash-codecs'
+import {
+  BITCOIN_CHAIN_IDS,
+  DASH_CHAIN_IDS,
+  isBitcoinChainId,
+  isDashChainId
+} from '@/core/chains/registry/chain-ids'
 
 // This migration-only profile anchors identities; it does not enable chain runtime capabilities.
 function getProvisioningChainProfile(): RetainedV1MigrationChainProfile {
@@ -129,6 +138,19 @@ export interface ExportWalletPrivateKeyInput {
   readonly password: string
   readonly binding: Extract<KeyringCommandBinding, { readonly kind: 'credential' }>
   readonly bitcoinAddressType?: 'p2pkh' | 'p2sh-p2wpkh' | 'p2wpkh' | 'p2tr'
+}
+
+function bitcoinExportAddressType(
+  chainId: string,
+  addressType: ExportWalletPrivateKeyInput['bitcoinAddressType']
+): 'p2pkh' | 'p2sh_p2wpkh' | 'p2wpkh' | 'p2tr' {
+  if (addressType === undefined) {
+    if (chainId === BITCOIN_CHAIN_IDS.testnet) {
+      throw new Error('Bitcoin testnet private-key export requires an address type')
+    }
+    return 'p2wpkh'
+  }
+  return addressType === 'p2sh-p2wpkh' ? 'p2sh_p2wpkh' : addressType
 }
 
 function chainIdForAddressScheme(
@@ -249,6 +271,10 @@ export class CredentialLifecycleCoordinator {
     credentialRepository: this.credentialRepository,
     storageRepository: this.storageRepository
   })
+  private readonly ledgerStarknetProjection = new LedgerStarknetNetworkProjectionCoordinator({
+    credentialRepository: this.credentialRepository,
+    storageRepository: this.storageRepository
+  })
   private readonly privateKeyProvisioning = new PrivateKeyProvisioningCoordinator({
     credentialRepository: this.credentialRepository,
     storageRepository: this.storageRepository
@@ -317,6 +343,17 @@ export class CredentialLifecycleCoordinator {
           resolveEvmNetworkCatalog(DEFAULT_NETWORK, settings).map(network => network.chainId)
         )
       )
+    this.synchronizationQueue = operation.then(
+      () => undefined,
+      () => undefined
+    )
+    return operation
+  }
+
+  projectLedgerStarknetNetwork(network: Network) {
+    const operation = this.synchronizationQueue
+      .catch(() => {})
+      .then(() => this.ledgerStarknetProjection.synchronize(network))
     this.synchronizationQueue = operation.then(
       () => undefined,
       () => undefined
@@ -762,6 +799,7 @@ export class CredentialLifecycleCoordinator {
         (scope.chainFamily === 'eip155' && !chainId.startsWith('eip155:')) ||
         (scope.chainFamily === 'bip122' && chainId !== getBitcoinChainId(scope.bitcoinNetwork)) ||
         (scope.chainFamily === 'pearl' && chainId !== getPearlChainId(scope.pearlNetwork)) ||
+        (scope.chainFamily === 'dash' && chainId !== DASH_CHAIN_IDS[scope.dashNetwork]) ||
         (scope.chainFamily === 'solana' && !chainId.startsWith('solana:')) ||
         (scope.chainFamily === 'near' && !chainId.startsWith('near:'))
       ) {
@@ -795,6 +833,9 @@ export class CredentialLifecycleCoordinator {
       maxTimeoutMs: 120_000
     })
     try {
+      if (isDashChainId(chainId) && input.bitcoinAddressType !== undefined) {
+        throw new Error('Dash private-key export does not use an address type')
+      }
       const commandPayload: KeyringCommandPayload = chainId.startsWith('eip155:')
         ? {
             vault: parsedVault,
@@ -811,37 +852,43 @@ export class CredentialLifecycleCoordinator {
               change: false,
               addressIndex: 0
             }
-          : chainId.startsWith('bip122:')
+          : isBitcoinChainId(chainId)
             ? {
                 vault: parsedVault,
                 password: input.password,
                 chainId,
-                addressType:
-                  input.bitcoinAddressType === 'p2sh-p2wpkh'
-                    ? 'p2sh_p2wpkh'
-                    : (input.bitcoinAddressType ?? 'p2wpkh'),
+                addressType: bitcoinExportAddressType(chainId, input.bitcoinAddressType),
                 accountIndex: account.accountIndex,
                 change: false,
                 addressIndex: 0
               }
-            : chainId.startsWith('solana:') || chainId.startsWith('near:')
+            : isDashChainId(chainId)
               ? {
                   vault: parsedVault,
                   password: input.password,
                   chainId,
                   accountIndex: account.accountIndex,
+                  change: false,
                   addressIndex: 0
                 }
-              : (() => {
-                  throw new Error('Private-key export does not support this chain')
-                })()
+              : chainId.startsWith('solana:') || chainId.startsWith('near:')
+                ? {
+                    vault: parsedVault,
+                    password: input.password,
+                    chainId,
+                    accountIndex: account.accountIndex,
+                    addressIndex: 0
+                  }
+                : (() => {
+                    throw new Error('Private-key export does not support this chain')
+                  })()
       return await commandClient.execute(
         {
           operation: 'credential.export-private-key',
           binding: input.binding,
           payload: commandPayload
         },
-        parseRawExportedPrivateKey
+        isDashChainId(chainId) ? parseDashExportedPrivateKey : parseRawExportedPrivateKey
       )
     } finally {
       payload.fill(0)

@@ -6,10 +6,12 @@ export type RpcProbeKind =
   | 'zcash-lightwalletd-grpc-web'
   | 'evm-json-rpc'
   | 'bitcoin-esplora'
+  | 'dash-insight'
   | 'pearl-blockbook'
   | 'solana-json-rpc'
   | 'near-json-rpc'
   | 'quantus-json-rpc'
+  | 'starknet-json-rpc'
 
 export interface RpcRegistryEndpoint {
   id: string
@@ -64,7 +66,7 @@ const TESTNET = 'testnet'
 
 export const RPC_REGISTRY: RpcRegistryDocument = {
   version: RPC_REGISTRY_SCHEMA_VERSION,
-  updatedAt: '2026-10-27T08:30:27.000Z',
+  updatedAt: '2026-11-12T07:40:00.000Z',
   chains: [
     {
       id: 'zcash-mainnet',
@@ -240,6 +242,17 @@ export const RPC_REGISTRY: RpcRegistryDocument = {
         ['blockstream-info', 'Blockstream', 'https://blockstream.info/testnet/api/']
       ]
     ),
+    chain('bip122:00000ffd590b1485b3caadc19b22e637', MAINNET, 'Dash', 'dash', 'dash-insight', [
+      ['insight', 'Insight', 'https://insight.dash.org/insight-api']
+    ]),
+    chain(
+      'bip122:00000bafbc94add76cb75e2ec9289483',
+      TESTNET,
+      'Dash Testnet',
+      'dash',
+      'dash-insight',
+      [['insight', 'Insight', 'https://insight.testnet.networks.dash.org/insight-api']]
+    ),
     chain('bip122:a18d3093b7ff618f0cdd073fa3d10374', MAINNET, 'Pearl', 'pearl', 'pearl-blockbook', [
       ['blockbook', 'Blockbook', 'https://blockbook.pearlresearch.ai/api/v2']
     ]),
@@ -279,6 +292,13 @@ export const RPC_REGISTRY: RpcRegistryDocument = {
     chain('near:testnet', TESTNET, 'NEAR Testnet', 'near', 'near-json-rpc', [
       ['official', 'NEAR', 'https://rpc.testnet.near.org'],
       ['fastnear', 'Fastnear', 'https://test.rpc.fastnear.com']
+    ]),
+    chain('starknet:SN_MAIN', MAINNET, 'Starknet', 'starknet', 'starknet-json-rpc', [
+      ['publicnode', 'PublicNode', 'https://starknet-rpc.publicnode.com']
+    ]),
+    chain('starknet:SN_SEPOLIA', TESTNET, 'Starknet Sepolia', 'starknet', 'starknet-json-rpc', [
+      ['publicnode', 'PublicNode', 'https://starknet-sepolia-rpc.publicnode.com'],
+      ['drpc', 'dRPC', 'https://starknet-sepolia.drpc.org']
     ])
   ]
 }

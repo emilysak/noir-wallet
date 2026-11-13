@@ -3,11 +3,13 @@ export type ChainFamily =
   | 'zcash'
   | 'evm'
   | 'bitcoin'
+  | 'dash'
   | 'solana'
   | 'tron'
   | 'near'
   | 'pearl'
   | 'quantus'
+  | 'starknet'
 export type ChainNetworkKind = 'mainnet' | 'testnet' | 'devnet' | 'custom'
 export type TransactionModel = 'account' | 'utxo' | 'hybrid-utxo'
 export type TransactionAction =

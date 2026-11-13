@@ -179,12 +179,14 @@ import {
   createBackgroundRheaSwapNearCoordinator,
   type RheaSwapNearCoordinator
 } from './rhea-swap-near'
+import { DASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { parseKeyDomainId } from '@/core/keyring/domain'
 import { parseAccountId } from '@/core/accounts/domain'
 import { isAssetMarketHistoryRange } from '@/core/prices'
 import { UnsupportedAssetMarketHistoryError } from '@/infrastructure/prices'
 import {
   getBitcoinChainId,
+  getDashChainId,
   getPearlChainId,
   getQuantusChainId,
   getZcashChainId,
@@ -221,6 +223,7 @@ import { mapEvmWalletRuntimeError } from './evm-wallet-runtime-error'
 import {
   isNewWalletFamilyEnabled,
   resolveBitcoinFeatureRuntimePolicy,
+  resolveDashFeatureRuntimePolicy,
   resolveEvmFeatureRuntimePolicy,
   resolveNearFeatureRuntimePolicy,
   resolvePearlFeatureRuntimePolicy,
@@ -245,6 +248,7 @@ import {
   createBackgroundPearlDAppHandler,
   createEnsureActiveSoftwarePearlAccount
 } from './pearl-dapp'
+import { createBackgroundDashDAppHandler } from './dash-dapp'
 import { createBackgroundQuantusDAppHandler } from './quantus-dapp'
 import { fetchCachedIdentity, type IdentitySigningMode } from '@/core/wallet/identity-cache'
 import type { LendingSigningMode } from '@/core/services/lending-service'
@@ -258,6 +262,11 @@ import {
   toPearlProviderErrorShape,
   type PearlDAppRuntimeMethod
 } from '@/core/dapp/pearl-provider'
+import {
+  DashProviderError,
+  toDashProviderErrorShape,
+  type DashDAppRuntimeMethod
+} from '@/core/dapp/dash-provider'
 import {
   QuantusProviderError,
   toQuantusProviderErrorShape,
@@ -317,6 +326,16 @@ import {
   recoverPendingPearlTransfers,
   reloadBackgroundPearlRuntime
 } from './pearl-transfer'
+import {
+  createBackgroundDashTransferController,
+  recoverBackgroundDashTransfers
+} from './dash-wallet'
+import { beginDashLedgerWalletSignature } from './dash-ledger-wallet'
+import { isDashExternalSignatureRequired } from './dash-transfer-controller'
+import {
+  BackgroundDashTransactionMonitor,
+  DASH_TRANSACTION_MONITOR_ALARM
+} from './dash-transaction-monitor'
 import { createBitcoinWalletRuntimeError } from '@/core/chains/bitcoin'
 import { createPearlWalletRuntimeError } from '@/core/chains/pearl'
 import { mapBitcoinWalletRuntimeError } from './bitcoin-wallet-runtime-error'
@@ -341,6 +360,7 @@ import { validateVotingDecisions } from '@/lib/voting'
 
 import { BitcoinMultichainDerivationClient } from '@/infrastructure/keyring/multichain/bitcoin-derivation-client'
 import { PearlMultichainDerivationClient } from '@/infrastructure/keyring/multichain/pearl-derivation-client'
+import { DashMultichainDerivationClient } from '@/infrastructure/keyring/multichain/dash-derivation-client'
 import type { NetworkAccountMetadataInput } from '@/infrastructure/keyring/network-account-metadata-coordinator'
 import {
   NEAR_CHAIN_FEATURE_FLAG,
@@ -378,6 +398,30 @@ import {
   BackgroundNearTransactionMonitor,
   NEAR_TRANSACTION_MONITOR_ALARM
 } from './near-transaction-monitor'
+import {
+  createBackgroundStarknetTransferController,
+  createStarknetLedgerDappSigner,
+  createStarknetSessionSigner,
+  loadStarknetDappAccount
+} from './starknet-transfer'
+import {
+  BackgroundStarknetTransactionMonitor,
+  STARKNET_TRANSACTION_MONITOR_ALARM
+} from './starknet-transaction-monitor'
+import {
+  deriveSoftwareStarknetMetadata,
+  hydrateSoftwareStarknetAccounts,
+  readSoftwareStarknetAccount
+} from './starknet-account-projection'
+import { computeStarknetLedgerAddress } from './starknet-ledger-address'
+import { createStarknetDAppHandler, type StarknetDAppHandler } from './starknet-dapp-handler'
+import {
+  StarknetProviderError,
+  toStarknetProviderErrorShape,
+  type StarknetDAppRuntimeMethod
+} from '@/core/dapp/starknet-provider'
+import { getStarknetNetworkConfig } from '@/core/chains/starknet/network-config'
+import { resolveStarknetFeatureRuntimePolicy } from '@/core/chains/feature-runtime-policy'
 import { hasKeystoneWalletMissingNetworkProjection } from '@/store/wallet-network-projection'
 import {
   configureLedgerSigningCoordinator,
@@ -387,6 +431,7 @@ import {
   cancelLedgerSigning,
   cancelAllLedgerSigning
 } from './ledger-signing-coordinator'
+import { ledgerSigningChainFamily } from './ledger-chain-family'
 import { readLedgerProvisioningCredential } from './ledger-signing-bridge'
 
 import type { ChromeTokenVisibilityRepository } from '@/infrastructure/portfolio/chrome-token-visibility'
@@ -443,6 +488,7 @@ const quantusFeatureRuntimePolicy = resolveQuantusFeatureRuntimePolicy(
 const solanaBetaEnabled = __ENABLED_CHAIN_FEATURE_FLAGS__.includes(SOLANA_CHAIN_FEATURE_FLAG)
 const nearBetaEnabled = __ENABLED_CHAIN_FEATURE_FLAGS__.includes(NEAR_CHAIN_FEATURE_FLAG)
 const pearlBetaEnabled = __ENABLED_CHAIN_FEATURE_FLAGS__.includes(PEARL_CHAIN_FEATURE_FLAG)
+const dashFeatureRuntimePolicy = resolveDashFeatureRuntimePolicy(__ENABLED_CHAIN_FEATURE_FLAGS__)
 const quantusBetaEnabled = quantusFeatureRuntimePolicy.newOperationsEnabled
 
 function areSolanaOperationsEnabled(): boolean {
@@ -453,15 +499,31 @@ function areNearOperationsEnabled(): boolean {
   return resolveNearFeatureRuntimePolicy(__ENABLED_CHAIN_FEATURE_FLAGS__).newOperationsEnabled
 }
 
+function areStarknetOperationsEnabled(): boolean {
+  return resolveStarknetFeatureRuntimePolicy(__ENABLED_CHAIN_FEATURE_FLAGS__).newOperationsEnabled
+}
+
 let evmTransactionMonitor: BackgroundEvmTransactionMonitor | null = null
 let bitcoinTransactionMonitor: BackgroundBitcoinTransactionMonitor | null = null
 let pearlTransactionMonitor: BackgroundPearlTransactionMonitor | null = null
+let dashTransactionMonitor: BackgroundDashTransactionMonitor | null = null
+let dashTransferController: ReturnType<typeof createBackgroundDashTransferController> | null = null
 let nearIntentsTransactionMonitor: BackgroundNearIntentsTransactionMonitor | null = null
 let solanaTransactionMonitor: BackgroundSolanaTransactionMonitor | null = null
 let quantusTransactionMonitor: BackgroundQuantusTransactionMonitor | null = null
 let nearTransactionMonitor: BackgroundNearTransactionMonitor | null = null
+let starknetSessionUnlocked = false
+let starknetTransferController: ReturnType<
+  typeof createBackgroundStarknetTransferController
+> | null = null
+let starknetTransactionMonitor: BackgroundStarknetTransactionMonitor | null = null
+let starknetDAppHandler: StarknetDAppHandler | null = null
 
-type EnabledPrivateKeyChainFamily = 'eip155' | 'bip122' | 'pearl' | 'solana' | 'near'
+type EnabledPrivateKeyChainFamily = 'eip155' | 'bip122' | 'pearl' | 'solana' | 'near' | 'dash'
+
+function isDashExportChainId(value: string): boolean {
+  return value === DASH_CHAIN_IDS.mainnet || value === DASH_CHAIN_IDS.testnet
+}
 
 function resolveEnabledPrivateKeyChainFamily(value: unknown): EnabledPrivateKeyChainFamily {
   if (
@@ -469,7 +531,8 @@ function resolveEnabledPrivateKeyChainFamily(value: unknown): EnabledPrivateKeyC
       value === 'bip122' ||
       value === 'pearl' ||
       value === 'solana' ||
-      value === 'near') &&
+      value === 'near' ||
+      value === 'dash') &&
     isNewWalletFamilyEnabled(value, __ENABLED_CHAIN_FEATURE_FLAGS__)
   )
     return value
@@ -486,6 +549,7 @@ function resolveEnabledPrivateKeyExportChainId(value: unknown): string {
   ) {
     resolveEnabledPrivateKeyChainFamily('pearl')
   }
+  if (isDashExportChainId(value)) resolveEnabledPrivateKeyChainFamily('dash')
   return value
 }
 let evmPortfolioConformanceCoordinator: ReturnType<
@@ -586,6 +650,7 @@ const swapTokenCatalogCache = new ChromeSwapTokenCatalogCacheRepository()
 let evmDAppHandler!: ReturnType<typeof createBackgroundEvmDAppHandler>
 let bitcoinDAppHandler!: ReturnType<typeof createBackgroundBitcoinDAppHandler>
 let pearlDAppHandler!: ReturnType<typeof createBackgroundPearlDAppHandler>
+let dashDAppHandler: ReturnType<typeof createBackgroundDashDAppHandler> | null = null
 let quantusDAppHandler!: ReturnType<typeof createBackgroundQuantusDAppHandler>
 let solanaDAppHandler: ReturnType<typeof createBackgroundSolanaDAppHandler> | null = null
 let nearDAppHandler: ReturnType<typeof createBackgroundNearDAppHandler> | null = null
@@ -617,6 +682,9 @@ const networkSwitchBitcoinDerivation = new BitcoinMultichainDerivationClient({
   credentials: credentialSession
 })
 const networkSwitchPearlDerivation = new PearlMultichainDerivationClient({
+  credentials: credentialSession
+})
+const networkSwitchDashDerivation = new DashMultichainDerivationClient({
   credentials: credentialSession
 })
 const accountNetworksPeaDerivation = new EvmMultichainSigningClient({
@@ -697,7 +765,16 @@ const dappExecutionModeTransitionCoordinator = new DAppExecutionModeTransitionCo
 )
 
 async function dispatchDAppChainRequest(
-  chainId: 'zcash' | 'evm' | 'bitcoin' | 'pearl' | 'quantus' | 'solana' | 'near',
+  chainId:
+    | 'zcash'
+    | 'evm'
+    | 'bitcoin'
+    | 'dash'
+    | 'solana'
+    | 'near'
+    | 'pearl'
+    | 'quantus'
+    | 'starknet',
   request: {
     readonly method: string
     readonly params?: readonly unknown[] | Readonly<Record<string, unknown>>
@@ -706,6 +783,16 @@ async function dispatchDAppChainRequest(
   tabInfo: { readonly title?: string; readonly favIconUrl?: string; readonly pageUrl?: string }
 ): Promise<unknown> {
   await assertCaip25MethodPermission(chainId, request.method, origin)
+  if (chainId === 'starknet') {
+    if (!starknetDAppHandler) throw new Error('Starknet dApp runtime is unavailable')
+    return starknetDAppHandler.request(
+      {
+        method: request.method as StarknetDAppRuntimeMethod,
+        ...(request.params === undefined ? {} : { params: request.params })
+      },
+      origin
+    )
+  }
   if (chainId === 'evm') {
     return evmDAppHandler.request(
       {
@@ -721,6 +808,19 @@ async function dispatchDAppChainRequest(
     return bitcoinDAppHandler.request(
       {
         method: request.method as BitcoinDAppRuntimeMethod,
+        ...(params === undefined ? {} : { params })
+      },
+      origin,
+      tabInfo
+    )
+  }
+  if (chainId === 'dash') {
+    if (!dashDAppHandler) {
+      throw new DashProviderError(4901, 'The Dash chain is not enabled in this wallet build.')
+    }
+    return dashDAppHandler.request(
+      {
+        method: request.method as DashDAppRuntimeMethod,
         ...(params === undefined ? {} : { params })
       },
       origin,
@@ -784,13 +884,23 @@ const CAIP25_CONNECTION_METHODS = new Set([
   'wallet_addEthereumChain',
   'connect',
   'requestAccounts',
+  'wallet_requestAccounts',
   'disconnect',
   'switchNetwork',
   'switchChain'
 ])
 
 async function assertCaip25MethodPermission(
-  family: 'zcash' | 'evm' | 'bitcoin' | 'pearl' | 'quantus' | 'solana' | 'near',
+  family:
+    | 'zcash'
+    | 'evm'
+    | 'bitcoin'
+    | 'dash'
+    | 'solana'
+    | 'near'
+    | 'pearl'
+    | 'quantus'
+    | 'starknet',
   method: string,
   origin: string
 ): Promise<void> {
@@ -802,24 +912,30 @@ async function assertCaip25MethodPermission(
         ? evmDAppHandler.getCaip2ChainId()
         : family === 'bitcoin'
           ? getBitcoinChainId(DEFAULT_NETWORK)
-          : family === 'pearl'
-            ? getPearlChainId(DEFAULT_NETWORK)
-            : family === 'quantus'
-              ? getQuantusChainId(DEFAULT_NETWORK)
-              : family === 'solana'
-                ? resolveSolanaRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
-                : resolveNearRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
+          : family === 'dash'
+            ? getDashChainId(DEFAULT_NETWORK)
+            : family === 'solana'
+              ? resolveSolanaRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
+              : family === 'near'
+                ? resolveNearRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
+                : family === 'pearl'
+                  ? getPearlChainId(DEFAULT_NETWORK)
+                  : family === 'quantus'
+                    ? getQuantusChainId(DEFAULT_NETWORK)
+                    : getStarknetNetworkConfig(DEFAULT_NETWORK).chainId
   const session = await dappManager.getCaip25Session(origin)
   const scope = session?.scopes.find(candidate => candidate.chainId === chainId)
   if (!scope || caip25SessionAllowsMethod(session, chainId, method)) return
   const message = `${method} is not authorized for CAIP-25 scope ${chainId}.`
   if (family === 'evm') throw new Eip1193ProviderError(4100, message)
   if (family === 'bitcoin') throw new BitcoinProviderError(4100, message)
+  if (family === 'dash') throw new DashProviderError(4100, message)
   if (family === 'pearl') throw new PearlProviderError(4100, message)
   if (family === 'quantus') throw new QuantusProviderError(4100, message)
   if (family === 'solana' || family === 'near') {
     throw new NativeTransferProviderError(4100, message)
   }
+  if (family === 'starknet') throw new StarknetProviderError(4100, message)
   throw new Error(message)
 }
 
@@ -1021,6 +1137,9 @@ async function reloadMultichainRuntime(
   pearlTransactionMonitor = pearlFeatureRuntimePolicy.transactionRecoveryEnabled
     ? new BackgroundPearlTransactionMonitor(pearlRpcUrl)
     : null
+  dashTransactionMonitor = dashFeatureRuntimePolicy.newOperationsEnabled
+    ? new BackgroundDashTransactionMonitor()
+    : null
   evmPortfolioConformanceCoordinator = __MULTICHAIN_CONFORMANCE_RPC_ENABLED__
     ? createBackgroundEvmPortfolioCoordinator(activeEvm)
     : null
@@ -1028,10 +1147,12 @@ async function reloadMultichainRuntime(
     evmFeatureRuntimePolicy.newOperationsEnabled ||
     bitcoinFeatureRuntimePolicy.newOperationsEnabled ||
     pearlFeatureRuntimePolicy.newOperationsEnabled ||
+    dashFeatureRuntimePolicy.newOperationsEnabled ||
     solanaBetaEnabled ||
     nearBetaEnabled ||
     pearlBetaEnabled ||
-    quantusBetaEnabled
+    quantusBetaEnabled ||
+    areStarknetOperationsEnabled()
       ? createBackgroundPortfolioCoordinator(
           catalog,
           customEvmNetworks,
@@ -1053,7 +1174,8 @@ async function reloadMultichainRuntime(
         useWalletStore.getState().getAccount(scope.keyDomainId, scope.accountId)
           ?.networkAddresses?.[DEFAULT_NETWORK]?.shielded || null
       )
-    }
+    },
+    networkSwitchDashDerivation
   )
   const evmTransferRuntime =
     evmFeatureRuntimePolicy.newOperationsEnabled && hasBackgroundEvmTransferCapability(activeEvm)
@@ -1101,6 +1223,20 @@ async function reloadMultichainRuntime(
     pearlFeatureRuntimePolicy.newOperationsEnabled && hasBackgroundPearlTransferCapability()
       ? createBackgroundPearlTransferController()
       : null
+  if (shouldCancelAwaitingApprovals) {
+    await dashTransferController?.cancelAllAwaitingApprovals()
+  }
+  dashTransferController = dashFeatureRuntimePolicy.newOperationsEnabled
+    ? createBackgroundDashTransferController()
+    : null
+  if (dashFeatureRuntimePolicy.newOperationsEnabled && !isRuntimeReconfiguration) {
+    void recoverBackgroundDashTransfers().catch(error => {
+      console.warn(
+        '[Dash Transfer] Startup recovery failed:',
+        error instanceof Error ? error.name : 'UnknownError'
+      )
+    })
+  }
   quantusTransferController = quantusBetaEnabled
     ? createBackgroundQuantusTransferController(intentsProtocolAssets, settings)
     : null
@@ -1126,6 +1262,49 @@ async function reloadMultichainRuntime(
       : null
   nearTransactionMonitor = nearTransferController
     ? new BackgroundNearTransactionMonitor(nearTransferController)
+    : null
+  const starknetOperationsEnabled = areStarknetOperationsEnabled()
+  if (starknetOperationsEnabled) {
+    await hydrateSoftwareStarknetAccounts()
+    starknetSessionUnlocked = await credentialSession.hasUnlockSession()
+  } else {
+    starknetSessionUnlocked = false
+  }
+  starknetTransferController = starknetOperationsEnabled
+    ? createBackgroundStarknetTransferController(intentsProtocolAssets, settings)
+    : null
+  starknetTransactionMonitor = starknetTransferController
+    ? new BackgroundStarknetTransactionMonitor(starknetTransferController)
+    : null
+  const starknetAccount = () => {
+    const state = useWalletStore.getState()
+    const wallet = state.currentWalletId ? state.getWallet(state.currentWalletId) : null
+    if (!wallet) return null
+    return readSoftwareStarknetAccount(state.currentWalletId, state.currentAccountId)
+  }
+  starknetDAppHandler = starknetOperationsEnabled
+    ? createStarknetDAppHandler({
+        getNetwork: () => DEFAULT_NETWORK,
+        isUnlocked: () => starknetSessionUnlocked,
+        ensureUnlocked: async () => {
+          if (starknetSessionUnlocked || (await credentialSession.hasUnlockSession())) {
+            starknetSessionUnlocked = true
+            return
+          }
+          await promptUnlock({ restoreZcashRuntime: false })
+          starknetSessionUnlocked = true
+        },
+        getAccount: () => loadStarknetDappAccount(),
+        requestApproval: (origin, action, data) =>
+          dappHandler.requestExternalApproval(origin, action, data),
+        quoteInvoke: starknetTransferController
+          ? { quote: input => starknetTransferController!.quoteInvoke(input) }
+          : null,
+        signer: createStarknetSessionSigner(starknetAccount, settings),
+        ledger: createStarknetLedgerDappSigner(settings),
+        broadcast: (origin, eventName, data) =>
+          dappHandler.broadcastProviderEvent(origin, 'starknet', eventName, data)
+      })
     : null
   const nextEvmDAppHandler = createBackgroundEvmDAppHandler(
     evmTransferController,
@@ -1157,6 +1336,9 @@ async function reloadMultichainRuntime(
         })
     })
   })
+  dashDAppHandler = dashFeatureRuntimePolicy.newOperationsEnabled
+    ? createBackgroundDashDAppHandler(dashTransferController)
+    : null
   solanaDAppHandler = solanaOperationsEnabled ? createBackgroundSolanaDAppHandler(settings) : null
   nearDAppHandler = nearOperationsEnabled ? createBackgroundNearDAppHandler(settings) : null
   quantusDAppHandler = createBackgroundQuantusDAppHandler(
@@ -1179,6 +1361,8 @@ async function reloadMultichainRuntime(
     evm: evmDAppHandler,
     bitcoin: bitcoinDAppHandler,
     bitcoinEnabled: bitcoinFeatureRuntimePolicy.newOperationsEnabled,
+    dash: dashDAppHandler,
+    dashEnabled: dashFeatureRuntimePolicy.newOperationsEnabled,
     solana: solanaDAppHandler,
     near: nearDAppHandler,
     ...(solanaScope === undefined
@@ -1199,6 +1383,16 @@ async function reloadMultichainRuntime(
             iconChain: 'near'
           }
         }),
+    starknet: starknetDAppHandler,
+    ...(starknetOperationsEnabled
+      ? {
+          starknetScope: {
+            chainId: getStarknetNetworkConfig(DEFAULT_NETWORK).chainId,
+            chainName: getStarknetNetworkConfig(DEFAULT_NETWORK).displayName,
+            iconChain: 'starknet'
+          }
+        }
+      : {}),
     dispatch: dispatchDAppChainRequest
   })
   assetPriceService = createBackgroundAssetPriceService(
@@ -1225,9 +1419,11 @@ async function reloadMultichainRuntime(
     evmTransactionMonitor?.init(),
     bitcoinTransactionMonitor?.init(),
     pearlTransactionMonitor?.init(),
+    dashTransactionMonitor?.init(),
     solanaTransactionMonitor?.init(),
     quantusTransactionMonitor?.init(),
     nearTransactionMonitor?.init(),
+    starknetTransactionMonitor?.init(),
     portfolioCoordinator?.readCachedActive()
   ])
   if (previousNumericChainId !== 0 && previousNumericChainId !== activeEvm.numericChainId) {
@@ -1379,6 +1575,14 @@ async function prepareSoftwareWalletNetworkMetadata(target: Network): Promise<vo
             addressIndex: 0
           })
         : undefined
+      const dash = dashFeatureRuntimePolicy.newOperationsEnabled
+        ? await networkSwitchDashDerivation.deriveAddress(parseKeyDomainId(wallet.id), {
+            chainId: parseChainId(getDashChainId(target)).id,
+            accountIndex: account.derivationIndex,
+            change: false,
+            addressIndex: 0
+          })
+        : undefined
       const ed25519 = await deriveSoftwareEd25519NetworkMetadata({
         keyDomainId: wallet.id,
         accountIndex: account.derivationIndex,
@@ -1392,6 +1596,14 @@ async function prepareSoftwareWalletNetworkMetadata(target: Network): Promise<vo
         network: target,
         quantusEnabled: quantusBetaEnabled
       })
+      const starknet = areStarknetOperationsEnabled()
+        ? await deriveSoftwareStarknetMetadata({
+            keyDomainId: wallet.id,
+            accountId: account.id,
+            accountIndex: account.derivationIndex,
+            network: target
+          })
+        : undefined
       metadata.push({
         keyDomainId: parseKeyDomainId(wallet.id),
         accountId: parseAccountId(account.id),
@@ -1401,8 +1613,10 @@ async function prepareSoftwareWalletNetworkMetadata(target: Network): Promise<vo
         zcashAddresses: zcash,
         bitcoin,
         ...(pearl === undefined ? {} : { pearl }),
+        ...(dash === undefined ? {} : { dash }),
         ...ed25519,
-        ...quantus
+        ...quantus,
+        ...(starknet === undefined ? {} : { starknet: starknet.metadata })
       })
       useWalletStore.getState().updateAccountInWallets(wallet.id, account.id, {
         networkAddresses: {
@@ -1417,14 +1631,27 @@ async function prepareSoftwareWalletNetworkMetadata(target: Network): Promise<vo
     }
   }
   if (metadata.length > 0) {
-    await credentialLifecycle.synchronizeNetworkAccountMetadata(metadata)
+    const result = await credentialLifecycle.synchronizeNetworkAccountMetadata(metadata)
+    if (result.status === 'synchronized') {
+      await chrome.runtime.sendMessage({ type: 'ACCOUNT_CONTEXT_CHANGED' }).catch(() => {})
+    }
   }
   useWalletStore.getState().setCurrentNetwork(target)
   await flushWalletStore()
 }
 
 async function synchronizeCurrentSoftwareWalletNetworkMetadata(): Promise<void> {
-  if (!solanaBetaEnabled && !nearBetaEnabled && !pearlBetaEnabled && !quantusBetaEnabled) return
+  if (
+    !solanaBetaEnabled &&
+    !nearBetaEnabled &&
+    !pearlBetaEnabled &&
+    !dashFeatureRuntimePolicy.newOperationsEnabled &&
+    !quantusBetaEnabled &&
+    !areStarknetOperationsEnabled()
+  ) {
+    return
+  }
+  if (!(await credentialSession.hasUnlockSession())) return
   await prepareSoftwareWalletNetworkMetadata(DEFAULT_NETWORK)
   const currentWalletId = useWalletStore.getState().currentWalletId
   const currentWallet = currentWalletId
@@ -1483,6 +1710,16 @@ async function switchGlobalNetworkMode(target: Network): Promise<{ restartRequir
   if (nearPending.some(item => item.phase === 'signed')) {
     throw new Error('Broadcast or recover the signed NEAR transaction before switching networks')
   }
+  const starknetPending = starknetTransferController
+    ? await starknetTransferController.listPending()
+    : []
+  if (
+    starknetPending.some(item => item.status === 'pending' && item.phase !== 'awaiting-approval')
+  ) {
+    throw new Error(
+      'Broadcast or recover the signed Starknet transaction before switching networks'
+    )
+  }
 
   return accountContextTransition.runActiveOperation(async () => {
     syncScheduler.pauseForTx()
@@ -1492,6 +1729,7 @@ async function switchGlobalNetworkMode(target: Network): Promise<{ restartRequir
     try {
       const idle = await syncScheduler.waitForActiveSyncIdle(30_000)
       if (!idle) throw new Error('Wallet sync did not stop before network switch')
+      await credentialLifecycle.projectLedgerStarknetNetwork(target)
       await prepareSoftwareWalletNetworkMetadata(target)
       targetProjectionPrepared = true
       pendingRequestsManager.cancelAll()
@@ -1499,9 +1737,11 @@ async function switchGlobalNetworkMode(target: Network): Promise<{ restartRequir
         evmTransferRouter?.cancelAllAwaitingApprovals(),
         bitcoinTransferController?.cancelAllAwaitingApprovals(),
         pearlTransferController?.cancelAllAwaitingApprovals(),
+        dashTransferController?.cancelAllAwaitingApprovals(),
         solanaTransferController?.cancelAllAwaitingApprovals(),
+        nearTransferController?.cancelAllAwaitingApprovals(),
         quantusTransferController?.cancelAllAwaitingApprovals(),
-        nearTransferController?.cancelAllAwaitingApprovals()
+        starknetTransferController?.cancelAllAwaitingApprovals()
       ])
       await dappManager.clearConnections()
       await performWalletLockState()
@@ -1641,17 +1881,7 @@ logger.configureDiagnostics(appendDiagnosticLog)
 configureLedgerSigningCoordinator(async scope => {
   if (networkRestartRequired || !(await credentialSession.hasUnlockSession()))
     throw new Error('Wallet is locked or restarting')
-  const namespace = parseChainId(scope.chainId).namespace
-  const family =
-    namespace === 'eip155'
-      ? 'evm'
-      : namespace === 'solana'
-        ? 'solana'
-        : namespace === 'near'
-          ? 'near'
-          : namespace === 'bip122'
-            ? 'bitcoin'
-            : null
+  const family = ledgerSigningChainFamily(scope.chainId)
   if (!family) throw new Error('Unsupported Ledger chain')
   await credentialLifecycle.assertActiveAccountSupportsChain(
     scope.keyDomainId,
@@ -1811,12 +2041,27 @@ async function performSilentWasmInitialization(): Promise<void> {
   try {
     await runtimeNetworkReady
     await prepareWalletStoreForUse()
+    await credentialLifecycle.projectLedgerStarknetNetwork(DEFAULT_NETWORK).catch(error => {
+      console.warn('[Background] Ledger Starknet network projection failed:', error)
+    })
 
     restoreStuckWithdrawMonitors().catch(err => {
       console.warn('[Background] Failed to restore stuck withdraw monitors:', err)
     })
 
     await backgroundZcashWalletRuntime.initialize()
+    void (async () => {
+      if (!(await credentialSession.hasUnlockSession())) return
+      if (
+        backgroundZcashWalletRuntime.isLocked() &&
+        !(await restoreBackgroundZcashRuntimeFromSession())
+      ) {
+        return
+      }
+      await synchronizeCurrentSoftwareWalletNetworkMetadata()
+    })().catch(error => {
+      console.warn('[Background] Software network metadata sync failed:', error)
+    })
     await walletCleanupCoordinator.resumePendingCleanup()
 
     const initialRpcEndpointId = getPreferredRpcEndpointOption('zcash').id
@@ -2022,6 +2267,11 @@ chrome.alarms.onAlarm.addListener(alarm => {
           console.warn('[EVM Transaction Monitor] Poll failed:', error)
         })
       }
+      if (alarm.name === DASH_TRANSACTION_MONITOR_ALARM) {
+        dashTransactionMonitor?.handleAlarm().catch(error => {
+          console.warn('[Dash Transaction Monitor] Poll failed:', error)
+        })
+      }
       if (alarm.name === BITCOIN_TRANSACTION_MONITOR_ALARM) {
         bitcoinTransactionMonitor?.handleAlarm().catch(error => {
           const { currentWalletId, currentAccountId } = useWalletStore.getState()
@@ -2058,6 +2308,11 @@ chrome.alarms.onAlarm.addListener(alarm => {
       if (alarm.name === NEAR_TRANSACTION_MONITOR_ALARM) {
         nearTransactionMonitor?.handleAlarm().catch(error => {
           console.warn('[NEAR Transaction Monitor] Poll failed:', error)
+        })
+      }
+      if (alarm.name === STARKNET_TRANSACTION_MONITOR_ALARM) {
+        starknetTransactionMonitor?.handleAlarm().catch(error => {
+          console.warn('[Starknet Transaction Monitor] Poll failed:', error)
         })
       }
       if (alarm.name === NEAR_INTENTS_TRANSACTION_MONITOR_ALARM) {
@@ -2266,10 +2521,12 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
         if (
           chainId === 'evm' ||
           chainId === 'bitcoin' ||
+          chainId === 'dash' ||
           chainId === 'pearl' ||
           chainId === 'quantus' ||
           chainId === 'solana' ||
           chainId === 'near' ||
+          chainId === 'starknet' ||
           chainId === 'multichain'
         ) {
           await multichainStartupReady
@@ -2286,6 +2543,15 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
             error: {
               code: 4200,
               message: 'The Bitcoin provider is unavailable in this wallet build.'
+            }
+          })
+          return
+        }
+        if (chainId === 'dash' && !dashFeatureRuntimePolicy.newOperationsEnabled) {
+          respond({
+            error: {
+              code: 4901,
+              message: 'The Dash chain is not enabled in this wallet build.'
             }
           })
           return
@@ -2320,6 +2586,15 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
         if (chainId === 'near' && !areNearOperationsEnabled()) {
           respond({
             error: { code: 4200, message: 'The NEAR provider is unavailable in this wallet build.' }
+          })
+          return
+        }
+        if (chainId === 'starknet' && !areStarknetOperationsEnabled()) {
+          respond({
+            error: {
+              code: 4200,
+              message: 'The Starknet provider is unavailable in this wallet build.'
+            }
           })
           return
         }
@@ -2391,13 +2666,17 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
                   ? toBitcoinProviderErrorShape(error)
                   : parsedMessage.chainId === 'pearl'
                     ? toPearlProviderErrorShape(error)
-                    : parsedMessage.chainId === 'quantus'
-                      ? toQuantusProviderErrorShape(error)
+                    : parsedMessage.chainId === 'dash'
+                      ? toDashProviderErrorShape(error)
                       : parsedMessage.chainId === 'solana' || parsedMessage.chainId === 'near'
                         ? toNativeTransferProviderErrorShape(error)
-                        : error instanceof Error
-                          ? error.message
-                          : 'dApp request failed'
+                        : parsedMessage.chainId === 'quantus'
+                          ? toQuantusProviderErrorShape(error)
+                          : parsedMessage.chainId === 'starknet'
+                            ? toStarknetProviderErrorShape(error)
+                            : error instanceof Error
+                              ? error.message
+                              : 'dApp request failed'
         })
       }
     })
@@ -2574,6 +2853,7 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
       'SUBMIT_LEDGER_SIGNING_RESPONSE',
       'CANCEL_LEDGER_SIGNING_REQUEST',
       'GET_LEDGER_PROVISIONING_CREDENTIAL',
+      'COMPUTE_STARKNET_LEDGER_ADDRESS',
       'GET_HARDWARE_TRANSFER_VENDOR'
     ].includes(message.type)
   ) {
@@ -2603,7 +2883,10 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
         : message.type === 'SUBMIT_LEDGER_SIGNING_RESPONSE'
           ? submitLedgerSigningResponse(message.requestId, message.response, sender.tab?.id)
           : getLedgerSigningRequest(message.requestId, sender.tab?.id).then(() =>
-              cancelLedgerSigning(message.requestId)
+              cancelLedgerSigning(
+                message.requestId,
+                typeof message.reason === 'string' ? message.reason : undefined
+              )
             )
     void operation
       .then(result => sendResponse({ result: result ?? true }))
@@ -2622,6 +2905,25 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
       .catch(error =>
         sendResponse({
           error: error instanceof Error ? error.message : 'Ledger Wallet unavailable'
+        })
+      )
+    return true
+  }
+  if (message.type === 'COMPUTE_STARKNET_LEDGER_ADDRESS') {
+    if (!isOwnExtensionRouteSender(sender, chrome.runtime.id, '/hardware/ledger-connect')) {
+      sendResponse({ error: 'Unauthorized Ledger setup sender' })
+      return true
+    }
+    const publicKey = message.publicKey
+    if (typeof publicKey !== 'string') {
+      sendResponse({ error: 'Invalid Ledger runtime message' })
+      return true
+    }
+    void computeStarknetLedgerAddress(publicKey, getStarknetNetworkConfig(DEFAULT_NETWORK).chainId)
+      .then(result => sendResponse({ result }))
+      .catch(error =>
+        sendResponse({
+          error: error instanceof Error ? error.message : 'Starknet address computation failed'
         })
       )
     return true
@@ -3547,9 +3849,16 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
           error.cause.cause instanceof BitcoinDiscoveryReadError
             ? error.cause.cause.stage
             : 'unknown'
+        const cause =
+          error instanceof PortfolioCoordinatorError && error.cause instanceof Error
+            ? error.cause.message
+            : error instanceof Error
+              ? error.message
+              : 'UnknownError'
         console.warn(
           '[Portfolio] Request failed at stage:',
           error instanceof PortfolioCoordinatorError ? error.stage : 'unknown',
+          cause,
           'Bitcoin stage:',
           bitcoinStage,
           'Discovery stage:',
@@ -3674,6 +3983,11 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
     message.type === 'DISCARD_RHEA_SWAP'
   ) {
     if (!rheaSwapService || !rheaSwapEvmSignatureCoordinator) {
+      console.error('[RHEA Swap] Request failed', {
+        operation: message.type,
+        errorName: 'UnavailableError',
+        errorMessage: 'RHEA Swap is unavailable in this build or network'
+      })
       sendResponse({ error: 'RHEA Swap is unavailable in this build or network' })
       return true
     }
@@ -3938,6 +4252,7 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
         })
         await bitcoinDAppHandler.notifyAccountsChanged()
         await pearlDAppHandler.notifyAccountsChanged()
+        await dashDAppHandler?.notifyAccountsChanged()
         await quantusDAppHandler.notifyAccountsChanged()
         await multichainSessionDAppHandler?.notifyAllSessionsChanged()
         await chrome.runtime
@@ -4239,6 +4554,49 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
   }
 
   if (
+    message.type === 'PREPARE_STARKNET_TRANSFER' ||
+    message.type === 'QUOTE_STARKNET_TRANSFER_MAX' ||
+    message.type === 'GET_PENDING_STARKNET_TRANSFER' ||
+    message.type === 'APPROVE_STARKNET_TRANSFER' ||
+    message.type === 'REJECT_STARKNET_TRANSFER' ||
+    message.type === 'RESUME_STARKNET_TRANSFER'
+  ) {
+    if (!starknetTransferController) {
+      sendResponse({ error: 'Starknet send is unavailable in this wallet build.' })
+      return true
+    }
+    const operation =
+      message.type === 'PREPARE_STARKNET_TRANSFER'
+        ? starknetTransferController.prepare(message.intent)
+        : message.type === 'QUOTE_STARKNET_TRANSFER_MAX'
+          ? starknetTransferController.quoteMaximum(message.intent)
+          : message.type === 'GET_PENDING_STARKNET_TRANSFER'
+            ? starknetTransferController.getPendingApproval(message.transactionId)
+            : message.type === 'APPROVE_STARKNET_TRANSFER'
+              ? starknetTransferController.approve(
+                  message.transactionId,
+                  message.payloadFingerprint
+                )
+              : message.type === 'REJECT_STARKNET_TRANSFER'
+                ? starknetTransferController.reject(message.transactionId)
+                : starknetTransferController.resumeBroadcast(message.transactionId)
+    void operation
+      .then(result => {
+        if (
+          message.type === 'APPROVE_STARKNET_TRANSFER' ||
+          message.type === 'RESUME_STARKNET_TRANSFER'
+        ) {
+          void chrome.alarms.create(STARKNET_TRANSACTION_MONITOR_ALARM, { when: Date.now() + 100 })
+        }
+        sendResponse({ result })
+      })
+      .catch(error =>
+        sendResponse({ error: error instanceof Error ? error.message : 'Starknet transfer failed' })
+      )
+    return true
+  }
+
+  if (
     message.type === 'PREPARE_BITCOIN_TRANSFER' ||
     message.type === 'GET_PENDING_BITCOIN_TRANSFER' ||
     message.type === 'APPROVE_BITCOIN_TRANSFER' ||
@@ -4341,6 +4699,82 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
       })
       .catch(error => {
         sendResponse({ error: mapPearlWalletRuntimeError(error) })
+      })
+    return true
+  }
+
+  if (
+    message.type === 'PREPARE_DASH_TRANSFER' ||
+    message.type === 'GET_PENDING_DASH_TRANSFER' ||
+    message.type === 'APPROVE_DASH_TRANSFER' ||
+    message.type === 'REJECT_DASH_TRANSFER' ||
+    message.type === 'RESUME_DASH_TRANSFER'
+  ) {
+    if (!dashTransferController) {
+      sendResponse({ error: 'Dash transfers are unavailable' })
+      return true
+    }
+    const controller = dashTransferController
+    const operation =
+      message.type === 'PREPARE_DASH_TRANSFER'
+        ? controller.prepare(message.intent)
+        : message.type === 'GET_PENDING_DASH_TRANSFER'
+          ? controller.getPendingApproval(message.transactionId)
+          : message.type === 'APPROVE_DASH_TRANSFER'
+            ? controller.approve(message.transactionId, message.payloadFingerprint)
+            : message.type === 'REJECT_DASH_TRANSFER'
+              ? controller.reject(message.transactionId)
+              : controller.resumeBroadcast(message.transactionId)
+    void operation
+      .then(async result => {
+        if (message.type === 'APPROVE_DASH_TRANSFER' && isDashExternalSignatureRequired(result)) {
+          const handoff = beginDashLedgerWalletSignature(controller, result)
+          try {
+            await handoff.tabReady
+          } catch (error) {
+            try {
+              sendResponse({
+                error: error instanceof Error ? error.message : 'Dash transfer failed'
+              })
+            } catch {
+              // The popup can close when focus moves to the Ledger tab.
+            }
+            return
+          }
+          try {
+            sendResponse({ result })
+          } catch {
+            // The Ledger tab is already open. Submission continues after the popup closes.
+          }
+          void handoff.done.then(broadcast => {
+            if (!broadcast) return
+            void chrome.alarms.create(DASH_TRANSACTION_MONITOR_ALARM, { when: Date.now() + 100 })
+          })
+          return
+        }
+        if (message.type === 'APPROVE_DASH_TRANSFER' || message.type === 'RESUME_DASH_TRANSFER') {
+          void chrome.alarms.create(DASH_TRANSACTION_MONITOR_ALARM, { when: Date.now() + 100 })
+        }
+        sendResponse({ result })
+      })
+      .catch(error => {
+        sendResponse({ error: error instanceof Error ? error.message : 'Dash transfer failed' })
+      })
+    return true
+  }
+
+  if (message.type === 'REFRESH_DASH_TRANSFER_STATUS') {
+    if (!dashTransactionMonitor) {
+      sendResponse({ error: 'Dash transfers are unavailable' })
+      return true
+    }
+    void dashTransactionMonitor
+      .refreshTransaction(String(message.transactionId))
+      .then(result => sendResponse({ result }))
+      .catch(error => {
+        sendResponse({
+          error: error instanceof Error ? error.message : 'Dash confirmation request failed'
+        })
       })
     return true
   }
@@ -4618,7 +5052,7 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
       accountId: message.accountId as string,
       chainId,
       password: message.password as string,
-      ...(message.bitcoinAddressType === undefined
+      ...(isDashExportChainId(chainId) || message.bitcoinAddressType === undefined
         ? {}
         : {
             bitcoinAddressType: message.bitcoinAddressType as
@@ -5489,6 +5923,7 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
           solanaTransactionMonitor?.handleAlarm() ?? Promise.resolve(null),
           quantusTransactionMonitor?.handleAlarm() ?? Promise.resolve(null),
           nearTransactionMonitor?.handleAlarm() ?? Promise.resolve(null),
+          starknetTransactionMonitor?.handleAlarm() ?? Promise.resolve(null),
           nearIntentsTransactionMonitor?.handleAlarm() ?? Promise.resolve(null)
         ]
     void Promise.allSettled(monitors).then(async results => {
@@ -5724,11 +6159,27 @@ async function handleDAppRequest(
 }
 
 /**
- * Open unlock window and wait for unlock completion
+ * Open unlock window and wait for unlock completion.
+ * Concurrent callers share the window that is already open.
  */
-async function promptUnlock(
-  options: { readonly restoreZcashRuntime?: boolean } = {}
-): Promise<void> {
+let promptUnlockInFlight: { promise: Promise<void>; restoreZcashRuntime: boolean } | null = null
+
+function promptUnlock(options: { readonly restoreZcashRuntime?: boolean } = {}): Promise<void> {
+  const restoreZcashRuntime = options.restoreZcashRuntime !== false
+  if (promptUnlockInFlight) {
+    promptUnlockInFlight.restoreZcashRuntime =
+      promptUnlockInFlight.restoreZcashRuntime || restoreZcashRuntime
+    return promptUnlockInFlight.promise
+  }
+  const flight = { promise: Promise.resolve(), restoreZcashRuntime }
+  flight.promise = runPromptUnlock(flight).finally(() => {
+    if (promptUnlockInFlight === flight) promptUnlockInFlight = null
+  })
+  promptUnlockInFlight = flight
+  return flight.promise
+}
+
+async function runPromptUnlock(flight: { restoreZcashRuntime: boolean }): Promise<void> {
   await closeAllPopupWindows()
 
   const lastWindow = await chrome.windows.getLastFocused()
@@ -5790,7 +6241,7 @@ async function promptUnlock(
       unlockReceived = true
       void (async () => {
         try {
-          if (options.restoreZcashRuntime === false) {
+          if (!flight.restoreZcashRuntime) {
             finish()
             return
           }
@@ -5863,6 +6314,7 @@ function restoreZcashDAppPermissionsAfterUnlock(): void {
         await evmDAppHandler.notifyAccountsChanged()
         await bitcoinDAppHandler.notifyAccountsChanged()
         await pearlDAppHandler.notifyAccountsChanged()
+        await dashDAppHandler?.notifyAccountsChanged()
         await quantusDAppHandler.notifyAccountsChanged()
         await solanaDAppHandler?.notifyAccountsChanged()
         await nearDAppHandler?.notifyAccountsChanged()
@@ -5924,6 +6376,7 @@ async function performWalletUnlock(password: string): Promise<any> {
           evmDAppHandler.notifyAccountsChanged(),
           bitcoinDAppHandler.notifyAccountsChanged(),
           pearlDAppHandler.notifyAccountsChanged(),
+          dashDAppHandler?.notifyAccountsChanged(),
           quantusDAppHandler.notifyAccountsChanged(),
           solanaDAppHandler?.notifyAccountsChanged(),
           nearDAppHandler?.notifyAccountsChanged(),
@@ -6064,6 +6517,7 @@ function handleWalletLock(): Promise<void> {
 }
 
 async function performWalletLockState(): Promise<void> {
+  starknetSessionUnlocked = false
   syncScheduler.pauseForTx()
   try {
     await cancelAllLedgerSigning('Wallet was locked. Review this action again.')
@@ -6095,6 +6549,7 @@ async function performWalletLockState(): Promise<void> {
     await dappHandler.notifyAccountsChanged([])
     await evmDAppHandler.notifyAccountsChanged()
     await bitcoinDAppHandler.notifyAccountsChanged()
+    await dashDAppHandler?.notifyAccountsChanged()
     await solanaDAppHandler?.notifyAccountsChanged()
     await nearDAppHandler?.notifyAccountsChanged()
     await multichainSessionDAppHandler?.notifyAllSessionsChanged()
@@ -6143,6 +6598,7 @@ async function handleAccountSwitched({
     }
     await evmDAppHandler.notifyAccountsChanged()
     await bitcoinDAppHandler.notifyAccountsChanged()
+    await dashDAppHandler?.notifyAccountsChanged()
     await solanaDAppHandler?.notifyAccountsChanged()
     await nearDAppHandler?.notifyAccountsChanged()
     await multichainSessionDAppHandler?.notifyAllSessionsChanged()
@@ -6156,6 +6612,7 @@ async function handleAccountSwitched({
     await dappHandler.notifyAccountsChanged([]).catch(() => {})
     await evmDAppHandler.notifyAccountsChanged().catch(() => {})
     await bitcoinDAppHandler.notifyAccountsChanged().catch(() => {})
+    await dashDAppHandler?.notifyAccountsChanged().catch(() => {})
     await solanaDAppHandler?.notifyAccountsChanged().catch(() => {})
     await nearDAppHandler?.notifyAccountsChanged().catch(() => {})
     await multichainSessionDAppHandler?.notifyAllSessionsChanged().catch(() => {})
@@ -6392,6 +6849,7 @@ async function synchronizeNativeActiveAccount(walletId: string, accountId: strin
     dappHandler.notifyAccountsChanged([]),
     evmDAppHandler.notifyAccountsChanged(),
     bitcoinDAppHandler.notifyAccountsChanged(),
+    dashDAppHandler?.notifyAccountsChanged(),
     solanaDAppHandler?.notifyAccountsChanged(),
     nearDAppHandler?.notifyAccountsChanged(),
     multichainSessionDAppHandler?.notifyAllSessionsChanged(),
@@ -6402,7 +6860,7 @@ async function synchronizeNativeActiveAccount(walletId: string, accountId: strin
 
 async function handleImportPrivateKeyWallet(input: {
   readonly privateKey: string
-  readonly chainFamily: 'eip155' | 'bip122' | 'pearl' | 'solana' | 'near'
+  readonly chainFamily: 'eip155' | 'bip122' | 'pearl' | 'solana' | 'near' | 'dash'
   readonly displayName: string
 }) {
   syncScheduler.pauseForTx()

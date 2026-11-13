@@ -9,6 +9,7 @@ export type ExampleChainIcon =
   | 'berachain'
   | 'bitcoin'
   | 'bsc'
+  | 'dash'
   | 'ethereum'
   | 'gnosis'
   | 'monad'
@@ -19,6 +20,7 @@ export type ExampleChainIcon =
   | 'quantus'
   | 'solana'
   | 'near'
+  | 'starknet'
   | 'xlayer'
   | 'zcash'
 
@@ -31,6 +33,7 @@ const EXAMPLE_CHAIN_ICON_URLS: Readonly<Record<ExampleChainIcon, string>> = Obje
   berachain: chainIconUrl('berachain'),
   bitcoin: chainIconUrl('bitcoin'),
   bsc: chainIconUrl('bsc'),
+  dash: chainIconUrl('dash'),
   ethereum: chainIconUrl('ethereum'),
   gnosis: chainIconUrl('gnosis'),
   monad: chainIconUrl('monad'),
@@ -41,6 +44,7 @@ const EXAMPLE_CHAIN_ICON_URLS: Readonly<Record<ExampleChainIcon, string>> = Obje
   quantus: `${import.meta.env.BASE_URL}quantus.svg`,
   solana: chainIconUrl('solana'),
   near: chainIconUrl('near'),
+  starknet: `${import.meta.env.BASE_URL}starknet.svg`,
   xlayer: chainIconUrl('xlayer'),
   zcash: chainIconUrl('zcash')
 })

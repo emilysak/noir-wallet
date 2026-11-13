@@ -7,15 +7,23 @@ import {
 import {
   discoverLedger,
   exportLedgerAccount,
+  getLedgerDeviceName,
   type LedgerSessionOptions,
   type LedgerTransport
 } from '@/lib/ledger/device'
+import { assertLedgerStarknetDeviceSupported } from '@/lib/ledger/starknet-model'
 import { exportLedgerEvmAccount } from '@/lib/ledger/evm'
 import { exportLedgerBitcoinAccount } from '@/lib/ledger/bitcoin'
 import { exportLedgerSolanaAccount } from '@/lib/ledger/solana'
 import { exportLedgerNearAccount } from '@/lib/ledger/near'
+import { exportLedgerDashAccount } from '@/lib/ledger/dash'
 import type { Network } from '@/types'
-import { ledgerAppName } from './ledger-device-status'
+import { ledgerAppName, ledgerDashModelStatus } from './ledger-device-status'
+import {
+  ledgerAccountCoversRequest,
+  resolveStarknetLedgerSelection
+} from '../pages/hardware/ledger-connect-model'
+import { assertLedgerDashFeature } from '@/core/wallet/ledger-feature-policy'
 
 export function ledgerCredentialAccounts(
   credential: LedgerHardwareCredential
@@ -47,7 +55,16 @@ export function ledgerAccountIdentity(account: LedgerPublicAccount): string {
             account.address,
             account.publicKey
           ]
-        : [account.family, account.derivationPath, account.address, account.publicKey]
+        : account.family === 'dash'
+          ? [
+              account.family,
+              account.derivationPath,
+              account.network,
+              account.xpub,
+              account.address,
+              account.publicKey
+            ]
+          : [account.family, account.derivationPath, account.address, account.publicKey]
   )
 }
 export async function exportLedgerWalletAccounts(input: {
@@ -114,6 +131,27 @@ export async function exportLedgerWalletAccounts(input: {
         address: result.address
       }
     }
+    if (family === 'dash') {
+      const unsupported = ledgerDashModelStatus(device.deviceModel.model)
+      if (unsupported) throw new Error(unsupported.message)
+      assertLedgerDashFeature(device.deviceModel.model, network)
+      const result = await exportLedgerDashAccount({
+        ...options,
+        network,
+        accountIndex: input.deviceAccountIndex,
+        ...(path ? { derivationPath: path } : {})
+      })
+      metadata = result
+      return {
+        family,
+        accountIndex: input.accountIndex,
+        derivationPath: result.accountPath,
+        network: 'mainnet',
+        xpub: result.xpub,
+        publicKey: result.publicKey,
+        address: result.address
+      }
+    }
     if (family === 'solana') {
       const result = await exportLedgerSolanaAccount(
         path ?? `m/44'/501'/${input.deviceAccountIndex}'/0'`,
@@ -141,6 +179,14 @@ export async function exportLedgerWalletAccounts(input: {
         publicKey: result.publicKey,
         address: result.address
       }
+    }
+    if (family === 'starknet') {
+      assertLedgerStarknetDeviceSupported(device.deviceModel.model)
+      metadata ??= {
+        deviceModel: device.deviceModel.model,
+        deviceName: getLedgerDeviceName(device.deviceModel.model, device.name)
+      }
+      return resolveStarknetLedgerSelection(input.expectedAccounts, network, path)
     }
     const hdIndex = path
       ? Number(path.split('/').at(-1)?.replace("'", ''))
@@ -178,11 +224,8 @@ export async function exportLedgerWalletAccounts(input: {
   for (const family of input.families) {
     input.signal.throwIfAborted()
     if (
-      existing.some(
-        account =>
-          account.family === family &&
-          account.accountIndex === input.accountIndex &&
-          (!('network' in account) || account.network === input.network)
+      existing.some(account =>
+        ledgerAccountCoversRequest(account, family, input.accountIndex, input.network)
       )
     )
       continue

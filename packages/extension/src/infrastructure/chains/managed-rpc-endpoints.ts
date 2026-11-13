@@ -2,14 +2,17 @@ import type { Network } from '@/types'
 import {
   findBuiltinEvmNetworkConfig,
   getSolanaNetworkConfig,
+  getStarknetNetworkConfig,
   type NearNetwork,
-  type SolanaCluster
+  type SolanaCluster,
+  type StarknetNetwork
 } from '@/config/networks'
 import {
   getDefaultEvmRpcEndpoint,
   RPC_DEFAULT_ENDPOINTS,
   type RpcEndpointOption
 } from '@/config/rpc-endpoints'
+import { DASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { getBitcoinChainId, getPearlChainId, getQuantusChainId } from '@/core/chains/registry'
 import { getManagedRpcEndpointOptions } from './rpc-registry-client'
 
@@ -20,6 +23,12 @@ interface BitcoinEsploraEndpointConfig {
 
 interface PearlBlockbookEndpointConfig {
   readonly id: string
+  readonly baseUrl: string
+}
+
+export interface DashInsightEndpointConfig {
+  readonly id: string
+  readonly label: string
   readonly baseUrl: string
 }
 
@@ -65,6 +74,17 @@ export function resolvePearlRpcEndpointOptions(
   }))
 }
 
+export function resolveDashRpcEndpointOptions(
+  network: Network
+): readonly DashInsightEndpointConfig[] {
+  const managed = getManagedRpcEndpointOptions(DASH_CHAIN_IDS[network], network, 'dash-insight')
+  return managedOrDefault(managed, RPC_DEFAULT_ENDPOINTS.dash[network]).map(endpoint => ({
+    id: endpoint.id,
+    label: endpoint.label,
+    baseUrl: endpoint.url
+  }))
+}
+
 export function resolveSolanaRpcEndpointOptions(
   cluster: SolanaCluster
 ): readonly RpcEndpointOption[] {
@@ -88,4 +108,15 @@ export function resolveQuantusRpcEndpointOptions(network: Network): readonly Rpc
     'quantus-json-rpc'
   )
   return managedOrDefault(managed, RPC_DEFAULT_ENDPOINTS.quantus[network])
+}
+
+export function resolveStarknetRpcEndpointOptions(
+  network: StarknetNetwork
+): readonly RpcEndpointOption[] {
+  const managed = getManagedRpcEndpointOptions(
+    getStarknetNetworkConfig(network).chainId,
+    network,
+    'starknet-json-rpc'
+  )
+  return managedOrDefault(managed, RPC_DEFAULT_ENDPOINTS.starknet[network])
 }

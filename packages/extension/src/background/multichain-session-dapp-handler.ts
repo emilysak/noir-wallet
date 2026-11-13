@@ -1,7 +1,12 @@
 import { ANALYTICS_EVENTS } from '../lib/analytics/constants'
 import { emitDAppEvent, observeDAppRequest, type DAppAnalyticsSink } from './dapp-analytics'
 import type { EvmNetworkConfig } from '@/config/networks'
-import { getBitcoinChainId, getZcashChainId, parseChainId } from '@/core/chains/registry'
+import {
+  getBitcoinChainId,
+  getDashChainId,
+  getZcashChainId,
+  parseChainId
+} from '@/core/chains/registry'
 import {
   Caip25ProviderError,
   parseCaip25CreateSessionRequest,
@@ -13,11 +18,14 @@ import {
   type Caip25StoredScope
 } from '@/core/dapp/caip25'
 import { BITCOIN_DAPP_RUNTIME_METHODS } from '@/core/dapp/bitcoin-provider'
+import { DASH_DAPP_RUNTIME_METHODS } from '@/core/dapp/dash-provider'
 import { EVM_DAPP_RUNTIME_METHODS } from '@/core/dapp/eip1193'
 import {
   NEAR_DAPP_RUNTIME_METHODS,
   SOLANA_DAPP_RUNTIME_METHODS
 } from '@/core/dapp/native-transfer-provider'
+import { STARKNET_DAPP_RUNTIME_METHODS } from '@/core/dapp/starknet-provider'
+import type { StarknetDAppHandler } from './starknet-dapp-handler'
 import type { DAppChainAuthorization, DAppManager } from '@/core/dapp/dapp-manager'
 import type { Network } from '@/types'
 import { ZCASH_DAPP_RUNTIME_METHODS } from '@/lib/runtime-message-security'
@@ -42,7 +50,7 @@ export interface MultichainSessionTabInfo {
   readonly pageUrl?: string
 }
 
-type ChainFamily = 'zcash' | 'evm' | 'bitcoin' | 'solana' | 'near'
+type ChainFamily = 'zcash' | 'evm' | 'bitcoin' | 'dash' | 'solana' | 'near' | 'starknet'
 
 interface SupportedScope {
   readonly family: ChainFamily
@@ -89,6 +97,8 @@ export interface BackgroundMultichainSessionDAppHandlerOptions {
   >
   readonly bitcoin: SessionHandler
   readonly bitcoinEnabled?: boolean
+  readonly dash?: SessionHandler | null
+  readonly dashEnabled?: boolean
   readonly solana: Pick<
     BackgroundSolanaDAppHandler,
     'prepareSessionAccountSelection' | 'resolveSessionAccountSelection' | 'getSessionAccounts'
@@ -103,6 +113,15 @@ export interface BackgroundMultichainSessionDAppHandlerOptions {
     readonly iconChain: string
   }
   readonly nearScope?: {
+    readonly chainId: string
+    readonly chainName: string
+    readonly iconChain: string
+  }
+  readonly starknet?: Pick<
+    StarknetDAppHandler,
+    'prepareSessionAccountSelection' | 'resolveSessionAccountSelection' | 'getSessionAccounts'
+  > | null
+  readonly starknetScope?: {
     readonly chainId: string
     readonly chainName: string
     readonly iconChain: string
@@ -149,6 +168,11 @@ const BITCOIN_SESSION_METHODS = invocableMethods(BITCOIN_DAPP_RUNTIME_METHODS, [
   'switchNetwork',
   'switchChain'
 ])
+const DASH_SESSION_METHODS = invocableMethods(DASH_DAPP_RUNTIME_METHODS, [
+  'connect',
+  'requestAccounts',
+  'disconnect'
+])
 const SOLANA_SESSION_METHODS = invocableMethods(SOLANA_DAPP_RUNTIME_METHODS, [
   'connect',
   'requestAccounts',
@@ -158,6 +182,16 @@ const NEAR_SESSION_METHODS = invocableMethods(NEAR_DAPP_RUNTIME_METHODS, [
   'connect',
   'requestAccounts',
   'disconnect'
+])
+const STARKNET_SESSION_METHODS = invocableMethods(STARKNET_DAPP_RUNTIME_METHODS, [
+  'wallet_requestAccounts',
+  'wallet_disconnect',
+  'wallet_addStarknetChain',
+  'wallet_addDeclareTransaction',
+  'wallet_strk20InvokeTransaction',
+  'wallet_strk20PrepareInvoke',
+  'wallet_strk20Balances',
+  'wallet_strk20ShadowAccountCommitment'
 ])
 
 function formatCaip10Account(chainId: string, address: string): string {
@@ -268,6 +302,18 @@ export class BackgroundMultichainSessionDAppHandler {
             }
           ]
         : []),
+      ...(options.dashEnabled !== false && options.dash
+        ? [
+            {
+              family: 'dash' as const,
+              chainId: getDashChainId(options.network),
+              chainName: options.network === 'mainnet' ? 'Dash' : 'Dash Testnet',
+              iconChain: 'dash',
+              methods: DASH_SESSION_METHODS,
+              notifications: SESSION_NOTIFICATIONS
+            }
+          ]
+        : []),
       ...(options.solana && options.solanaScope
         ? [
             {
@@ -284,6 +330,16 @@ export class BackgroundMultichainSessionDAppHandler {
               family: 'near' as const,
               ...options.nearScope,
               methods: NEAR_SESSION_METHODS,
+              notifications: SESSION_NOTIFICATIONS
+            }
+          ]
+        : []),
+      ...(options.starknet && options.starknetScope
+        ? [
+            {
+              family: 'starknet' as const,
+              ...options.starknetScope,
+              methods: STARKNET_SESSION_METHODS,
               notifications: SESSION_NOTIFICATIONS
             }
           ]
@@ -363,6 +419,11 @@ export class BackgroundMultichainSessionDAppHandler {
           throw new Caip25ProviderError(5100, 'Bitcoin is unavailable.')
         proposal = await this.options.bitcoin.prepareSessionAccountSelection(origin)
         break
+      case 'dash':
+        if (this.options.dashEnabled === false || !this.options.dash)
+          throw new Caip25ProviderError(5100, 'Dash is unavailable.')
+        proposal = await this.options.dash.prepareSessionAccountSelection(origin)
+        break
       case 'solana':
         if (!this.options.solana) throw new Caip25ProviderError(5100, 'Solana is unavailable.')
         proposal = await this.options.solana.prepareSessionAccountSelection(origin)
@@ -370,6 +431,10 @@ export class BackgroundMultichainSessionDAppHandler {
       case 'near':
         if (!this.options.near) throw new Caip25ProviderError(5100, 'NEAR is unavailable.')
         proposal = await this.options.near.prepareSessionAccountSelection(origin)
+        break
+      case 'starknet':
+        if (!this.options.starknet) throw new Caip25ProviderError(5100, 'Starknet is unavailable.')
+        proposal = await this.options.starknet.prepareSessionAccountSelection(origin)
         break
     }
     return Object.freeze({
@@ -392,12 +457,19 @@ export class BackgroundMultichainSessionDAppHandler {
         if (this.options.bitcoinEnabled === false)
           throw new Caip25ProviderError(5100, 'Bitcoin is unavailable.')
         return this.options.bitcoin.resolveSessionAccountSelection(prepared.proposal, selectedIds)
+      case 'dash':
+        if (this.options.dashEnabled === false || !this.options.dash)
+          throw new Caip25ProviderError(5100, 'Dash is unavailable.')
+        return this.options.dash.resolveSessionAccountSelection(prepared.proposal, selectedIds)
       case 'solana':
         if (!this.options.solana) throw new Caip25ProviderError(5100, 'Solana is unavailable.')
         return this.options.solana.resolveSessionAccountSelection(prepared.proposal, selectedIds)
       case 'near':
         if (!this.options.near) throw new Caip25ProviderError(5100, 'NEAR is unavailable.')
         return this.options.near.resolveSessionAccountSelection(prepared.proposal, selectedIds)
+      case 'starknet':
+        if (!this.options.starknet) throw new Caip25ProviderError(5100, 'Starknet is unavailable.')
+        return this.options.starknet.resolveSessionAccountSelection(prepared.proposal, selectedIds)
     }
   }
 
@@ -481,6 +553,7 @@ export class BackgroundMultichainSessionDAppHandler {
     await this.notifySessionChanged(origin)
     for (const item of prepared) {
       const selected = selections[prepared.indexOf(item)]
+      if (item.supported.family === 'starknet') continue
       emitDAppEvent(
         this.options.analytics,
         item.supported.family,
@@ -526,10 +599,16 @@ export class BackgroundMultichainSessionDAppHandler {
         return this.options.bitcoinEnabled === false
           ? Object.freeze([])
           : this.options.bitcoin.getSessionAccounts(origin)
+      case 'dash':
+        return this.options.dashEnabled === false || !this.options.dash
+          ? Object.freeze([])
+          : this.options.dash.getSessionAccounts(origin)
       case 'solana':
         return this.options.solana?.getSessionAccounts(origin) ?? Object.freeze([])
       case 'near':
         return this.options.near?.getSessionAccounts(origin) ?? Object.freeze([])
+      case 'starknet':
+        return this.options.starknet?.getSessionAccounts(origin) ?? Object.freeze([])
     }
   }
 

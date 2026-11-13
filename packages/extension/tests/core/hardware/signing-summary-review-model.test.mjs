@@ -181,6 +181,51 @@ const baseSummaries = [
     recipient: 'example.com',
     callbackUrl: null
   }),
+  summary('dash.psbt.v1', 'bip122:00000bafbc94add76cb75e2ec9289483', 'transaction', {
+    psbtVersion: 0,
+    signer: 'ySignerDashAddressExample111111111',
+    accountIndex: 0,
+    inputs: [
+      {
+        index: 0,
+        transactionId: digest,
+        outputIndex: 0,
+        amountDuffs: '100000000',
+        sequence: 0xffffffff,
+        scriptType: 'p2pkh',
+        sighashType: 'SIGHASH_ALL',
+        ownership: 'signing-account',
+        derivationPath: "m/44'/1'/0'/0/0"
+      }
+    ],
+    outputs: [
+      {
+        index: 0,
+        address: 'yRecipientDashAddressExample11111',
+        scriptPubKeyHex: '76a91400',
+        amountDuffs: '90000000',
+        classification: 'recipient',
+        derivationPath: null
+      },
+      {
+        index: 1,
+        address: 'yChangeDashAddressExample111111111',
+        scriptPubKeyHex: '76a91401',
+        amountDuffs: '9000000',
+        classification: 'change',
+        derivationPath: "m/44'/1'/0'/1/0"
+      }
+    ],
+    signingInputIndexes: [0],
+    totalInputDuffs: '100000000',
+    totalOutputDuffs: '99000000',
+    feeDuffs: '1000000'
+  }),
+  summary('dash.message.v1', 'bip122:00000bafbc94add76cb75e2ec9289483', 'message', {
+    signer: 'ySignerDashAddressExample111111111',
+    message: content(),
+    messageHash: `0x${digest}`
+  }),
   summary('quantus.transfer.v1', 'quantus:mainnet', 'transaction', {
     signerAddress: 'qzna4bUiEiZdXQpwvSQDmM2y9rBPyJRS9iNm85jPgicM76kA8',
     signerAccountId: `0x${'cd'.repeat(32)}`,
@@ -195,6 +240,39 @@ const baseSummaries = [
     blockNumber: 1024,
     callHash: `0x${'44'.repeat(32)}`,
     callLength: 13
+  }),
+  summary('starknet.invoke.v1', 'starknet:SN_MAIN', 'transaction', {
+    senderAddress: '0x1',
+    nonce: '0x2',
+    tip: '0',
+    resourceBounds: {
+      l1Gas: { maxAmount: '1', maxPricePerUnit: '2' },
+      l2Gas: { maxAmount: '3', maxPricePerUnit: '4' },
+      l1DataGas: { maxAmount: '5', maxPricePerUnit: '6' }
+    },
+    calls: [{ to: '0x3', selector: '0x4', entrypoint: null, calldata: ['0x5'] }],
+    nonceDataAvailabilityMode: 'l1',
+    feeDataAvailabilityMode: 'l2'
+  }),
+  summary('starknet.deploy-account.v1', 'starknet:SN_MAIN', 'transaction', {
+    contractAddress: '0x6',
+    classHash: '0x7',
+    salt: '0x8',
+    constructorCalldata: ['0x9'],
+    nonce: '0x1',
+    tip: '0',
+    resourceBounds: {
+      l1Gas: { maxAmount: '1', maxPricePerUnit: '2' },
+      l2Gas: { maxAmount: '3', maxPricePerUnit: '4' },
+      l1DataGas: { maxAmount: '5', maxPricePerUnit: '6' }
+    },
+    nonceDataAvailabilityMode: 'l1',
+    feeDataAvailabilityMode: 'l1'
+  }),
+  summary('starknet.typed-data.v1', 'starknet:SN_MAIN', 'message', {
+    accountAddress: '0x1',
+    publicKey: '0x2',
+    typedData: content()
   })
 ]
 
@@ -452,6 +530,36 @@ test.describe('Signing summary review model', () => {
         { label: 'Chain ID', value: item.chainId, code: true, breakAll: true }
       ])
     }
+  })
+
+  test('shows Dash recipients, amounts, the total fee, and change', () => {
+    const model = buildSigningSummaryReviewModel(
+      baseSummaries.find(item => item.schema === 'dash.psbt.v1')
+    )
+    const rows = model.sections.flatMap(section => section.rows)
+    expect(model.title).toBe('Sign Dash transaction')
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: 'Recipient',
+          value: 'yRecipientDashAddressExample11111'
+        }),
+        expect.objectContaining({ label: 'Amount', value: '90000000 duffs' }),
+        expect.objectContaining({ label: 'Total fee', value: '1000000 duffs' }),
+        expect.objectContaining({
+          label: 'Change',
+          value: 'yChangeDashAddressExample111111111'
+        }),
+        expect.objectContaining({ label: 'Change amount', value: '9000000 duffs' })
+      ])
+    )
+    const copy = JSON.stringify(model)
+    expect(copy).not.toMatch(/shielded|anonymous|\bprivate\b/i)
+    const message = buildSigningSummaryReviewModel(
+      baseSummaries.find(item => item.schema === 'dash.message.v1')
+    )
+    expect(message.title).toBe('Sign Dash message')
+    expect(JSON.stringify(message)).not.toMatch(/shielded|anonymous|\bprivate\b/i)
   })
 
   test('renders all ten supported TRON contracts without a generic fallback', () => {

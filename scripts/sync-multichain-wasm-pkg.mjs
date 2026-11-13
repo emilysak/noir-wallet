@@ -14,8 +14,8 @@ import {
 } from './lib/wasm-package-integrity.mjs'
 
 const SOURCE_REPOSITORY = 'https://github.com/NoirWallet/multichain-wallet-wasm.git'
-const SOURCE_COMMIT = '8103f125404272ae1181bbe7b887f8b05732f051'
-const ABI_VERSION = 'wallet-engine-8103f12-v12'
+const SOURCE_COMMIT = 'fc727637f4df9d3bf9bc2d0cd946e0df2e16dc05'
+const ABI_VERSION = 'wallet-engine-fc72763-v10'
 const RUST_TOOLCHAIN = '1.96.1'
 const WASM_PACK_VERSION = '0.14.0'
 const WASM_BINDGEN_VERSION = '0.2.126'
@@ -25,6 +25,9 @@ const CAPABILITIES = Object.freeze(
     'account.bitcoin.batch-derive',
     'account.bitcoin.derive',
     'account.bitcoin.imported',
+    'account.dash.batch-derive',
+    'account.dash.derive',
+    'account.dash.imported',
     'account.evm.derive',
     'account.evm.imported',
     'account.near.derive',
@@ -37,6 +40,7 @@ const CAPABILITIES = Object.freeze(
     'account.pearl.imported',
     'account.solana.derive',
     'account.solana.imported',
+    'account.starknet.derive',
     'bitcoin.bip322.full.sign',
     'bitcoin.bip322.full.verify',
     'bitcoin.bip322.sign',
@@ -44,15 +48,19 @@ const CAPABILITIES = Object.freeze(
     'bitcoin.psbt-v0.sign',
     'credential.create-12',
     'credential.create-24',
+    'credential.export-private-key',
     'credential.import-12',
     'credential.import-24',
-    'credential.export-private-key',
     'credential.import-private-key-bip122',
+    'credential.import-private-key-dash',
     'credential.import-private-key-eip155',
     'credential.import-private-key-near',
     'credential.import-private-key-pearl',
     'credential.import-private-key-solana',
     'credential.passphrase-empty-only',
+    'dash.message.sign',
+    'dash.message.verify',
+    'dash.psbt-v0.sign',
     'evm.eip191.sign',
     'evm.eip712.sign',
     'evm.pea-v1.eip191.sign',
@@ -69,6 +77,9 @@ const CAPABILITIES = Object.freeze(
     'solana.message.sign',
     'solana.message.verify',
     'solana.transaction.sign',
+    'starknet.deploy-account.sign',
+    'starknet.invoke.sign',
+    'starknet.typed-data.sign',
     'vault.argon2id-xchacha20poly1305',
     'vault.private-key-v2'
   ].sort()

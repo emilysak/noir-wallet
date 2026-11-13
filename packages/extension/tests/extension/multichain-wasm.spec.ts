@@ -890,8 +890,8 @@ test.describe('pinned Multichain WASM in the real MV3 extension', () => {
       await execute<CapabilitiesValue>(popup, 'capabilities.get', {}, { kind: 'unbound' })
     )
     expect(capabilities).toMatchObject({
-      abiVersion: 'wallet-engine-8103f12-v12',
-      sourceCommit: '8103f125404272ae1181bbe7b887f8b05732f051'
+      abiVersion: 'wallet-engine-fc72763-v10',
+      sourceCommit: 'fc727637f4df9d3bf9bc2d0cd946e0df2e16dc05'
     })
     expect(capabilities.capabilities).toEqual(
       expect.arrayContaining([

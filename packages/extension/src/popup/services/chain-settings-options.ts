@@ -1,12 +1,14 @@
 import {
   findBuiltinEvmNetworkConfig,
   getBitcoinNetworkConfig,
+  getDashNetworkConfig,
   getEvmNetworkConfigs,
   getNearNetworkConfig,
   getPearlNetworkConfig,
   getQuantusNetworkConfig,
   NETWORKS,
-  getSolanaNetworkConfig
+  getSolanaNetworkConfig,
+  getStarknetNetworkConfig
 } from '@/config/networks'
 import {
   getBlockExplorerBaseUrl,
@@ -15,11 +17,13 @@ import {
 import { BLOCK_EXPLORER_GROUPS } from '@/config/block-explorers'
 import {
   resolveBitcoinFeatureRuntimePolicy,
+  resolveDashFeatureRuntimePolicy,
   resolveEvmFeatureRuntimePolicy,
   resolveNearFeatureRuntimePolicy,
   resolvePearlFeatureRuntimePolicy,
   resolveQuantusFeatureRuntimePolicy,
-  resolveSolanaFeatureRuntimePolicy
+  resolveSolanaFeatureRuntimePolicy,
+  resolveStarknetFeatureRuntimePolicy
 } from '@/core/chains/feature-runtime-policy'
 import type { ChainEndpointSettings, ChainRpcProtocol } from '@/core/chains/chain-endpoint-settings'
 import { resolveEvmNetworkCatalog } from '@/core/chains/evm-runtime-config'
@@ -27,11 +31,14 @@ import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import {
   getEvmRpcEndpointOptions,
   resolveBitcoinRpcEndpointOptions,
+  resolveDashRpcEndpointOptions,
   resolveNearRpcEndpointOptions,
   resolvePearlRpcEndpointOptions,
   resolveQuantusRpcEndpointOptions,
-  resolveSolanaRpcEndpointOptions
+  resolveSolanaRpcEndpointOptions,
+  resolveStarknetRpcEndpointOptions
 } from '@/infrastructure/chains/managed-rpc-endpoints'
+import { DASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { getBitcoinChainId, getPearlChainId, getZcashChainId } from '@/core/chains/registry'
 import type { RpcEndpointGroup } from '@/config/rpc-endpoints'
 
@@ -85,7 +92,8 @@ export function buildNetworkSettingsOptions(
     zec: 'ZEC',
     btc: 'BTC',
     sol: 'SOL',
-    near: 'NEAR'
+    near: 'NEAR',
+    starknet: 'STRK'
   }
   return Object.freeze(
     buildExplorerChainOptions(settings).map(option => {
@@ -119,10 +127,14 @@ export function buildRpcChainOptions(settings: ChainEndpointSettings): readonly 
   const quantus = getQuantusNetworkConfig(DEFAULT_NETWORK)
   const solana = getSolanaNetworkConfig(DEFAULT_NETWORK === 'mainnet' ? 'mainnet' : 'devnet')
   const near = getNearNetworkConfig(DEFAULT_NETWORK)
+  const starknet = getStarknetNetworkConfig(DEFAULT_NETWORK)
   const evmEnabled = resolveEvmFeatureRuntimePolicy(
     __ENABLED_CHAIN_FEATURE_FLAGS__
   ).newOperationsEnabled
   const bitcoinEnabled = resolveBitcoinFeatureRuntimePolicy(
+    __ENABLED_CHAIN_FEATURE_FLAGS__
+  ).newOperationsEnabled
+  const dashEnabled = resolveDashFeatureRuntimePolicy(
     __ENABLED_CHAIN_FEATURE_FLAGS__
   ).newOperationsEnabled
   const pearlEnabled = resolvePearlFeatureRuntimePolicy(
@@ -135,6 +147,9 @@ export function buildRpcChainOptions(settings: ChainEndpointSettings): readonly 
     __ENABLED_CHAIN_FEATURE_FLAGS__
   ).newOperationsEnabled
   const quantusEnabled = resolveQuantusFeatureRuntimePolicy(
+    __ENABLED_CHAIN_FEATURE_FLAGS__
+  ).newOperationsEnabled
+  const starknetEnabled = resolveStarknetFeatureRuntimePolicy(
     __ENABLED_CHAIN_FEATURE_FLAGS__
   ).newOperationsEnabled
 
@@ -151,6 +166,24 @@ export function buildRpcChainOptions(settings: ChainEndpointSettings): readonly 
               Object.freeze({
                 id: endpoint.id,
                 label: endpoint.id === 'mempool-space' ? 'mempool.space' : 'Blockstream',
+                url: endpoint.baseUrl
+              })
+            )
+          })
+        ]
+      : []),
+    ...(dashEnabled
+      ? [
+          Object.freeze({
+            chainId: DASH_CHAIN_IDS[DEFAULT_NETWORK],
+            label: getDashNetworkConfig(DEFAULT_NETWORK).displayName,
+            iconChain: 'dash',
+            protocol: 'dash-insight' as const,
+            defaultUrl: resolveDashRpcEndpointOptions(DEFAULT_NETWORK)[0].baseUrl,
+            presets: resolveDashRpcEndpointOptions(DEFAULT_NETWORK).map(endpoint =>
+              Object.freeze({
+                id: endpoint.id,
+                label: endpoint.label,
                 url: endpoint.baseUrl
               })
             )
@@ -239,6 +272,18 @@ export function buildRpcChainOptions(settings: ChainEndpointSettings): readonly 
             )
           })
         ]
+      : []),
+    ...(starknetEnabled
+      ? [
+          Object.freeze({
+            chainId: starknet.chainId,
+            label: starknet.displayName,
+            iconChain: 'starknet',
+            protocol: 'starknet-json-rpc' as const,
+            defaultUrl: resolveStarknetRpcEndpointOptions(starknet.networkMode)[0].url,
+            presets: resolveStarknetRpcEndpointOptions(starknet.networkMode)
+          })
+        ]
       : [])
   ])
 }
@@ -251,6 +296,7 @@ export function buildExplorerChainOptions(
   const pearl = getPearlNetworkConfig(DEFAULT_NETWORK)
   const solana = getSolanaNetworkConfig(DEFAULT_NETWORK === 'mainnet' ? 'mainnet' : 'devnet')
   const near = getNearNetworkConfig(DEFAULT_NETWORK)
+  const starknet = getStarknetNetworkConfig(DEFAULT_NETWORK)
   const builtinEvm = getEvmNetworkConfigs(DEFAULT_NETWORK)
   const evmEnabled = resolveEvmFeatureRuntimePolicy(
     __ENABLED_CHAIN_FEATURE_FLAGS__
@@ -265,6 +311,9 @@ export function buildExplorerChainOptions(
     __ENABLED_CHAIN_FEATURE_FLAGS__
   ).newOperationsEnabled
   const nearEnabled = resolveNearFeatureRuntimePolicy(
+    __ENABLED_CHAIN_FEATURE_FLAGS__
+  ).newOperationsEnabled
+  const starknetEnabled = resolveStarknetFeatureRuntimePolicy(
     __ENABLED_CHAIN_FEATURE_FLAGS__
   ).newOperationsEnabled
 
@@ -339,6 +388,17 @@ export function buildExplorerChainOptions(
             iconChain: 'near',
             defaultUrl: near.explorerUrl,
             defaultTransactionPath: 'txns'
+          })
+        ]
+      : []),
+    ...(starknetEnabled
+      ? [
+          Object.freeze({
+            chainId: starknet.chainId,
+            label: starknet.displayName,
+            iconChain: 'starknet',
+            defaultUrl: starknet.explorerUrl,
+            defaultTransactionPath: starknet.transactionExplorerPath
           })
         ]
       : [])

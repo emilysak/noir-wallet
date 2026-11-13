@@ -31,15 +31,24 @@ import type { BitcoinTransferSubmission } from '@/popup/services/bitcoin-wallet-
 import { useActiveAccountNetworks } from '@/popup/hooks/useActiveAccountNetworks'
 import { useSettingsStore } from '@/store/settings-store'
 import { getChainEndpointRuntimeKey } from '@/core/chains/chain-endpoint-settings'
+import { DASH_CHAIN_FEATURE_FLAG } from '@/config/multichain-feature-flags'
+import { isBitcoinChainId, isDashChainId } from '@/core/chains/registry/chain-ids'
 import { usePortfolioUpdates } from '@/popup/hooks/usePortfolioUpdates'
 import { assetPriceClient } from '@/popup/services/asset-price-client'
 import { offerSaveRecipient } from '@/popup/services/save-recipient-prompt'
-import { buildSendAssetSelectionModel, type SendAsset } from './send-asset-order'
 import { isSelectableChainFamily } from '@/popup/services/chain-selection-availability'
+import {
+  buildSendAssetSelectionModel,
+  isUnifiedSendPortfolioChain,
+  type SendAsset
+} from './send-asset-order'
 import { SolanaSendForm } from './SolanaSendForm'
 import { SolanaTransactionResult } from './SolanaTransactionResult'
 import type { SolanaTransferSubmission } from '@/popup/services/solana-wallet-client'
 import { NearSendForm } from './NearSendForm'
+import { StarknetSendForm } from './StarknetSendForm'
+import { StarknetTransactionResult } from './StarknetTransactionResult'
+import type { StarknetTransferSubmission } from '@/popup/services/starknet-wallet-client'
 import { NearTransactionResult } from './NearTransactionResult'
 import type { NearTransferSubmission } from '@/popup/services/near-wallet-client'
 import { QuantusSendForm } from './QuantusSendForm'
@@ -48,6 +57,9 @@ import type { QuantusTransferSubmission } from '@/popup/services/quantus-wallet-
 import { PearlSendForm } from './PearlSendForm'
 import { PearlTransactionResult } from './PearlTransactionResult'
 import type { PearlTransferSubmission } from '@/popup/services/pearl-wallet-client'
+import { DashSendForm } from './DashSendForm'
+import { DashTransactionResult } from './DashTransactionResult'
+import type { DashTransferSubmission } from '@/popup/services/dash-wallet-client'
 import {
   isPortfolioModelForScope,
   readCachedPortfolio,
@@ -62,10 +74,12 @@ import { prefetchEvmSendCatalogs } from '@/popup/services/evm-send-catalog'
 type SendSubmission =
   | Readonly<{ family: 'evm'; value: EvmTransferSubmission }>
   | Readonly<{ family: 'bitcoin'; value: BitcoinTransferSubmission }>
+  | Readonly<{ family: 'dash'; value: DashTransferSubmission }>
   | Readonly<{ family: 'pearl'; value: PearlTransferSubmission }>
   | Readonly<{ family: 'solana'; value: SolanaTransferSubmission }>
   | Readonly<{ family: 'near'; value: NearTransferSubmission }>
   | Readonly<{ family: 'quantus'; value: QuantusTransferSubmission }>
+  | Readonly<{ family: 'starknet'; value: StarknetTransferSubmission }>
 
 function availableUsdPrice(
   asset: PortfolioReadModel['assets'][number],
@@ -259,7 +273,9 @@ function AssetSelection({
                   </p>
                 </div>
               </div>
-              {entry.chain.chain.family === 'bitcoin' && entry.asset.updatedAt === 0 ? (
+              {entry.chain.chain.family === 'bitcoin' &&
+              isBitcoinChainId(entry.chain.chain.id) &&
+              entry.asset.updatedAt === 0 ? (
                 <p className="min-w-0 truncate text-right text-sm font-medium">
                   {entry.chain.status === 'error' ? 'Unavailable' : 'Updating…'}
                 </p>
@@ -496,14 +512,13 @@ export function MultichainSend() {
     return visibleModel.assets.flatMap(asset => {
       const chain = chainById.get(asset.asset.chainId)
       return chain &&
-        isSelectableChainFamily(chain.chain.family, __ENABLED_CHAIN_FEATURE_FLAGS__) &&
-        (chain.chain.family === 'evm' ||
-          chain.chain.family === 'bitcoin' ||
-          chain.chain.family === 'pearl' ||
-          chain.chain.family === 'solana' ||
-          chain.chain.family === 'quantus' ||
-          chain.chain.family === 'near') &&
-        chain.chain.capabilities.transaction.status === 'available'
+        (isUnifiedSendPortfolioChain(chain.chain, __ENABLED_CHAIN_FEATURE_FLAGS__) ||
+          (chain.chain.family === 'pearl' &&
+            isSelectableChainFamily(chain.chain.family, __ENABLED_CHAIN_FEATURE_FLAGS__) &&
+            chain.chain.capabilities.transaction.status === 'available') ||
+          (chain.chain.family === 'quantus' &&
+            isSelectableChainFamily(chain.chain.family, __ENABLED_CHAIN_FEATURE_FLAGS__) &&
+            chain.chain.capabilities.transaction.status === 'available'))
         ? [{ asset, chain }]
         : []
     })
@@ -599,7 +614,11 @@ export function MultichainSend() {
     )
   }
 
-  if (submission?.family === 'bitcoin' && selection?.chain.chain.family === 'bitcoin') {
+  if (
+    submission?.family === 'bitcoin' &&
+    selection?.chain.chain.family === 'bitcoin' &&
+    isBitcoinChainId(selection.chain.chain.id)
+  ) {
     return (
       <BitcoinTransactionResult
         asset={selection.asset}
@@ -619,6 +638,28 @@ export function MultichainSend() {
   if (submission?.family === 'pearl' && selection?.chain.chain.family === 'pearl') {
     return (
       <PearlTransactionResult
+        asset={selection.asset}
+        chain={selection.chain}
+        submission={submission.value}
+        onDone={outcome => leaveOnchainResult('/', outcome !== 'failed')}
+        onViewActivity={transactionId =>
+          leaveOnchainResult(
+            `/?tab=activity&transactionId=${encodeURIComponent(transactionId)}`,
+            true
+          )
+        }
+      />
+    )
+  }
+
+  if (
+    submission?.family === 'dash' &&
+    selection?.chain.chain.family === 'dash' &&
+    isDashChainId(selection.chain.chain.id) &&
+    __ENABLED_CHAIN_FEATURE_FLAGS__.includes(DASH_CHAIN_FEATURE_FLAG)
+  ) {
+    return (
+      <DashTransactionResult
         asset={selection.asset}
         chain={selection.chain}
         submission={submission.value}
@@ -670,6 +711,23 @@ export function MultichainSend() {
   if (submission?.family === 'quantus' && selection?.chain.chain.family === 'quantus') {
     return (
       <QuantusTransactionResult
+        asset={selection.asset}
+        chain={selection.chain}
+        submission={submission.value}
+        onDone={outcome => leaveOnchainResult('/', outcome !== 'failed')}
+        onViewActivity={transactionId =>
+          leaveOnchainResult(
+            `/?tab=activity&transactionId=${encodeURIComponent(transactionId)}`,
+            true
+          )
+        }
+      />
+    )
+  }
+
+  if (submission?.family === 'starknet' && selection?.chain.chain.family === 'starknet') {
+    return (
+      <StarknetTransactionResult
         asset={selection.asset}
         chain={selection.chain}
         submission={submission.value}
@@ -750,7 +808,8 @@ export function MultichainSend() {
           }
           onSubmitted={value => setSubmission({ family: 'evm', value })}
         />
-      ) : selection?.chain.chain.family === 'bitcoin' ? (
+      ) : selection?.chain.chain.family === 'bitcoin' &&
+        isBitcoinChainId(selection.chain.chain.id) ? (
         <BitcoinSendForm
           selection={selection}
           priceUsd={availableUsdPrice(selection.asset, assetPrices)}
@@ -762,11 +821,25 @@ export function MultichainSend() {
           priceUsd={availableUsdPrice(selection.asset, assetPrices)}
           onSubmitted={value => setSubmission({ family: 'pearl', value })}
         />
+      ) : selection?.chain.chain.family === 'dash' &&
+        isDashChainId(selection.chain.chain.id) &&
+        __ENABLED_CHAIN_FEATURE_FLAGS__.includes(DASH_CHAIN_FEATURE_FLAG) ? (
+        <DashSendForm
+          selection={selection}
+          priceUsd={availableUsdPrice(selection.asset, assetPrices)}
+          onSubmitted={value => setSubmission({ family: 'dash', value })}
+        />
       ) : selection?.chain.chain.family === 'solana' ? (
         <SolanaSendForm
           selection={selection}
           priceUsd={availableUsdPrice(selection.asset, assetPrices)}
           onSubmitted={value => setSubmission({ family: 'solana', value })}
+        />
+      ) : selection?.chain.chain.family === 'near' ? (
+        <NearSendForm
+          selection={selection}
+          priceUsd={availableUsdPrice(selection.asset, assetPrices)}
+          onSubmitted={value => setSubmission({ family: 'near', value })}
         />
       ) : selection?.chain.chain.family === 'quantus' ? (
         <QuantusSendForm
@@ -774,11 +847,11 @@ export function MultichainSend() {
           priceUsd={availableUsdPrice(selection.asset, assetPrices)}
           onSubmitted={value => setSubmission({ family: 'quantus', value })}
         />
-      ) : selection?.chain.chain.family === 'near' ? (
-        <NearSendForm
+      ) : selection?.chain.chain.family === 'starknet' ? (
+        <StarknetSendForm
           selection={selection}
           priceUsd={availableUsdPrice(selection.asset, assetPrices)}
-          onSubmitted={value => setSubmission({ family: 'near', value })}
+          onSubmitted={value => setSubmission({ family: 'starknet', value })}
         />
       ) : (
         <AssetSelection

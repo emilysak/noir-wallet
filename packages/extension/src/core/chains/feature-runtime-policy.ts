@@ -1,10 +1,12 @@
 import {
   BITCOIN_CHAIN_FEATURE_FLAG,
+  DASH_CHAIN_FEATURE_FLAG,
   EVM_CHAIN_FEATURE_FLAG,
   NEAR_CHAIN_FEATURE_FLAG,
   PEARL_CHAIN_FEATURE_FLAG,
   QUANTUS_CHAIN_FEATURE_FLAG,
   SOLANA_CHAIN_FEATURE_FLAG,
+  STARKNET_CHAIN_FEATURE_FLAG,
   ZCASH_CHAIN_FEATURE_FLAG,
   type ChainFeatureFlagValue
 } from '@/config/multichain-feature-flags'
@@ -61,6 +63,18 @@ export function resolveNearFeatureRuntimePolicy(
   })
 }
 
+export interface DashFeatureRuntimePolicy {
+  readonly newOperationsEnabled: boolean
+}
+
+export function resolveDashFeatureRuntimePolicy(
+  enabledFlags: readonly ChainFeatureFlagValue[]
+): DashFeatureRuntimePolicy {
+  return Object.freeze({
+    newOperationsEnabled: enabledFlags.includes(DASH_CHAIN_FEATURE_FLAG)
+  })
+}
+
 export interface PearlFeatureRuntimePolicy {
   readonly newOperationsEnabled: boolean
   readonly transactionRecoveryEnabled: true
@@ -87,6 +101,18 @@ export function resolveQuantusFeatureRuntimePolicy(
   })
 }
 
+export interface StarknetFeatureRuntimePolicy {
+  readonly newOperationsEnabled: boolean
+}
+
+export function resolveStarknetFeatureRuntimePolicy(
+  enabledFlags: readonly ChainFeatureFlagValue[]
+): StarknetFeatureRuntimePolicy {
+  return Object.freeze({
+    newOperationsEnabled: enabledFlags.includes(STARKNET_CHAIN_FEATURE_FLAG)
+  })
+}
+
 export function isNewWalletFamilyEnabled(
   family: string,
   enabledFlags: readonly ChainFeatureFlagValue[]
@@ -98,9 +124,12 @@ export function isNewWalletFamilyEnabled(
     case 'eip155':
       return resolveEvmFeatureRuntimePolicy(enabledFlags).newOperationsEnabled
     case 'bitcoin':
+    // Private-key credentials use this family token for Bitcoin. It is not every BIP-122 chain.
     case 'bip122':
       // bip122 remains the Bitcoin private-key family tag; Pearl uses family "pearl".
       return resolveBitcoinFeatureRuntimePolicy(enabledFlags).newOperationsEnabled
+    case 'dash':
+      return resolveDashFeatureRuntimePolicy(enabledFlags).newOperationsEnabled
     case 'pearl':
       return resolvePearlFeatureRuntimePolicy(enabledFlags).newOperationsEnabled
     case 'quantus':
@@ -109,6 +138,8 @@ export function isNewWalletFamilyEnabled(
       return resolveSolanaFeatureRuntimePolicy(enabledFlags).newOperationsEnabled
     case 'near':
       return resolveNearFeatureRuntimePolicy(enabledFlags).newOperationsEnabled
+    case 'starknet':
+      return resolveStarknetFeatureRuntimePolicy(enabledFlags).newOperationsEnabled
     default:
       return false
   }

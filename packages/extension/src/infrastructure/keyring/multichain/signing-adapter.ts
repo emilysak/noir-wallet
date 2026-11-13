@@ -54,11 +54,25 @@ import {
   type NearSigningPreparePayload
 } from './signing-adapter-near'
 import {
+  adaptStarknetPreparedSigning,
+  adaptStarknetSignedResult,
+  parseStarknetSigningPreparePayload,
+  type StarknetSigningPreparePayload
+} from './signing-adapter-starknet'
+import {
   adaptPearlPreparedSigning,
   adaptPearlSignedResult,
   parsePearlSigningPreparePayload,
   type PearlSigningPreparePayload
 } from './signing-adapter-pearl'
+import {
+  adaptDashPreparedSigning,
+  adaptDashSignedResult,
+  parseDashSigningPreparePayload,
+  type DashSigningPreparePayload
+} from './signing-adapter-dash'
+import type { RawDashAccount } from './dash-codecs'
+import type { RawDerivedStarknetAccount } from './starknet-codecs'
 import {
   adaptQuantusPreparedSigning,
   adaptQuantusSignedResult,
@@ -120,7 +134,9 @@ type EvmTransaction =
 export type ParsedSigningPreparePayload =
   | SolanaSigningPreparePayload
   | NearSigningPreparePayload
+  | StarknetSigningPreparePayload
   | PearlSigningPreparePayload
+  | DashSigningPreparePayload
   | QuantusSigningPreparePayload
   | {
       readonly kind: 'pea-evm-transaction'
@@ -188,6 +204,8 @@ export interface AdaptedPreparedSigning {
     | RawDerivedQuantusAccount
     | RawDerivedPeaAccount
     | RawPeaExecutionAccount
+    | RawDashAccount
+    | RawDerivedStarknetAccount
   readonly prepared: PreparedSigningCommand
 }
 
@@ -316,8 +334,18 @@ export function parseSigningPreparePayload(value: unknown): ParsedSigningPrepare
   if (record.kind === 'near-transaction' || record.kind === 'near-nep413-message') {
     return parseNearSigningPreparePayload(record)
   }
+  if (
+    record.kind === 'starknet-invoke' ||
+    record.kind === 'starknet-deploy-account' ||
+    record.kind === 'starknet-typed-data'
+  ) {
+    return parseStarknetSigningPreparePayload(record)
+  }
   if (record.kind === 'pearl-psbt' || record.kind === 'pearl-bip322-message') {
     return parsePearlSigningPreparePayload(record)
+  }
+  if (record.kind === 'dash-psbt' || record.kind === 'dash-message') {
+    return parseDashSigningPreparePayload(record)
   }
   if (record.kind === 'quantus-transfer') {
     return parseQuantusSigningPreparePayload(record)
@@ -1127,12 +1155,27 @@ async function adaptBitcoinMessage(
   })
 }
 
+function isRawDashAccount(
+  account:
+    | RawDerivedAccount
+    | RawDerivedBitcoinAccount
+    | RawDerivedPearlAccount
+    | RawDerivedEd25519Account
+    | RawDerivedQuantusAccount
+    | RawDerivedPeaAccount
+    | RawPeaExecutionAccount
+    | RawDashAccount
+    | RawDerivedStarknetAccount
+): account is RawDashAccount {
+  return 'addressScheme' in account && account.addressScheme === 'dash_p2pkh'
+}
+
 export async function adaptPreparedSigning(
   raw: unknown,
   payload: ParsedSigningPreparePayload,
   signingCommandId: SigningCommandId,
   expiresAt: number,
-  bitcoinAccount?: RawDerivedBitcoinAccount,
+  bitcoinAccount?: RawDerivedBitcoinAccount | RawDashAccount,
   imported = false,
   pearlAccount?: RawDerivedPearlAccount
 ): Promise<AdaptedPreparedSigning> {
@@ -1147,8 +1190,27 @@ export async function adaptPreparedSigning(
     case 'pea-evm-typed-data':
       return adaptEvmTypedData(raw, payload, signingCommandId, expiresAt, imported)
     case 'bitcoin-psbt':
-      if (!bitcoinAccount) throw new Error('Bitcoin PSBT signer account is missing')
+      if (
+        !bitcoinAccount ||
+        !('addressScheme' in bitcoinAccount) ||
+        bitcoinAccount.addressScheme === 'dash_p2pkh'
+      ) {
+        throw new Error('Bitcoin PSBT signer account is missing')
+      }
       return adaptBitcoinPsbt(raw, payload, bitcoinAccount, signingCommandId, expiresAt)
+    case 'dash-psbt':
+    case 'dash-message':
+      if (!bitcoinAccount || bitcoinAccount.addressScheme !== 'dash_p2pkh') {
+        throw new Error('Dash signer account is missing')
+      }
+      return adaptDashPreparedSigning(
+        raw,
+        payload,
+        signingCommandId,
+        expiresAt,
+        bitcoinAccount,
+        imported
+      )
     case 'bitcoin-bip322-message':
       return adaptBitcoinMessage(raw, payload, signingCommandId, expiresAt, imported)
     case 'pearl-psbt':
@@ -1169,6 +1231,10 @@ export async function adaptPreparedSigning(
       return adaptNearPreparedSigning(raw, payload, signingCommandId, expiresAt, imported)
     case 'quantus-transfer':
       return adaptQuantusPreparedSigning(raw, payload, signingCommandId, expiresAt, imported)
+    case 'starknet-invoke':
+    case 'starknet-deploy-account':
+    case 'starknet-typed-data':
+      return adaptStarknetPreparedSigning(raw, payload, signingCommandId, expiresAt)
   }
 }
 
@@ -1183,6 +1249,8 @@ export function adaptSignedResult(
     | RawDerivedQuantusAccount
     | RawDerivedPeaAccount
     | RawPeaExecutionAccount
+    | RawDashAccount
+    | RawDerivedStarknetAccount
 ): SigningResult {
   switch (kind) {
     case 'evm-transaction':
@@ -1214,6 +1282,12 @@ export function adaptSignedResult(
         transactionId: signed.unsignedTxid
       })
     }
+    case 'dash-psbt':
+    case 'dash-message':
+      if (!isRawDashAccount(account)) {
+        throw new Error('Dash signing account is missing')
+      }
+      return adaptDashSignedResult(kind, raw, account)
     case 'bitcoin-bip322-message': {
       const signed = parseRawSignedBitcoinMessage(raw)
       if (signed.address !== account.address) {
@@ -1245,5 +1319,12 @@ export function adaptSignedResult(
         throw new Error('Quantus signing account is missing')
       }
       return adaptQuantusSignedResult(raw, account)
+    case 'starknet-invoke':
+    case 'starknet-deploy-account':
+    case 'starknet-typed-data':
+      if (!('addressScheme' in account) || account.addressScheme !== 'starknet') {
+        throw new Error('Starknet signing account is missing')
+      }
+      return adaptStarknetSignedResult(kind, raw, account)
   }
 }

@@ -10,6 +10,7 @@ export {
   EVM_ERC20_REFERENCE_VALIDATOR,
   NEAR_NEP141_REFERENCE_VALIDATOR,
   SOLANA_TOKEN_REFERENCE_VALIDATOR,
+  STARKNET_SNIP2_REFERENCE_VALIDATOR,
   createAssetRegistry,
   filterAssetDefinitionsForChains,
   parseAssetDisplayMetadata,
@@ -52,9 +53,11 @@ export {
   createEvmBitcoinChainRegistry,
   createInitialProductChainRegistry,
   getBitcoinChainId,
+  getDashChainId,
   getPearlChainId,
   getQuantusChainId,
   getBundledBitcoinAssetDefinitions,
+  getBundledDashAssetDefinitions,
   getBundledInitialProductAssetDefinitions,
   getBundledEvmAssetDefinitions,
   getBundledPearlAssetDefinitions,
@@ -67,5 +70,7 @@ export {
   getSolanaWaitingChainDefinition,
   getSolanaWaitingChainDefinitions,
   getSolanaBetaChainDefinition,
+  getBundledStarknetAssetDefinitions,
+  getStarknetChainDefinition,
   getZcashChainId
 } from './product-chain-definitions'

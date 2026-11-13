@@ -47,11 +47,13 @@ const CHAIN_FAMILIES = new Set([
   'zcash',
   'evm',
   'bitcoin',
+  'dash',
   'pearl',
   'quantus',
   'solana',
   'tron',
-  'near'
+  'near',
+  'starknet'
 ])
 const NETWORK_KINDS = new Set(['mainnet', 'testnet', 'devnet', 'custom'])
 const CAPABILITY_STATUSES = new Set(['available', 'waiting', 'unsupported'])

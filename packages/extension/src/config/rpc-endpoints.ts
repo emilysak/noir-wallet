@@ -93,6 +93,14 @@ export const RPC_DEFAULT_ENDPOINTS = {
       url: 'https://mempool.space/testnet/api/'
     }
   },
+  dash: {
+    mainnet: { id: 'insight', label: 'Insight', url: 'https://insight.dash.org/insight-api' },
+    testnet: {
+      id: 'insight',
+      label: 'Insight',
+      url: 'https://insight.testnet.networks.dash.org/insight-api'
+    }
+  },
   solana: {
     mainnet: { id: 'delta', label: 'Delta', url: 'https://solana.deltarpc.com/' },
     devnet: { id: 'official', label: 'Official', url: 'https://api.devnet.solana.com' },
@@ -101,6 +109,14 @@ export const RPC_DEFAULT_ENDPOINTS = {
   near: {
     mainnet: { id: 'fastnear', label: 'Fastnear', url: 'https://free.rpc.fastnear.com' },
     testnet: { id: 'official', label: 'Official', url: 'https://rpc.testnet.near.org' }
+  },
+  starknet: {
+    mainnet: { id: 'publicnode', label: 'PublicNode', url: 'https://starknet-rpc.publicnode.com' },
+    testnet: {
+      id: 'publicnode',
+      label: 'PublicNode',
+      url: 'https://starknet-sepolia-rpc.publicnode.com'
+    }
   },
   pearl: {
     mainnet: {

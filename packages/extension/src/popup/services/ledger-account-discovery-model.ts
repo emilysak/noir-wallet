@@ -7,6 +7,8 @@ import {
   ledgerEvmDerivationPath,
   ledgerSolanaDerivationPath,
   ledgerNearDerivationPath,
+  ledgerDashDerivationPath,
+  ledgerStarknetDerivationPath,
   type LedgerDerivationMode
 } from '@/core/wallet/ledger-derivation-path'
 import type { Network } from '@/types'
@@ -31,13 +33,17 @@ export const LEDGER_PATH_MODES: Record<
   near: [
     { value: 'standard', label: 'Standard' },
     { value: 'noir', label: 'Noir legacy' }
-  ]
+  ],
+  dash: [{ value: 'standard', label: 'P2PKH' }],
+  starknet: [{ value: 'standard', label: 'Argent' }]
 }
 
 export interface LedgerAccountCandidate {
   readonly account: LedgerPublicAccount
   readonly deviceIndex: number
   readonly registered: boolean
+  readonly detail?: string
+  readonly blockedReason?: string
 }
 
 export function ledgerCandidatePaths(
@@ -62,6 +68,11 @@ export function ledgerCandidatePaths(
       return ledgerSolanaDerivationPath(mode, index)
     if (family === 'near' && (mode === 'standard' || mode === 'noir'))
       return ledgerNearDerivationPath(mode, index)
+    if (family === 'dash') {
+      if (network !== 'mainnet') throw new Error('Dash hardware wallets support mainnet only')
+      return ledgerDashDerivationPath(index)
+    }
+    if (family === 'starknet') return ledgerStarknetDerivationPath(index)
     return `m/84'/${network === 'mainnet' ? 0 : 1}'/${index}'`
   })
 }

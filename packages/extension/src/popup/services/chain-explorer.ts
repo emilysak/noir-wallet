@@ -1,8 +1,10 @@
 import {
   getBitcoinNetworkConfig,
+  getDashNetworkConfig,
   getNearNetworkConfig,
   getPearlNetworkConfig,
-  getSolanaNetworkConfig
+  getSolanaNetworkConfig,
+  getStarknetNetworkConfig
 } from '@/config/networks'
 import { CHAIN_BLOCK_EXPLORER_ALTERNATIVES } from '@/config/block-explorers'
 import {
@@ -61,6 +63,14 @@ export function resolveChainExplorerTarget(
       transactionPath: 'tx'
     })
   }
+  const dash = getDashNetworkConfig(network)
+  if (chainId === dash.chainId) {
+    return Object.freeze({
+      baseUrl: dash.explorerBaseUrl,
+      transactionPath: dash.transactionExplorerPath,
+      addressPath: dash.addressExplorerPath
+    })
+  }
   if (chainId === getPearlChainId(network)) {
     return Object.freeze({
       baseUrl: getPearlNetworkConfig(network).explorerUrl,
@@ -77,6 +87,14 @@ export function resolveChainExplorerTarget(
   const near = getNearNetworkConfig(network)
   if (chainId === near.chainId) {
     return Object.freeze({ baseUrl: near.explorerUrl, transactionPath: 'txns' })
+  }
+  const starknet = getStarknetNetworkConfig(network)
+  if (chainId === starknet.chainId) {
+    return Object.freeze({
+      baseUrl: starknet.explorerUrl,
+      transactionPath: starknet.transactionExplorerPath,
+      addressPath: starknet.addressExplorerPath
+    })
   }
   const evm = resolveEvmNetworkCatalog(network, settings).find(config => config.chainId === chainId)
   return evm?.explorerUrl

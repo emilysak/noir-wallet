@@ -2,8 +2,8 @@
   "schemaVersion": 2,
   "engine": "multichain",
   "packageVersion": "0.1.0",
-  "abiVersion": "wallet-engine-8103f12-v12",
-  "sourceCommit": "8103f125404272ae1181bbe7b887f8b05732f051",
+  "abiVersion": "wallet-engine-fc72763-v10",
+  "sourceCommit": "fc727637f4df9d3bf9bc2d0cd946e0df2e16dc05",
   "artifacts": [
     {
       "path": "package.json",
@@ -26,8 +26,8 @@
     {
       "path": "wallet_wasm_bg.wasm",
       "role": "binary",
-      "bytes": 4524039,
-      "sha256": "729d6fb1e05b989b19048ed13704d973335d398107647959e974d219f7cd35a0"
+      "bytes": 4522980,
+      "sha256": "f58dd28d3455aed65fdec586df02031cb46f339d567af8f066a956a68d4f67ee"
     },
     {
       "path": "wallet_wasm_bg.wasm.d.ts",
@@ -48,6 +48,9 @@
     "account.bitcoin.batch-derive",
     "account.bitcoin.derive",
     "account.bitcoin.imported",
+    "account.dash.batch-derive",
+    "account.dash.derive",
+    "account.dash.imported",
     "account.evm.derive",
     "account.evm.imported",
     "account.near.derive",
@@ -60,6 +63,7 @@
     "account.quantus.derive",
     "account.solana.derive",
     "account.solana.imported",
+    "account.starknet.derive",
     "bitcoin.bip322.full.sign",
     "bitcoin.bip322.full.verify",
     "bitcoin.bip322.sign",
@@ -71,11 +75,15 @@
     "credential.import-12",
     "credential.import-24",
     "credential.import-private-key-bip122",
+    "credential.import-private-key-dash",
     "credential.import-private-key-eip155",
     "credential.import-private-key-near",
     "credential.import-private-key-pearl",
     "credential.import-private-key-solana",
     "credential.passphrase-empty-only",
+    "dash.message.sign",
+    "dash.message.verify",
+    "dash.psbt-v0.sign",
     "evm.eip191.sign",
     "evm.eip712.sign",
     "evm.pea-v1.eip191.sign",
@@ -92,6 +100,9 @@
     "solana.message.sign",
     "solana.message.verify",
     "solana.transaction.sign",
+    "starknet.deploy-account.sign",
+    "starknet.invoke.sign",
+    "starknet.typed-data.sign",
     "vault.argon2id-xchacha20poly1305",
     "vault.private-key-v2"
   ]

@@ -21,6 +21,7 @@ import { closeAllPopupWindows } from './window-manager'
 import { useWalletStore, rehydrateWalletStore } from '@/store/wallet-store'
 import { useAccountDataStore, buildAccountKey } from '@/store/account-data-store'
 import { EVM_GAS_FUNDING_APPROVAL_TIMEOUT_MS, pendingRequestsManager } from './pending-requests'
+import { revokeAllStarknetPermissions, revokeStarknetOrigin } from './starknet-dapp-handler'
 import { getApprovalContext } from './approval-context'
 import { signApprovedDAppMessage } from './dapp-message-signing'
 import { sleep } from '@/lib/utils'
@@ -105,10 +106,12 @@ const APPROVAL_ACTION_PREFIXES = Object.freeze({
     'evmNetwork'
   ]),
   bitcoin: Object.freeze(['bitcoinConnect', 'bitcoinTransaction', 'bitcoinMessage']),
+  dash: Object.freeze(['dashConnect', 'dashTransaction', 'dashMessage']),
   pearl: Object.freeze(['pearlConnect', 'pearlTransaction', 'pearlMessage']),
   quantus: Object.freeze(['quantusConnect', 'quantusTransaction', 'quantusSignTransfer']),
   solana: Object.freeze(['solanaConnect', 'solanaTransaction', 'solanaMessage']),
   near: Object.freeze(['nearConnect', 'nearTransaction', 'nearMessage']),
+  starknet: Object.freeze(['starknetConnect', 'starknetTransaction', 'starknetMessage']),
   multichain: Object.freeze(['multichainConnect'])
 })
 
@@ -189,6 +192,7 @@ export class DAppHandler {
   clearPermissions(): void {
     this.permissions.clear()
     pendingRequestsManager.cancelAll()
+    revokeAllStarknetPermissions()
   }
 
   async removeAccountReferences(walletId: string, accountId?: string): Promise<void> {
@@ -1923,7 +1927,17 @@ export class DAppHandler {
 
   cancelPendingApprovals(
     origin: string,
-    chainId: 'zcash' | 'evm' | 'bitcoin' | 'pearl' | 'quantus' | 'solana' | 'near' | 'multichain'
+    chainId:
+      | 'zcash'
+      | 'evm'
+      | 'bitcoin'
+      | 'dash'
+      | 'solana'
+      | 'near'
+      | 'pearl'
+      | 'quantus'
+      | 'starknet'
+      | 'multichain'
   ): number {
     const actions = APPROVAL_ACTION_PREFIXES[chainId]
     return pendingRequestsManager.cancelOrigin(origin, action => actions.includes(action))
@@ -2242,10 +2256,15 @@ export class DAppHandler {
     await dappManager.removeConnection(origin)
     this.permissions.delete(origin)
     pendingRequestsManager.cancelOrigin(origin)
+    revokeStarknetOrigin(origin)
     await Promise.allSettled([
       this.broadcastEvent(origin, 'accountsChanged', null),
       this.broadcastEvent(origin, 'accountsChanged', [], 'evm'),
-      this.broadcastEvent(origin, 'accountsChanged', [], 'bitcoin')
+      this.broadcastEvent(origin, 'accountsChanged', [], 'bitcoin'),
+      this.broadcastEvent(origin, 'accountsChanged', [], 'dash'),
+      this.broadcastEvent(origin, 'accountsChanged', [], 'solana'),
+      this.broadcastEvent(origin, 'accountsChanged', [], 'near'),
+      this.broadcastEvent(origin, 'accountsChanged', [], 'starknet')
     ])
     this.trackDisconnected()
   }

@@ -14,7 +14,9 @@ import {
   type QuantusTransferSummary
 } from './signing-summary'
 import { parseBitcoinSummary } from './signing-summary-validation-bitcoin'
+import { parseDashSummary } from './signing-summary-validation-dash'
 import { parseNearSummary } from './signing-summary-validation-near'
+import { parseStarknetSummary } from './signing-summary-validation-starknet'
 import { parsePearlSummary } from './signing-summary-validation-pearl'
 import { parseSolanaSummary } from './signing-summary-validation-solana'
 import { parseTronSummary } from './signing-summary-validation-tron'
@@ -32,11 +34,13 @@ const FAMILY_NAMESPACES: Readonly<Record<SigningSummaryFamily, string>> = Object
   zcash: 'bip122',
   evm: 'eip155',
   bitcoin: 'bip122',
+  dash: 'bip122',
   pearl: 'bip122',
   solana: 'solana',
   tron: 'tron',
   near: 'near',
-  quantus: 'quantus'
+  quantus: 'quantus',
+  starknet: 'starknet'
 })
 const ISSUE_CODES = new Set<SigningReviewIssueCode>([
   'contract-creation',
@@ -69,6 +73,8 @@ export const SCHEMA_EXPECTATIONS: Readonly<
   'evm.typed-data.v1': Object.freeze({ family: 'evm', operation: 'message' }),
   'bitcoin.psbt.v1': Object.freeze({ family: 'bitcoin', operation: 'transaction' }),
   'bitcoin.bip322-message.v1': Object.freeze({ family: 'bitcoin', operation: 'message' }),
+  'dash.psbt.v1': Object.freeze({ family: 'dash', operation: 'transaction' }),
+  'dash.message.v1': Object.freeze({ family: 'dash', operation: 'message' }),
   'pearl.psbt.v1': Object.freeze({ family: 'pearl', operation: 'transaction' }),
   'pearl.bip322-message.v1': Object.freeze({ family: 'pearl', operation: 'message' }),
   'solana.transaction.v1': Object.freeze({ family: 'solana', operation: 'transaction' }),
@@ -77,7 +83,10 @@ export const SCHEMA_EXPECTATIONS: Readonly<
   'tron.sign-message-v2.v1': Object.freeze({ family: 'tron', operation: 'message' }),
   'near.transaction.v1': Object.freeze({ family: 'near', operation: 'transaction' }),
   'near.nep413-message.v1': Object.freeze({ family: 'near', operation: 'message' }),
-  'quantus.transfer.v1': Object.freeze({ family: 'quantus', operation: 'transaction' })
+  'quantus.transfer.v1': Object.freeze({ family: 'quantus', operation: 'transaction' }),
+  'starknet.invoke.v1': Object.freeze({ family: 'starknet', operation: 'transaction' }),
+  'starknet.deploy-account.v1': Object.freeze({ family: 'starknet', operation: 'transaction' }),
+  'starknet.typed-data.v1': Object.freeze({ family: 'starknet', operation: 'message' })
 })
 
 export type UnknownRecord = Record<string, unknown>
@@ -421,6 +430,8 @@ export function parseSigningSummary(
       return parseEvmSummary(envelope)
     case 'bitcoin':
       return parseBitcoinSummary(envelope)
+    case 'dash':
+      return parseDashSummary(envelope)
     case 'pearl':
       return parsePearlSummary(envelope)
     case 'solana':
@@ -431,6 +442,8 @@ export function parseSigningSummary(
       return parseNearSummary(envelope)
     case 'quantus':
       return parseQuantusSummary(envelope)
+    case 'starknet':
+      return parseStarknetSummary(envelope)
   }
 }
 

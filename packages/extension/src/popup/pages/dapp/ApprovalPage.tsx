@@ -52,6 +52,7 @@ import { useNavigate } from '@/popup/provider/Router'
 import {
   formatDAppHost,
   parseBitcoinSigningSummary,
+  parseDashSigningSummary,
   parseEvmAddNetworkApproval,
   parseEvmMessageSummary,
   parseEvmPrivateTransferApproval,
@@ -90,9 +91,11 @@ const MULTI_ACCOUNT_CONNECT_ACTIONS = new Set([
   'evmConnect',
   'bitcoinConnect',
   'pearlConnect',
+  'dashConnect',
   'quantusConnect',
   'solanaConnect',
-  'nearConnect'
+  'nearConnect',
+  'starknetConnect'
 ])
 
 function ApprovalCheckIcon() {
@@ -228,6 +231,9 @@ export function ApprovalPage() {
   const isPearlConnect = action === 'pearlConnect'
   const isPearlTransaction = action === 'pearlTransaction'
   const isPearlMessage = action === 'pearlMessage'
+  const isDashConnect = action === 'dashConnect'
+  const isDashTransaction = action === 'dashTransaction'
+  const isDashMessage = action === 'dashMessage'
   const isQuantusConnect = action === 'quantusConnect'
   const isQuantusTransaction = action === 'quantusTransaction'
   const isQuantusSignTransfer = action === 'quantusSignTransfer'
@@ -261,6 +267,11 @@ export function ApprovalPage() {
     ? parsePearlSigningSummary(data.review?.summary, 'transaction')
     : isPearlMessage
       ? parsePearlSigningSummary(data.review?.summary, 'message')
+      : null
+  const dashSigningSummary = isDashTransaction
+    ? parseDashSigningSummary(data.review?.summary, 'transaction')
+    : isDashMessage
+      ? parseDashSigningSummary(data.review?.summary, 'message')
       : null
   const quantusSigningSummary =
     isQuantusTransaction || isQuantusSignTransfer
@@ -408,7 +419,14 @@ export function ApprovalPage() {
         })
         setWalletReady(true)
       }
-      setSelectedIds(preselectedIds)
+      const requiredAccountIds = Array.isArray(requestData.accounts)
+        ? requestData.accounts.flatMap(item => {
+            if (typeof item !== 'object' || item === null) return []
+            const id = Reflect.get(item, 'id')
+            return Reflect.get(item, 'required') === true && typeof id === 'string' ? [id] : []
+          })
+        : []
+      setSelectedIds(preselectedIds.length > 0 ? preselectedIds : requiredAccountIds)
       const scopeSelections: Record<string, string[]> = Object.create(null)
       if (Array.isArray(requestData.scopes)) {
         for (const scope of requestData.scopes) {
@@ -848,9 +866,11 @@ export function ApprovalPage() {
 
       case 'bitcoinConnect':
       case 'pearlConnect':
+      case 'dashConnect':
       case 'quantusConnect':
       case 'solanaConnect':
       case 'nearConnect':
+      case 'starknetConnect':
       case 'evmConnect': {
         const address = typeof data.address === 'string' ? data.address : 'Unavailable'
         const accounts: ChainAccountOption[] = Array.isArray(data.accounts)
@@ -1032,6 +1052,13 @@ export function ApprovalPage() {
         return renderInvalidSigningRequest(
           'The request did not include a valid, immutable Pearl signing summary.',
           action === 'pearlMessage'
+        )
+
+      case 'dashTransaction':
+      case 'dashMessage':
+        return renderInvalidSigningRequest(
+          'The request did not include a valid, immutable Dash signing summary.',
+          action === 'dashMessage'
         )
 
       case 'quantusTransaction':
@@ -1341,6 +1368,70 @@ export function ApprovalPage() {
           action === 'solanaMessage' || action === 'nearMessage'
         )
 
+      case 'starknetTransaction':
+      case 'starknetMessage': {
+        const calls = Array.isArray(data.calls) ? data.calls : []
+        return (
+          <div className="space-y-5">
+            <DAppRequestHeader
+              domain={dappDomain}
+              pageUrl={dappPageUrl}
+              action={action === 'starknetMessage' ? 'Sign typed data' : 'Review Starknet calls'}
+            />
+            <ApprovalDetailCard title={action === 'starknetMessage' ? 'Typed data' : 'Calls'}>
+              {action === 'starknetMessage' ? (
+                <p className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground">
+                  {typeof data.message === 'string'
+                    ? data.message
+                    : typeof data.primaryType === 'string'
+                      ? data.primaryType
+                      : 'Typed data'}
+                </p>
+              ) : (
+                <div className="space-y-3">
+                  {calls.map((call: unknown, index: number) => {
+                    const record =
+                      call && typeof call === 'object' ? (call as Record<string, unknown>) : {}
+                    const calldata = Array.isArray(record.calldata) ? record.calldata.length : 0
+                    return (
+                      <div
+                        key={index}
+                        className="min-w-0 space-y-1 break-all font-mono text-[11px] leading-4 text-foreground/90"
+                      >
+                        <div>
+                          {typeof record.contract_address === 'string'
+                            ? record.contract_address
+                            : 'Unknown contract'}
+                        </div>
+                        <div className="text-muted">
+                          {typeof record.entry_point === 'string' ? record.entry_point : 'call'} ·{' '}
+                          {calldata} felts
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </ApprovalDetailCard>
+            {action === 'starknetTransaction' && data.deploysAccount === true && (
+              <WarningBox>
+                <div className="flex-1">
+                  <span className="font-medium">Account deployment:</span>
+                  <p className="mt-1 text-xs">
+                    This account has not been deployed yet. The wallet will sign and broadcast a
+                    deploy first, then the transfer.
+                  </p>
+                </div>
+              </WarningBox>
+            )}
+            <DAppNetworkCard
+              chain="Starknet"
+              network={typeof data.networkName === 'string' ? data.networkName : 'Starknet'}
+            />
+          </div>
+        )
+      }
+
       default:
         return (
           <div className="space-y-5">
@@ -1598,6 +1689,23 @@ export function ApprovalPage() {
     )
   }
 
+  if (dashSigningSummary) {
+    const address = dashSigningSummary.fields.signer
+    return (
+      <SigningSummaryReview
+        summary={dashSigningSummary}
+        chainName="Dash"
+        networkName={typeof data.chainName === 'string' ? data.chainName : 'Unknown network'}
+        accountName={accountDisplayName}
+        accountAddress={address}
+        source={{ kind: 'dapp', domain: dappDomain, pageUrl: dappPageUrl }}
+        isSubmitting={isLoading}
+        onReject={() => void handleDecision(false)}
+        onConfirm={() => void handleDecision(true)}
+      />
+    )
+  }
+
   if (quantusSigningSummary) {
     return (
       <SigningSummaryReview
@@ -1672,6 +1780,7 @@ export function ApprovalPage() {
               (isEvmMessage && evmMessageSummary === null) ||
               ((isBitcoinTransaction || isBitcoinMessage) && bitcoinSigningSummary === null) ||
               ((isPearlTransaction || isPearlMessage) && pearlSigningSummary === null) ||
+              ((isDashTransaction || isDashMessage) && dashSigningSummary === null) ||
               (isQuantusTransaction && quantusSigningSummary === null) ||
               (isQuantusSignTransfer && quantusSigningSummary === null) ||
               ((isSolanaTransaction || isSolanaMessage || isNearTransaction || isNearMessage) &&
@@ -1701,7 +1810,7 @@ export function ApprovalPage() {
                       ? data.action === 'add'
                         ? 'Add Network'
                         : 'Switch Network'
-                      : isBitcoinConnect
+                      : isBitcoinConnect || isDashConnect
                         ? 'Connect'
                         : isPearlConnect
                           ? 'Connect'

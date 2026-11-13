@@ -24,15 +24,19 @@ import {
   getZcashChainId,
   parseChainId
 } from '@/core/chains/registry'
+import { DASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { assertDisabledChainEndpointsUnchanged } from '@/core/chains/disabled-chain-endpoint-policy'
 import {
   findBuiltinEvmNetworkConfig,
   getNearNetworkConfig,
-  getSolanaNetworkConfig
+  getSolanaNetworkConfig,
+  getStarknetNetworkConfig
 } from '@/config/networks'
 import { attestBitcoinEsploraEndpoint } from '@/infrastructure/chains/bitcoin'
+import { attestDashInsightEndpoint } from '@/infrastructure/chains/dash'
 import { attestEvmRpcEndpoint } from '@/infrastructure/chains/evm'
 import { attestNearRpcEndpoint } from '@/infrastructure/chains/near'
+import { attestStarknetRpcEndpoint } from '@/infrastructure/chains/starknet/starknet-network-attestation'
 import { attestPearlBlockbookEndpoint } from '@/infrastructure/chains/pearl'
 import { attestQuantusRpcEndpoint } from '@/infrastructure/chains/quantus'
 import { attestSolanaRpcEndpoint } from '@/infrastructure/chains/solana'
@@ -54,10 +58,12 @@ import { credentialLifecycle } from './credential-lifecycle'
 import { dappManager } from '@/core/dapp/dapp-manager'
 import {
   resolveBitcoinFeatureRuntimePolicy,
+  resolveDashFeatureRuntimePolicy,
   resolveEvmFeatureRuntimePolicy,
   resolveNearFeatureRuntimePolicy,
   resolveQuantusFeatureRuntimePolicy,
-  resolveSolanaFeatureRuntimePolicy
+  resolveSolanaFeatureRuntimePolicy,
+  resolveStarknetFeatureRuntimePolicy
 } from '@/core/chains/feature-runtime-policy'
 
 const MAXIMUM_ATTESTATION_CONCURRENCY = 3
@@ -170,31 +176,43 @@ export class ChainEndpointSettingsCoordinator {
       DEFAULT_NETWORK === 'mainnet' ? 'mainnet' : 'devnet'
     )
     const nearNetwork = getNearNetworkConfig(DEFAULT_NETWORK)
+    const starknetNetwork = getStarknetNetworkConfig(DEFAULT_NETWORK)
     const solanaEnabled = resolveSolanaFeatureRuntimePolicy(
       __ENABLED_CHAIN_FEATURE_FLAGS__
     ).newOperationsEnabled
     const nearEnabled = resolveNearFeatureRuntimePolicy(
       __ENABLED_CHAIN_FEATURE_FLAGS__
     ).newOperationsEnabled
+    const starknetEnabled = resolveStarknetFeatureRuntimePolicy(
+      __ENABLED_CHAIN_FEATURE_FLAGS__
+    ).newOperationsEnabled
     const bitcoinEnabled = resolveBitcoinFeatureRuntimePolicy(
       __ENABLED_CHAIN_FEATURE_FLAGS__
     ).newOperationsEnabled
+    const dashEnabled = resolveDashFeatureRuntimePolicy(
+      __ENABLED_CHAIN_FEATURE_FLAGS__
+    ).newOperationsEnabled
+    const dashChainId = DASH_CHAIN_IDS[DEFAULT_NETWORK]
     const quantusChainId = getQuantusChainId(DEFAULT_NETWORK)
     const quantusEnabled = resolveQuantusFeatureRuntimePolicy(
       __ENABLED_CHAIN_FEATURE_FLAGS__
     ).newOperationsEnabled
     assertDisabledChainEndpointsUnchanged(currentSettings, settings, [
       ...(!bitcoinEnabled ? [getBitcoinChainId(DEFAULT_NETWORK)] : []),
+      ...(!dashEnabled ? [dashChainId] : []),
       ...(!solanaEnabled ? [solanaNetwork.chainId] : []),
       ...(!nearEnabled ? [nearNetwork.chainId] : []),
-      ...(!quantusEnabled ? [quantusChainId] : [])
+      ...(!quantusEnabled ? [quantusChainId] : []),
+      ...(!starknetEnabled ? [starknetNetwork.chainId] : [])
     ])
     const supportedChainIds = new Set([
       getZcashChainId(DEFAULT_NETWORK),
       getBitcoinChainId(DEFAULT_NETWORK),
+      dashChainId,
       solanaNetwork.chainId,
       nearNetwork.chainId,
       ...(quantusEnabled ? [quantusChainId] : []),
+      starknetNetwork.chainId,
       ...catalog.map(network => network.chainId)
     ])
     const unsupportedOverride = [...settings.overrides, ...(settings.savedRpcEndpoints ?? [])].find(
@@ -280,6 +298,12 @@ export class ChainEndpointSettingsCoordinator {
         )
         continue
       }
+      if (override.chainId === dashChainId && rpc.protocol === 'dash-insight') {
+        attestations.set(`dash:${rpc.url}`, () =>
+          attestDashInsightEndpoint(override.chainId, rpc.url)
+        )
+        continue
+      }
       if (
         override.chainId === getPearlChainId(DEFAULT_NETWORK) &&
         (rpc.protocol === 'pearl-blockbook' || rpc.protocol === 'pearl-json-rpc')
@@ -316,6 +340,16 @@ export class ChainEndpointSettingsCoordinator {
       ) {
         attestations.set(`quantus:${rpc.url}`, () =>
           attestQuantusRpcEndpoint({ chainId: override.chainId, rpcUrl: rpc.url })
+        )
+        continue
+      }
+      if (
+        starknetEnabled &&
+        override.chainId === starknetNetwork.chainId &&
+        rpc.protocol === 'starknet-json-rpc'
+      ) {
+        attestations.set(`starknet:${rpc.url}`, () =>
+          attestStarknetRpcEndpoint({ chainId: override.chainId, rpcUrl: rpc.url })
         )
         continue
       }

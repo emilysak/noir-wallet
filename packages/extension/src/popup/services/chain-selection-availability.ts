@@ -1,10 +1,12 @@
 import {
   BITCOIN_CHAIN_FEATURE_FLAG,
+  DASH_CHAIN_FEATURE_FLAG,
   EVM_CHAIN_FEATURE_FLAG,
   NEAR_CHAIN_FEATURE_FLAG,
   PEARL_CHAIN_FEATURE_FLAG,
   QUANTUS_CHAIN_FEATURE_FLAG,
   SOLANA_CHAIN_FEATURE_FLAG,
+  STARKNET_CHAIN_FEATURE_FLAG,
   ZCASH_CHAIN_FEATURE_FLAG,
   type ChainFeatureFlagValue
 } from '@/config/multichain-feature-flags'
@@ -15,19 +17,23 @@ export type SelectableChainFamily =
   | 'zcash'
   | 'evm'
   | 'bitcoin'
+  | 'dash'
   | 'solana'
   | 'near'
   | 'pearl'
   | 'quantus'
+  | 'starknet'
 
 const FAMILY_FLAGS: Readonly<Record<SelectableChainFamily, ChainFeatureFlagValue>> = {
   zcash: ZCASH_CHAIN_FEATURE_FLAG,
   evm: EVM_CHAIN_FEATURE_FLAG,
   bitcoin: BITCOIN_CHAIN_FEATURE_FLAG,
+  dash: DASH_CHAIN_FEATURE_FLAG,
   solana: SOLANA_CHAIN_FEATURE_FLAG,
   near: NEAR_CHAIN_FEATURE_FLAG,
   pearl: PEARL_CHAIN_FEATURE_FLAG,
-  quantus: QUANTUS_CHAIN_FEATURE_FLAG
+  quantus: QUANTUS_CHAIN_FEATURE_FLAG,
+  starknet: STARKNET_CHAIN_FEATURE_FLAG
 }
 
 export const DEFERRED_CHAIN_CHOICES = Object.freeze([
@@ -75,6 +81,7 @@ export function isSelectableSwapBlockchain(
     return isSelectableChainFamily('solana', enabledFlags)
   }
   if (normalized === 'near') return isSelectableChainFamily('near', enabledFlags)
+  if (normalized === 'dash') return false
   return (
     isSelectableChainFamily('evm', enabledFlags) &&
     resolveIntentsEvmChainId(normalized, getEvmNetworkConfigs('mainnet')) !== null
