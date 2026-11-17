@@ -282,7 +282,154 @@ test.describe('NEAR native transfer preparation', () => {
       }
     })
     expect(parsePreparedNearTokenTransfer(structuredClone(prepared))).toEqual(prepared)
+  })
 
+  test('prepares a transfer to a missing implicit account and rejects a missing named account', async () => {
+    const implicitReceiver = 'ab'.repeat(32)
+    const lookedUp = []
+    const state = harness({
+      getAccount: async accountId => {
+        lookedUp.push(accountId)
+        return accountId === implicitReceiver ? null : account(accountId)
+      }
+    })
+    const prepared = await prepareNearNativeTransfer({
+      chainId: 'near:testnet',
+      accountIndex: 0,
+      signerId,
+      publicKey,
+      receiverId: implicitReceiver,
+      depositYocto: '1',
+      rpc: state.rpc
+    })
+
+    expect(prepared.receiverId).toBe(implicitReceiver)
+    expect(prepared.transaction.receiverId).toBe(implicitReceiver)
+    expect(prepared.transaction.actions).toEqual([{ type: 'transfer', depositYocto: '1' }])
+    expect(lookedUp).toContain(implicitReceiver)
+
+    const named = harness({
+      getAccount: async accountId => (accountId === receiverId ? null : account(accountId))
+    })
+    await expect(
+      prepareNearNativeTransfer({
+        chainId: 'near:testnet',
+        accountIndex: 0,
+        signerId,
+        publicKey,
+        receiverId,
+        depositYocto: '1',
+        rpc: named.rpc
+      })
+    ).rejects.toMatchObject({ code: 'recipient-not-found' })
+  })
+
+  test('pays a bounded storage deposit for an unregistered NEP-141 recipient', async () => {
+    const contractId = 'token.testnet'
+    const storageDepositYocto = '1250000000000000000000'
+    const state = harness({
+      getFungibleTokenBalance: async (requestedContract, accountId) => ({
+        contractId: requestedContract,
+        accountId,
+        amountRaw: '2500000',
+        blockHash,
+        blockHeight: 10
+      }),
+      isFungibleTokenAccountRegistered: async () => false
+    })
+    const prepared = await prepareNearTokenTransfer({
+      chainId: 'near:testnet',
+      accountIndex: 0,
+      assetId: 'near:testnet/nep141:token.testnet',
+      signerId,
+      publicKey,
+      recipientId: receiverId,
+      contractId,
+      amountRaw: '2500000',
+      rpc: state.rpc
+    })
+
+    expect(prepared.amountRaw).toBe('2500000')
+    expect(prepared.estimatedFeeYocto).toBe('6000000000000000000000')
+    expect(prepared.maximumFeeYocto).toBe('60000000000000000000000')
+    expect(prepared.storageReserveYocto).toBe('1000000000000000000000')
+    expect(prepared.totalRequiredYocto).toBe('62250000000000000000001')
+    expect(prepared.transaction.actions.map(action => action.methodName)).toEqual([
+      'storage_deposit',
+      'ft_transfer'
+    ])
+    expect(prepared.transaction.actions[0]).toMatchObject({
+      type: 'functionCall',
+      methodName: 'storage_deposit',
+      gas: '30000000000000',
+      depositYocto: storageDepositYocto
+    })
+    expect(prepared.transaction.actions[1]).toMatchObject({
+      type: 'functionCall',
+      methodName: 'ft_transfer',
+      gas: '30000000000000',
+      depositYocto: '1'
+    })
+    expect(BigInt(prepared.totalRequiredYocto)).toBe(
+      BigInt(prepared.maximumFeeYocto) +
+        BigInt(prepared.storageReserveYocto) +
+        BigInt(storageDepositYocto) +
+        1n
+    )
+    expect(parsePreparedNearTokenTransfer(structuredClone(prepared))).toEqual(prepared)
+
+    const fingerprint = await computeNearTransactionFingerprint(prepared.transaction)
+    await expect(
+      assertNearTransferSigningMatchesPrepared(prepared, {
+        chainId: prepared.chainId,
+        operation: 'transaction',
+        execution: { kind: 'internal' },
+        summary: {
+          schema: 'near.transaction.v1',
+          review: { level: 'standard', issues: [] },
+          fields: {
+            signerId,
+            publicKey,
+            nonce: prepared.transaction.nonce,
+            receiverId: contractId,
+            blockHash,
+            actions: prepared.transaction.actions.map(action => ({
+              kind: 'function-call',
+              methodName: action.methodName,
+              args: { encoding: 'base64', value: action.args },
+              gas: action.gas,
+              depositYocto: action.depositYocto
+            }))
+          }
+        },
+        payloadFingerprint: { digestHex: fingerprint }
+      })
+    ).resolves.toBeUndefined()
+
+    const inflated = structuredClone(prepared)
+    inflated.transaction.actions[0].depositYocto = '9990000000000000000000000'
+    inflated.totalRequiredYocto = (
+      BigInt(prepared.maximumFeeYocto) +
+      BigInt(prepared.storageReserveYocto) +
+      9990000000000000000000000n +
+      1n
+    ).toString()
+    expect(() => parsePreparedNearTokenTransfer(inflated)).toThrow(/storage deposit/)
+
+    const unpriced = harness({
+      getFungibleTokenBalance: async (requestedContract, accountId) => ({
+        contractId: requestedContract,
+        accountId,
+        amountRaw: '2500000',
+        blockHash,
+        blockHeight: 10
+      }),
+      isFungibleTokenAccountRegistered: async () => false,
+      getNativeTransferCostConfig: async () => ({
+        ...(await harness().rpc.getNativeTransferCostConfig()),
+        storageAmountPerByteRaw: '1'
+      })
+    })
     await expect(
       prepareNearTokenTransfer({
         chainId: 'near:testnet',
@@ -293,9 +440,34 @@ test.describe('NEAR native transfer preparation', () => {
         recipientId: receiverId,
         contractId,
         amountRaw: '1',
-        rpc: { ...state.rpc, isFungibleTokenAccountRegistered: async () => false }
+        rpc: unpriced.rpc
       })
     ).rejects.toMatchObject({ code: 'recipient-token-account-not-registered' })
+
+    const underfunded = harness({
+      getAccount: async accountId => account(accountId, '62250000000000000000000'),
+      getFungibleTokenBalance: async (requestedContract, accountId) => ({
+        contractId: requestedContract,
+        accountId,
+        amountRaw: '2500000',
+        blockHash,
+        blockHeight: 10
+      }),
+      isFungibleTokenAccountRegistered: async () => false
+    })
+    await expect(
+      prepareNearTokenTransfer({
+        chainId: 'near:testnet',
+        accountIndex: 0,
+        assetId: 'near:testnet/nep141:token.testnet',
+        signerId,
+        publicKey,
+        recipientId: receiverId,
+        contractId,
+        amountRaw: '2500000',
+        rpc: underfunded.rpc
+      })
+    ).rejects.toMatchObject({ code: 'insufficient-funds' })
   })
 })
 

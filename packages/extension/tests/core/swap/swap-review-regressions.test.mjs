@@ -4,6 +4,7 @@ import { selectWalletOwnedQuoteAssetExecution } from '../../../src/popup/service
 import { resolveSwapMaximumAdjustment } from '../../../src/popup/services/swap-maximum.ts'
 import {
   buildLiveSwapQuoteRequest,
+  formatMoveNetworkFee,
   hasSwapQuoteTermsChanged,
   isAcceptedSwapReview,
   resolveScopedSwapZcashRecipient,
@@ -609,4 +610,17 @@ it('lists Intents and native Shield ZEC as separate selectable sources with dist
   } finally {
     globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__ = previousFlags
   }
+})
+
+it('formats a Move confirmation network fee from a prepared raw amount', () => {
+  assert.deepEqual(formatMoveNetworkFee({ raw: '5000', decimals: 9, symbol: 'SOL' }), {
+    amount: '0.000005',
+    symbol: 'SOL'
+  })
+  assert.deepEqual(
+    formatMoveNetworkFee({ raw: '5000000000000', decimals: 24, symbol: 'NEAR' }),
+    { amount: '0.000000000005', symbol: 'NEAR' }
+  )
+  assert.equal(formatMoveNetworkFee({ raw: null, decimals: 9, symbol: 'SOL' }), null)
+  assert.equal(formatMoveNetworkFee({ raw: '1.5', decimals: 9, symbol: 'SOL' }), null)
 })

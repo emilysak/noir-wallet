@@ -1,5 +1,6 @@
 import { parseDisplayUnitAmount } from '@/lib/number-format'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import { supportsNearPrivateExecution } from '@/core/chains/near'
 import type { PortfolioAssetView, PortfolioChainView } from '@/core/portfolio'
 import type { AccountNetworksView } from './account-networks-client'
 import { getAssetDomainRaw, type AssetDomain } from './asset-domains'
@@ -42,6 +43,27 @@ export function resolveTransferDomains(input: {
     else to = from === 'public' ? 'private' : 'public'
   }
   return Object.freeze({ from, to })
+}
+
+export function getNearMoveChainIds(
+  account: AccountNetworksView | null,
+  mainnet: boolean
+): readonly string[] {
+  return (
+    account?.networks.flatMap(network => {
+      if (
+        network.chain.family !== 'near' ||
+        !network.addresses.some(address => address.preferredForReceive)
+      ) {
+        return []
+      }
+      // Mainnet can quote Cluster without a PEA. Testnet Move is a direct PEA transfer.
+      if (mainnet) return [network.chain.id]
+      return supportsNearPrivateExecution(account.walletSource) && network.privateExecutionAddress
+        ? [network.chain.id]
+        : []
+    }) ?? []
+  )
 }
 
 export function getPrivateTransferChainIds(

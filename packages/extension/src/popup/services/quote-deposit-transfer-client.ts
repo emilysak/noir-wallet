@@ -1,4 +1,5 @@
 import type { PortfolioAssetView, PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
+import { parseNearAccountId } from '@/core/chains/near'
 import { parseSolanaPublicKey } from '@/core/chains/solana'
 import type { EvmFeeEstimate, EvmFeeSelection } from '@/infrastructure/chains/evm'
 import type { NetworkFeeTier, TransactionGraph } from '@/core/transactions/domain'
@@ -57,6 +58,9 @@ import {
 } from '@/core/services/intents-evm-assets'
 import type { BitcoinSupportedAddressType } from '@/core/chains/bitcoin'
 import { resolveIntentsWalletAsset } from '@/core/services/intents-wallet-assets'
+import { NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS } from '@/core/services/confidential-funding/native-confidential-protocol-assets'
+import { WNEAR_NEAR_ASSET } from '@/config/intents'
+import { NEAR_WRAP_STORAGE_DEPOSIT_YOCTO } from '@/core/services/rhea-swap/near-wrap-batch'
 import {
   solanaWalletClient,
   type SolanaTransferReview,
@@ -326,18 +330,40 @@ function receiveTargetsMatchPortfolio(
   )
 }
 
+function resolveNativeConfidentialPortfolioAsset(
+  token: SwapToken,
+  portfolio: PortfolioReadModel
+): PortfolioAssetView | null {
+  const blockchain = token.blockchain.toLowerCase()
+  const alias = NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS.find(
+    item => item.protocolAssetId === token.assetId && item.blockchain === blockchain
+  )
+  if (!alias) return null
+  const assetId = `${alias.chainId}/slip44:${alias.reference}`
+  return (
+    portfolio.assets.find(
+      candidate => candidate.asset.id === assetId && candidate.metadata.decimals === token.decimals
+    ) ?? null
+  )
+}
+
 function resolveMappedPortfolioAsset(
   token: SwapToken,
   portfolio: PortfolioReadModel,
   mappings: readonly AssetProtocolSourceMapping[]
 ): Pick<WalletOwnedQuoteAsset, 'asset' | 'networkFeeAsset' | 'chain' | 'sourceAssetId'> | null {
+  // Wrapped NEAR and SOL stay on their protocol ids for quotes. Spendable balance
+  // is the native coin, including when the catalog row still has a contract address.
+  const nativeAlias = resolveNativeConfidentialPortfolioAsset(token, portfolio)
   const mapping = mappings.find(candidate => candidate.protocolAssetId === token.assetId)
   const protocolAsset = resolveIntentsWalletAsset(token, DEFAULT_NETWORK)
-  const asset = mapping
-    ? portfolio.assets.find(candidate => candidate.asset.id === mapping.assetId)
-    : protocolAsset
-      ? portfolio.assets.find(candidate => candidate.asset.id === protocolAsset.assetId)
-      : resolveUserEvmPortfolioAsset(token, portfolio)
+  const asset = nativeAlias
+    ? nativeAlias
+    : mapping
+      ? portfolio.assets.find(candidate => candidate.asset.id === mapping.assetId)
+      : protocolAsset
+        ? portfolio.assets.find(candidate => candidate.asset.id === protocolAsset.assetId)
+        : resolveUserEvmPortfolioAsset(token, portfolio)
   if (
     !asset ||
     asset.metadata.decimals !== token.decimals ||
@@ -428,7 +454,7 @@ function selectEvmBalance(
   })
 }
 
-function selectSolanaExecutionBalance(asset: PortfolioAssetView): PortfolioAssetView | null {
+function selectPrivateAccountBalance(asset: PortfolioAssetView): PortfolioAssetView | null {
   const selectedRaw = asset.balance.privateRaw
   if (selectedRaw === undefined) return null
   return Object.freeze({
@@ -451,6 +477,15 @@ function isSolanaExecutionAddress(value: string): boolean {
   }
 }
 
+function isNearExecutionAddress(value: string): boolean {
+  if (/^0x/i.test(value)) return false
+  try {
+    return parseNearAccountId(value) === value
+  } catch {
+    return false
+  }
+}
+
 export function selectWalletOwnedQuoteAssetExecution(
   source: WalletOwnedQuoteAsset,
   mode: QuoteDepositExecutionMode,
@@ -459,13 +494,33 @@ export function selectWalletOwnedQuoteAssetExecution(
 ): WalletOwnedQuoteAsset | null {
   if (source.family === 'solana') {
     if (mode !== 'private') return source
-    const asset = selectSolanaExecutionBalance(source.asset)
-    const networkFeeAsset = selectSolanaExecutionBalance(source.networkFeeAsset)
+    const asset = selectPrivateAccountBalance(source.asset)
+    const networkFeeAsset = selectPrivateAccountBalance(source.networkFeeAsset)
     if (
       !asset ||
       !networkFeeAsset ||
       !privateExecutionAddress ||
       !isSolanaExecutionAddress(privateExecutionAddress) ||
+      privateExecutionAddress === source.refundAddress
+    ) {
+      return null
+    }
+    return Object.freeze({
+      ...source,
+      asset,
+      networkFeeAsset,
+      refundAddress: privateExecutionAddress
+    })
+  }
+  if (source.family === 'near') {
+    if (mode !== 'private') return source
+    const asset = selectPrivateAccountBalance(source.asset)
+    const networkFeeAsset = selectPrivateAccountBalance(source.networkFeeAsset)
+    if (
+      !asset ||
+      !networkFeeAsset ||
+      !privateExecutionAddress ||
+      !isNearExecutionAddress(privateExecutionAddress) ||
       privateExecutionAddress === source.refundAddress
     ) {
       return null
@@ -546,14 +601,21 @@ export function resolveWalletSwapSourceToken(
   const mappedProtocolAssetId = mappings.find(
     candidate => candidate.assetId === requestedAssetId
   )?.protocolAssetId
+  let match: SwapToken | null = null
   for (const token of tokens) {
-    if (token.assetId === requestedAssetId) return token
-    if (token.assetId === mappedProtocolAssetId) return token
-    if (!portfolio) continue
-    const source = resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets, mappings)
-    if (source?.asset.asset.id === requestedAssetId) return token
+    const source = portfolio
+      ? resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets, mappings)
+      : null
+    if (
+      token.assetId !== requestedAssetId &&
+      token.assetId !== mappedProtocolAssetId &&
+      source?.asset.asset.id !== requestedAssetId
+    ) {
+      continue
+    }
+    if (!match || nativeNearQuoteScore(token) > nativeNearQuoteScore(match)) match = token
   }
-  return null
+  return match
 }
 
 export function listWalletSwapSourceTokens<T extends SwapToken>(
@@ -566,17 +628,65 @@ export function listWalletSwapSourceTokens<T extends SwapToken>(
   }
 ): readonly T[] {
   const mappings = options.mappings ?? protocolSourceMappings
-  return Object.freeze(
-    tokens.filter(token => {
-      if (token.blockchain === 'zec' || token.blockchain === 'zcash') {
-        return options.includeZcash
-      }
-      return (
-        portfolio !== null &&
-        resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets, mappings) !== null
-      )
+  const owned = tokens.filter(token => {
+    if (token.blockchain === 'zec' || token.blockchain === 'zcash') {
+      return options.includeZcash
+    }
+    return (
+      portfolio !== null &&
+      resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets, mappings) !== null
+    )
+  })
+  return Object.freeze(dedupeOwnedSwapTokens(owned, portfolio, receiveTargets, mappings))
+}
+
+function nativeNearQuoteScore(token: SwapToken): number {
+  if (token.assetId !== WNEAR_NEAR_ASSET) return 0
+  const address =
+    'rheaAddress' in token && typeof token.rheaAddress === 'string' ? token.rheaAddress : ''
+  const sources =
+    'sources' in token && Array.isArray(token.sources)
+      ? token.sources.filter((source): source is string => typeof source === 'string')
+      : []
+  return (
+    (address === 'wrap.near' ? 2 : 0) +
+    (sources.some(source => {
+      const normalized = source.toLowerCase()
+      return normalized === 'nearintents' || normalized === 'preswap-nearintents'
     })
+      ? 1
+      : 0)
   )
+}
+
+function dedupeOwnedSwapTokens<T extends SwapToken>(
+  tokens: readonly T[],
+  portfolio: PortfolioReadModel | null,
+  receiveTargets: AdditionalReceiveTargetsView | null,
+  mappings: readonly AssetProtocolSourceMapping[]
+): readonly T[] {
+  const indexByAsset = new Map<string, number>()
+  const result: T[] = []
+  for (const token of tokens) {
+    const owned =
+      portfolio === null
+        ? null
+        : resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets, mappings)
+    if (!owned) {
+      result.push(token)
+      continue
+    }
+    const existingIndex = indexByAsset.get(owned.asset.asset.id)
+    if (existingIndex === undefined) {
+      indexByAsset.set(owned.asset.asset.id, result.length)
+      result.push(token)
+      continue
+    }
+    if (nativeNearQuoteScore(token) > nativeNearQuoteScore(result[existingIndex])) {
+      result[existingIndex] = token
+    }
+  }
+  return result
 }
 
 export function createNearIntentsSwapBinding(input: {
@@ -807,8 +917,14 @@ export function createQuoteDepositTransferClient(options: {
             actionDepositRaw > BigInt(probeAmountRaw)
               ? actionDepositRaw - BigInt(probeAmountRaw)
               : 0n
+          const wrapStorageRaw =
+            input.source.family === 'near' &&
+            isNative &&
+            input.source.sourceAssetId === WNEAR_NEAR_ASSET
+              ? NEAR_WRAP_STORAGE_DEPOSIT_YOCTO
+              : 0n
           const amountRaw = isNative
-            ? availableRaw - feeRaw - reserveRaw - attachedDepositRaw
+            ? availableRaw - feeRaw - reserveRaw - attachedDepositRaw - wrapStorageRaw
             : availableRaw
           if (amountRaw <= 0n) {
             throw new Error('The source wallet balance does not cover the network fee')

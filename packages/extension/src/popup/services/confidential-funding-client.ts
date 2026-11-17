@@ -13,6 +13,8 @@ import type { SwapStatus } from '@/core/services/intents-api'
 import type { NetworkFeeTier } from '@/core/transactions/domain'
 import type { EvmFeeSelection } from '@/infrastructure/chains/evm'
 import type { Network } from '@/types'
+import { parseNearAccountId } from '@/core/chains/near'
+import { parseSolanaPublicKey } from '@/core/chains/solana'
 
 type RuntimeMessenger = (message: Readonly<Record<string, unknown>>) => Promise<unknown>
 export type ConfidentialBalance = Readonly<{ tokenId: string; available: string; source: string }>
@@ -116,6 +118,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
+const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/
+const EVM_ZERO_ADDRESS_PATTERN = /^0x0{40}$/i
+
+function parserAccepts(parse: (value: unknown) => string, value: string): boolean {
+  try {
+    parse(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function isConfidentialReviewAddress(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  if (EVM_ADDRESS_PATTERN.test(value)) return !EVM_ZERO_ADDRESS_PATTERN.test(value)
+  return parserAccepts(parseNearAccountId, value) || parserAccepts(parseSolanaPublicKey, value)
+}
+
+function sameConfidentialReviewAddress(left: string, right: string): boolean {
+  return /^0x/i.test(left) && /^0x/i.test(right)
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right
+}
+
 function unwrap(value: unknown): unknown {
   if (!isRecord(value)) throw new Error('Confidential funding returned an invalid response')
   if (typeof value.error === 'string') {
@@ -203,14 +229,14 @@ function parseReview(value: unknown): ConfidentialFundingReview {
     !/^\d+$/.test(review.sourceAmountRaw) ||
     !/^\d+$/.test(review.expectedOutputRaw) ||
     !/^\d+$/.test(review.minimumOutputRaw) ||
-    !/^0x[0-9a-fA-F]{40}$/.test(review.sourceAddress) ||
-    !/^0x[0-9a-fA-F]{40}$/.test(review.destinationAddress) ||
+    !isConfidentialReviewAddress(review.sourceAddress) ||
+    !isConfidentialReviewAddress(review.destinationAddress) ||
     (review.externalRecipient !== undefined &&
       (review.operation !== 'withdraw' ||
         review.destinationDomain !== 'public' ||
         typeof review.externalRecipient !== 'string' ||
-        /^0x0{40}$/i.test(review.externalRecipient) ||
-        review.externalRecipient.toLowerCase() !== review.destinationAddress.toLowerCase())) ||
+        EVM_ZERO_ADDRESS_PATTERN.test(review.externalRecipient) ||
+        !sameConfidentialReviewAddress(review.externalRecipient, review.destinationAddress))) ||
     !Number.isSafeInteger(review.withdrawCount) ||
     (review.operation !== undefined &&
       !['deposit', 'withdraw', 'cluster', 'swap'].includes(review.operation)) ||

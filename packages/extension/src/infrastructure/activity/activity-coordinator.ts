@@ -7,6 +7,7 @@ import {
 import type { TransactionGraph } from '@/core/transactions/domain'
 import type { Transaction } from '@/types'
 import type { StorageV2ReadRepository, TransactionRepository } from '@/ports/repositories'
+import { formatLogError } from '@/lib/log-format'
 import { mapZcashV1TransactionToActivityItem } from './zcash-v1-activity-source'
 
 type ActivityStorageRepository = Pick<StorageV2ReadRepository, 'getActivePointer' | 'getSnapshot'>
@@ -56,7 +57,10 @@ export class ActivityCoordinator {
     const accountMode = options.accountMode ?? 'main'
     const [storedLocalGraphs, zcashTransactions, supplementalItems] = await Promise.all([
       this.options.transactionRepository.list({ scope, limit: 200 }),
-      this.options.loadZcashTransactions(scope),
+      this.options.loadZcashTransactions(scope).catch(error => {
+        console.warn('[Activity] Zcash history read failed:', formatLogError(error))
+        return []
+      }),
       this.loadSupplementalItems(scope, accountMode, options)
     ])
     const localGraphs = this.options.filterLocalGraphs
@@ -72,31 +76,37 @@ export class ActivityCoordinator {
     const hasMore = await this.options
       .loadSupplementalHasMore?.(scope, accountMode, options.chainIds)
       .catch(() => false)
-    return buildActivityReadModel({
-      scope,
-      localGraphs,
-      supplementalItems: Object.freeze([
-        ...zcashTransactions.map(transaction => {
-          const matchingReceipts = destinationReceipts
-            .get(transaction.destinationTxHash?.toLowerCase() ?? '')
-            ?.filter(
-              receipt =>
-                receipt.network === transaction.network &&
-                receipt.fromType === 'transparent' &&
-                receipt.to === transaction.quoteBinding?.recipient &&
-                (receipt.confirmations ?? 0) > 0
-            )
-          return mapZcashV1TransactionToActivityItem(
+    const zcashItems = zcashTransactions.flatMap(transaction => {
+      const matchingReceipts = destinationReceipts
+        .get(transaction.destinationTxHash?.toLowerCase() ?? '')
+        ?.filter(
+          receipt =>
+            receipt.network === transaction.network &&
+            receipt.fromType === 'transparent' &&
+            receipt.to === transaction.quoteBinding?.recipient &&
+            (receipt.confirmations ?? 0) > 0
+        )
+      try {
+        return [
+          mapZcashV1TransactionToActivityItem(
             transaction,
             scope,
             matchingReceipts?.length === 1 ? matchingReceipts[0] : undefined
           )
-        }),
-        ...supplementalItems
-      ]),
+        ]
+      } catch (error) {
+        console.warn('[Activity] Skipping invalid Zcash history item:', formatLogError(error))
+        return []
+      }
+    })
+    return buildActivityReadModel({
+      scope,
+      localGraphs,
+      supplementalItems: Object.freeze([...zcashItems, ...supplementalItems]),
       privateExecutionAddresses,
       limit: 2_000,
-      hasMore
+      hasMore,
+      skipInvalidItems: true
     })
   }
 
@@ -115,19 +125,13 @@ export class ActivityCoordinator {
         )
       } catch (error) {
         if ((options.historyPageCount ?? 1) > 1) throw error
-        console.warn(
-          '[Activity] Supplemental refresh failed:',
-          error instanceof Error ? error.name : 'UnknownError'
-        )
+        console.warn('[Activity] Supplemental refresh failed:', formatLogError(error))
       }
     }
     try {
       return (await this.options.loadCachedSupplementalItems?.(scope, accountMode)) ?? []
     } catch (error) {
-      console.warn(
-        '[Activity] Supplemental cache read failed:',
-        error instanceof Error ? error.name : 'UnknownError'
-      )
+      console.warn('[Activity] Supplemental cache read failed:', formatLogError(error))
       return []
     }
   }
@@ -140,10 +144,7 @@ export class ActivityCoordinator {
       return (await this.options.loadPrivateExecutionAddresses?.(scope, localGraphs)) ?? []
     } catch (error) {
       // Optional address classification must not prevent reading persisted transactions.
-      console.warn(
-        '[Activity] Private address lookup failed:',
-        error instanceof Error ? error.name : 'UnknownError'
-      )
+      console.warn('[Activity] Private address lookup failed:', formatLogError(error))
       return []
     }
   }

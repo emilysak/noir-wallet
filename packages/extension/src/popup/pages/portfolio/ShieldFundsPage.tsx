@@ -106,6 +106,13 @@ function ShieldFundsContent() {
     zcashKeySource
   })
   const { near, canManageNear, hasZcash, providersFor } = shieldActions
+  const canManageConfidential =
+    canManageNear ||
+    (currentNetwork === 'mainnet' &&
+      (activeAccount?.networks.some(
+        network => network.chain.family === 'near' || network.chain.family === 'solana'
+      ) ??
+        false))
   const shieldScopeKey = `${currentNetwork}:${account?.walletId ?? ''}:${account?.accountId ?? ''}`
   const {
     connecting: nearConnecting,
@@ -113,7 +120,7 @@ function ShieldFundsContent() {
     refreshBalances: refreshNearBalances
   } = useShieldBalances({
     active: true,
-    enabled: canManageNear && near.status !== 'ready',
+    enabled: canManageConfidential && near.status !== 'ready',
     scopeKey: shieldScopeKey,
     scope: account
       ? {
@@ -138,7 +145,7 @@ function ShieldFundsContent() {
         : undefined,
     [model, prices]
   )
-  const hasNear = canManageNear || near.entries.length > 0
+  const hasNear = canManageConfidential || near.entries.length > 0
   const zcashVaultEntry = resolveShieldZcashVaultEntry({
     network: currentNetwork,
     walletSource: activeAccount?.walletSource ?? null,
@@ -164,13 +171,17 @@ function ShieldFundsContent() {
         ? '…'
         : '—'
       : formatFiatAmount(total, { showSign: true })
-  const availableProviders = (action: ShieldAction): readonly ShieldProvider[] =>
-    action === 'move'
-      ? [
-          ...(canManageNear ? (['near-confidential'] as const) : []),
-          ...(hasZcash && zcashMoveSource ? (['zcash-shield'] as const) : [])
-        ]
-      : providersFor(action)
+  const availableProviders = (action: ShieldAction): readonly ShieldProvider[] => {
+    if (action === 'move') {
+      return [
+        ...(canManageConfidential ? (['near-confidential'] as const) : []),
+        ...(hasZcash && zcashMoveSource ? (['zcash-shield'] as const) : [])
+      ]
+    }
+    const providers = providersFor(action)
+    if (!canManageConfidential || providers.includes('near-confidential')) return providers
+    return ['near-confidential', ...providers]
+  }
   const mode = new URLSearchParams(location.search).get('mode') === 'private' ? 'private' : 'public'
   const requestedAssetId = new URLSearchParams(location.search).get('assetId')
   const originParams = new URLSearchParams(location.search)
@@ -205,7 +216,7 @@ function ShieldFundsContent() {
       return
     }
     if (action === 'swap') {
-      if (provider === 'near-confidential' && canManageNear)
+      if (provider === 'near-confidential' && canManageConfidential)
         go('/shield-swap?provider=near-confidential')
       return
     }
@@ -241,7 +252,7 @@ function ShieldFundsContent() {
   }
   const openAction = (action: ShieldAction) => {
     if (action === 'move') {
-      if (canManageNear) navigate(movePath)
+      if (canManageConfidential) navigate(movePath)
       else if (zcashMovePath) navigate(zcashMovePath)
       return
     }
@@ -250,7 +261,11 @@ function ShieldFundsContent() {
       return
     }
     if (action === 'send') {
-      const provider = canManageNear ? 'near-confidential' : hasZcash ? 'zcash-shield' : null
+      const provider = canManageConfidential
+        ? 'near-confidential'
+        : hasZcash
+          ? 'zcash-shield'
+          : null
       if (provider) runAction(provider, action)
       return
     }
@@ -277,11 +292,11 @@ function ShieldFundsContent() {
       return
     handledActionQuery.current = location.search
     const providers = availableProviders(requestedAction)
-    if (requestedAction === 'move' && (canManageNear || zcashMovePath)) {
-      replace(canManageNear ? movePath : zcashMovePath!)
+    if (requestedAction === 'move' && (canManageConfidential || zcashMovePath)) {
+      replace(canManageConfidential ? movePath : zcashMovePath!)
     } else if (requestedAction === 'receive' && providers.length > 0) {
       replace(withShieldAsset('/shield-deposit', requestedAssetId))
-    } else if (requestedAction === 'send' && canManageNear)
+    } else if (requestedAction === 'send' && canManageConfidential)
       runAction('near-confidential', requestedAction, true)
     else if (providers.length === 1) runAction(providers[0]!, requestedAction, true)
     else {

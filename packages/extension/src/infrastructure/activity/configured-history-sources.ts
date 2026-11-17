@@ -69,6 +69,8 @@ export function createConfiguredActivityHistorySources(input: {
         })
       : undefined,
     nearNetwork,
+    // Remote FastNear transfer history is mainnet-only. Testnet sends the wallet
+    // originates still appear from the local transaction graph.
     nearHistory:
       enabled.has(NEAR_CHAIN_FEATURE_FLAG) && input.network === 'mainnet'
         ? createNearActivityHistorySource({ chainId: nearNetwork.chainId })

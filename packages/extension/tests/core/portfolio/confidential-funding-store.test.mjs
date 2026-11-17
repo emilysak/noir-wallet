@@ -337,3 +337,128 @@ test('persists external Shield deposit quote bindings across a restart', async (
     restoreLocks()
   }
 })
+
+test('keeps EVM Shield sessions and balances apart from NEAR and Solana signers', async () => {
+  let now = 10_000
+  const local = storageArea()
+  const session = storageArea()
+  const previousChrome = globalThis.chrome
+  globalThis.chrome = { storage: { local, session } }
+  const restoreLocks = installWebLocksStub()
+  try {
+    const store = new ChromeConfidentialFundingStore(() => now)
+    const evm = '0x1111111111111111111111111111111111111111'
+    const near = 'alice.near'
+    const solana = '11111111111111111111111111111111'
+    const legacy = {
+      accessToken: 'legacy',
+      refreshToken: 'legacy-refresh',
+      expiresAt: 60_000,
+      refreshExpiresAt: 120_000
+    }
+    const evmSession = { ...legacy, accessToken: 'evm', signerId: evm }
+    const nearSession = { ...legacy, accessToken: 'near', signerId: near }
+    const solanaSession = { ...legacy, accessToken: 'solana', signerId: solana }
+    const evmBalances = [{ tokenId: 'nep141:eth.omft.near', available: '5', source: 'private' }]
+    const nearBalances = [{ tokenId: 'nep141:wrap.near', available: '9', source: 'private' }]
+    await store.putSession('mainnet', 'wallet:one', 'account:one', legacy)
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', evm)).toEqual(legacy)
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', near)).toBeNull()
+    await store.putSession('mainnet', 'wallet:one', 'account:one', evmSession)
+    await store.putSession('mainnet', 'wallet:one', 'account:one', nearSession)
+    await store.putSession('mainnet', 'wallet:one', 'account:one', solanaSession)
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', evm)).toMatchObject({
+      accessToken: 'evm',
+      signerId: evm
+    })
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one')).toMatchObject({
+      accessToken: 'evm'
+    })
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', near)).toMatchObject({
+      accessToken: 'near'
+    })
+    await store.putBalances('mainnet', 'wallet:one', 'account:one', evmBalances, evm)
+    await store.putBalances('mainnet', 'wallet:one', 'account:one', nearBalances, near)
+    expect(await store.getBalances('mainnet', 'wallet:one', 'account:one')).toEqual(evmBalances)
+    expect(await store.getBalances('mainnet', 'wallet:one', 'account:one', evm)).toEqual(
+      evmBalances
+    )
+    expect(await store.getBalances('mainnet', 'wallet:one', 'account:one', near)).toEqual(
+      nearBalances
+    )
+    await store.deleteSession('mainnet', 'wallet:one', 'account:one', evm)
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', evm)).toBeNull()
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', near)).toMatchObject({
+      accessToken: 'near'
+    })
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', solana)).toMatchObject({
+      accessToken: 'solana'
+    })
+    expect(await store.getBalances('mainnet', 'wallet:one', 'account:one')).toEqual(evmBalances)
+    await store.deleteSession('mainnet', 'wallet:one', 'account:one', near)
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', solana)).toMatchObject({
+      accessToken: 'solana'
+    })
+    await store.deleteSessionsByAccountScope('wallet:one', 'account:one')
+    await store.deleteBalancesByAccountScope('wallet:one', 'account:one')
+    expect(await store.getSession('mainnet', 'wallet:one', 'account:one', solana)).toBeNull()
+    expect(await store.getBalances('mainnet', 'wallet:one', 'account:one')).toEqual([])
+    expect(await store.getBalances('mainnet', 'wallet:one', 'account:one', near)).toEqual([])
+  } finally {
+    globalThis.chrome = previousChrome
+    restoreLocks()
+  }
+})
+
+test('lists fresh NEAR and Solana balances apart from the EVM cache', async () => {
+  const local = storageArea()
+  const session = storageArea()
+  const previousChrome = globalThis.chrome
+  globalThis.chrome = { storage: { local, session } }
+  const restoreLocks = installWebLocksStub()
+  try {
+    const store = new ChromeConfidentialFundingStore(() => 10_000)
+    const evm = '0x1111111111111111111111111111111111111111'
+    const near = 'alice.near'
+    const solana = '11111111111111111111111111111111'
+    const legacy = {
+      accessToken: 'legacy',
+      refreshToken: 'legacy-refresh',
+      expiresAt: 60_000,
+      refreshExpiresAt: 120_000
+    }
+    const evmBalances = [{ tokenId: 'nep141:eth.omft.near', available: '5', source: 'private' }]
+    const nearBalances = [
+      { tokenId: 'nep141:wrap.near', available: '9', source: 'private' },
+      { tokenId: 'nep141:usdt.tether-token.near', available: '4', source: 'private' }
+    ]
+    const solanaBalances = [{ tokenId: 'nep141:sol.omft.near', available: '7', source: 'private' }]
+    await store.putBalances('mainnet', 'wallet:one', 'account:one', evmBalances, evm)
+    await store.putBalances('mainnet', 'wallet:one', 'account:one', nearBalances, near)
+    await store.putBalances('mainnet', 'wallet:one', 'account:one', solanaBalances, solana)
+    expect(await store.listFreshSignerBalances('mainnet', 'wallet:one', 'account:one')).toEqual([
+      { signerId: null, balances: evmBalances },
+      { signerId: near, balances: nearBalances },
+      { signerId: solana, balances: solanaBalances }
+    ])
+    expect(await store.getBalances('mainnet', 'wallet:one', 'account:one')).toEqual(evmBalances)
+    await store.putSession('mainnet', 'wallet:one', 'account:one', { ...legacy, signerId: evm })
+    await store.putSession('mainnet', 'wallet:one', 'account:one', {
+      ...legacy,
+      accessToken: 'near',
+      signerId: near
+    })
+    await store.putSession('mainnet', 'wallet:one', 'account:one', {
+      ...legacy,
+      accessToken: 'solana',
+      signerId: solana
+    })
+    expect(await store.listNonEvmSessionSignerIds('mainnet', 'wallet:one', 'account:one')).toEqual([
+      near,
+      solana
+    ])
+  } finally {
+    globalThis.chrome = previousChrome
+    restoreLocks()
+  }
+})

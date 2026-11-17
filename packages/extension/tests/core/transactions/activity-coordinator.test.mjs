@@ -421,4 +421,37 @@ test.describe('Activity coordinator', () => {
     })
     await expect(filtered.readActive()).rejects.toThrow('Account filter unavailable')
   })
+
+  test('keeps other activity when Zcash history cannot be read', async () => {
+    const coordinator = new ActivityCoordinator({
+      storageRepository: storage(),
+      transactionRepository: await repositoryWithEvmTransfer(),
+      loadZcashTransactions: async () => {
+        throw new Error('Zcash history unavailable')
+      }
+    })
+
+    const result = await coordinator.readActive()
+    expect(result.items.map(item => item.id)).toEqual(['transaction:evm:activity'])
+  })
+
+  test('omits one invalid supplemental item and keeps the remaining activity', async () => {
+    const coordinator = new ActivityCoordinator({
+      storageRepository: storage(),
+      transactionRepository: await repositoryWithEvmTransfer(),
+      loadZcashTransactions: async () => [zcashTransaction()],
+      loadSupplementalItems: async () => [
+        rpcActivity(`0x${'d'.repeat(64)}`, {
+          id: 'rpc:evm:wrong-scope',
+          scope: { ...scope, accountId: 'account:other' }
+        })
+      ]
+    })
+
+    const result = await coordinator.readActive({ includeSupplemental: true })
+    expect(result.items.map(item => item.id)).toEqual([
+      'zcash-v1:activity',
+      'transaction:evm:activity'
+    ])
+  })
 })

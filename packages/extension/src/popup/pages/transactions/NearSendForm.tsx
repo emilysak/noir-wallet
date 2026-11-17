@@ -57,17 +57,66 @@ interface PreparedReview {
   readonly value: NearTransferReview
 }
 
+const NEAR_TOKEN_STORAGE_DEPOSIT_YOCTO = 1_250_000_000_000_000_000_000n
+
+function fungibleTransferArgsMatch(
+  action: NearTransferReview['review']['summary']['fields']['actions'][number] | undefined,
+  recipient: string,
+  amountRaw: string
+): boolean {
+  if (action?.kind !== 'function-call' || action.args.encoding !== 'base64') return false
+  try {
+    const decoded = JSON.parse(atob(action.args.value)) as unknown
+    return (
+      typeof decoded === 'object' &&
+      decoded !== null &&
+      !Array.isArray(decoded) &&
+      Object.keys(decoded).length === 2 &&
+      (decoded as Record<string, unknown>).receiver_id === recipient &&
+      (decoded as Record<string, unknown>).amount === amountRaw
+    )
+  } catch {
+    return false
+  }
+}
+
+function leadingStorageDepositYocto(value: NearTransferReview): bigint {
+  const summary = value.review.summary
+  if (summary.schema !== 'near.transaction.v1' || summary.fields.actions.length !== 2) return 0n
+  const action = summary.fields.actions[0]
+  if (
+    action?.kind !== 'function-call' ||
+    action.methodName !== 'storage_deposit' ||
+    action.depositYocto !== NEAR_TOKEN_STORAGE_DEPOSIT_YOCTO.toString()
+  ) {
+    return 0n
+  }
+  return NEAR_TOKEN_STORAGE_DEPOSIT_YOCTO
+}
+
+function networkFeeWithStorageDeposit(maximumFeeRaw: string, depositYocto: bigint): string {
+  if (depositYocto === 0n || !/^(?:0|[1-9][0-9]*)$/.test(maximumFeeRaw)) return maximumFeeRaw
+  // maximumFeeRaw is prepaid gas. The storage_deposit attachment is separate.
+  return (BigInt(maximumFeeRaw) + depositYocto).toString()
+}
+
 export function NearSendForm({
   selection,
   priceUsd,
+  initialRecipient,
+  initialAmount,
+  executionMode = 'main',
   onSubmitted
 }: {
   readonly selection: NearSendAsset
   readonly priceUsd: string | null
+  readonly initialRecipient?: string
+  readonly initialAmount?: string
+  readonly executionMode?: 'main' | 'private'
   readonly onSubmitted: (submission: NearTransferSubmission) => void
 }) {
-  const [amount, setAmount] = useState('')
-  const [recipient, setRecipient] = useState('')
+  const [amount, setAmount] = useState(initialAmount ?? '')
+  const [recipient, setRecipient] = useState(initialRecipient ?? '')
   const [selectedRecipient, setSelectedRecipient] = useState<{
     address: string
     name: string
@@ -78,7 +127,23 @@ export function NearSendForm({
   const [maxSelected, setMaxSelected] = useState(false)
   const [review, setReview] = useState<PreparedReview | null>(null)
   const pendingReview = useRef<NearTransferReview | null>(null)
-  const asset = selection.asset
+  const sourceAsset = selection.asset
+  const executionRaw =
+    executionMode === 'private'
+      ? (sourceAsset.balance.privateRaw ?? '0')
+      : (sourceAsset.balance.mainRaw ?? sourceAsset.balance.availableRaw)
+  const asset =
+    executionRaw === sourceAsset.balance.availableRaw
+      ? sourceAsset
+      : {
+          ...sourceAsset,
+          balance: {
+            ...sourceAsset.balance,
+            totalRaw: executionRaw,
+            spendableRaw: executionRaw,
+            availableRaw: executionRaw
+          }
+        }
   const chain = selection.chain
   const networkName = formatPortfolioNetworkName(chain)
   const recipientPlaceholder =
@@ -198,16 +263,22 @@ export function NearSendForm({
     }
     let value: NearTransferReview | null = null
     try {
-      value = await nearWalletClient.prepareTransfer({
-        assetId: asset.asset.id,
-        recipient: parsedRecipient,
-        amountRaw
-      })
-      return value.debit.maximumFeeRaw
+      value = await nearWalletClient.prepareTransfer(
+        {
+          assetId: asset.asset.id,
+          recipient: parsedRecipient,
+          amountRaw
+        },
+        { executionMode }
+      )
+      return networkFeeWithStorageDeposit(
+        value.debit.maximumFeeRaw,
+        leadingStorageDepositYocto(value)
+      )
     } finally {
       if (value) await nearWalletClient.rejectTransfer(value.graph.root.id).catch(() => {})
     }
-  }, [amountRaw, amountWithinBalance, asset.asset.id, parsedRecipient])
+  }, [amountRaw, amountWithinBalance, asset.asset.id, executionMode, parsedRecipient])
   const feePreview = useTransferFeePreview({
     enabled:
       amountWithinBalance &&
@@ -226,19 +297,30 @@ export function NearSendForm({
     setError(null)
     let value: NearTransferReview | null = null
     try {
-      value = await nearWalletClient.prepareTransfer({
-        assetId: asset.asset.id,
-        recipient: parsedRecipient,
-        amountRaw
-      })
+      value = await nearWalletClient.prepareTransfer(
+        {
+          assetId: asset.asset.id,
+          recipient: parsedRecipient,
+          amountRaw
+        },
+        { executionMode }
+      )
       const summary = value.review.summary
-      const transfer = summary.fields.actions[0]
+      const actions = summary.fields.actions
+      const transfer = actions[0]
+      const tokenTransfer = actions.at(-1)
       const transferMatches =
         asset.asset.kind === 'native'
           ? transfer?.kind === 'transfer' && transfer.depositYocto === amountRaw
-          : transfer?.kind === 'function-call' &&
-            transfer.methodName === 'ft_transfer' &&
-            summary.fields.receiverId === asset.asset.reference.replace(/%5F/gi, '_')
+          : summary.fields.receiverId === asset.asset.reference.replace(/%5F/gi, '_') &&
+            (actions.length === 1 ||
+              (actions.length === 2 &&
+                transfer?.kind === 'function-call' &&
+                transfer.methodName === 'storage_deposit' &&
+                transfer.depositYocto === NEAR_TOKEN_STORAGE_DEPOSIT_YOCTO.toString())) &&
+            tokenTransfer?.kind === 'function-call' &&
+            tokenTransfer.methodName === 'ft_transfer' &&
+            fungibleTransferArgsMatch(tokenTransfer, parsedRecipient, amountRaw)
       if (
         summary.schema !== 'near.transaction.v1' ||
         value.graph.root.intent?.primaryAmount?.assetId !== asset.asset.id ||
@@ -292,7 +374,11 @@ export function NearSendForm({
     }
   }
 
-  const feeRaw = review?.value.graph.root.intent?.feeLimit?.amountRaw ?? '0'
+  const summary = review?.value.review.summary
+  const feeRaw = networkFeeWithStorageDeposit(
+    review?.value.graph.root.intent?.feeLimit?.amountRaw ?? '0',
+    review ? leadingStorageDepositYocto(review.value) : 0n
+  )
   const reviewAmount = formatBaseUnitAmount(review?.amountRaw ?? '0', asset.metadata.decimals)
   const fee = formatBaseUnitAmount(feeRaw, 24)
   const total =
@@ -302,7 +388,6 @@ export function NearSendForm({
           asset.metadata.decimals
         )
       : '0'
-  const summary = review?.value.review.summary
 
   return (
     <>

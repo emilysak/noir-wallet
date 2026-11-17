@@ -1,5 +1,5 @@
 import type { Account, ChainAccount } from '@/core/accounts/domain'
-import { parseNearAccountId } from '@/core/chains/near'
+import { parseNearAccountId, supportsNearPrivateExecution } from '@/core/chains/near'
 import type { ChainId } from '@/core/chains/domain'
 import type { KeyDomainSource, SigningSummary } from '@/core/keyring/domain'
 import {
@@ -62,6 +62,7 @@ interface NearTransferIntent {
   readonly assetId: string
   readonly recipient: string
   readonly amountRaw: string
+  readonly executionMode?: 'main' | 'private'
 }
 
 const MAXIMUM_U128 = 340_282_366_920_938_463_463_374_607_431_768_211_455n
@@ -75,7 +76,10 @@ function parseIntent(value: unknown): NearTransferIntent {
     throw new Error('Invalid NEAR transfer intent')
   }
   const record = value as Record<string, unknown>
-  const keys = ['assetId', 'recipient', 'amountRaw']
+  const hasExecutionMode = Object.prototype.hasOwnProperty.call(record, 'executionMode')
+  const keys = hasExecutionMode
+    ? ['assetId', 'recipient', 'amountRaw', 'executionMode']
+    : ['assetId', 'recipient', 'amountRaw']
   if (
     Object.keys(record).length !== keys.length ||
     !keys.every(key => Object.prototype.hasOwnProperty.call(record, key)) ||
@@ -83,14 +87,16 @@ function parseIntent(value: unknown): NearTransferIntent {
     typeof record.recipient !== 'string' ||
     typeof record.amountRaw !== 'string' ||
     !/^[1-9][0-9]*$/.test(record.amountRaw) ||
-    BigInt(record.amountRaw) > MAXIMUM_U128
+    BigInt(record.amountRaw) > MAXIMUM_U128 ||
+    (hasExecutionMode && record.executionMode !== 'main' && record.executionMode !== 'private')
   ) {
     throw new Error('Invalid NEAR transfer intent')
   }
   return Object.freeze({
     assetId: record.assetId,
     recipient: parseNearAccountId(record.recipient),
-    amountRaw: record.amountRaw
+    amountRaw: record.amountRaw,
+    ...(record.executionMode === 'private' ? { executionMode: 'private' as const } : {})
   })
 }
 
@@ -125,11 +131,18 @@ export class BackgroundNearTransferController {
       if (!intent.assetId.startsWith(`${context.chainAccount.scope.chainId}/`)) {
         throw new Error('NEAR transfer asset does not match the active network')
       }
+      if (
+        intent.executionMode === 'private' &&
+        !supportsNearPrivateExecution(context.keyDomainSource)
+      ) {
+        throw new Error('NEAR private execution is unavailable')
+      }
       const base = {
         chainAccount: context.chainAccount,
         accountIndex: context.accountIndex,
         publicKey: context.publicKey,
         receiverId: intent.recipient,
+        ...(intent.executionMode === 'private' ? { executionMode: 'private' as const } : {}),
         ...(nearIntentsBinding === undefined ? {} : { nearIntentsBinding })
       }
       return toBackgroundReview(

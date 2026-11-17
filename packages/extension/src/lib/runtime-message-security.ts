@@ -747,6 +747,9 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
   INSPECT_USER_EVM_ASSET: {
     required: { chainId: isShortString, contractAddress: isShortString }
   },
+  INSPECT_USER_NEAR_ASSET: {
+    required: { chainId: isShortString, contractId: isShortString }
+  },
   ADD_USER_EVM_ASSET: { required: { candidate: isRecord } },
   ENABLE_INTENTS_EVM_ASSETS: {
     required: { assets: isArray, show: isBoolean }
@@ -1150,6 +1153,7 @@ const TRUSTED_RUNTIME_CONTEXTS: Readonly<Record<string, readonly OwnExtensionSen
     GET_USER_EVM_ASSETS: ['extension-page'],
     GET_MANAGED_TOKEN_ASSETS: ['extension-page'],
     INSPECT_USER_EVM_ASSET: ['extension-page'],
+    INSPECT_USER_NEAR_ASSET: ['extension-page'],
     ADD_USER_EVM_ASSET: ['extension-page'],
     ENABLE_INTENTS_EVM_ASSETS: ['extension-page'],
     REMOVE_USER_EVM_ASSET: ['extension-page'],

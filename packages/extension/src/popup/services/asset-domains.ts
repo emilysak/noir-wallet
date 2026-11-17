@@ -1,4 +1,5 @@
 import Big from '@/lib/big'
+import { getNearNetworkConfig, getSolanaNetworkConfig } from '@/config/networks'
 import { formatBaseUnitDecimalAmount, formatFiatAmount } from '@/lib/number-format'
 import type { PortfolioAssetView, PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
 import { findAssetPrice, type AssetPriceReadModel } from '@/core/prices'
@@ -11,6 +12,15 @@ import {
 export type AssetDomain = 'all' | 'public' | 'shield' | 'private'
 export type ShieldProvider = 'near-confidential' | 'zcash-shield'
 const ZCASH_CHAIN_ID_SET = new Set<string>(Object.values(ZCASH_CHAIN_IDS))
+const NEAR_MAINNET_CHAIN_ID = getNearNetworkConfig('mainnet').chainId
+const SOLANA_MAINNET_CHAIN_ID = getSolanaNetworkConfig('mainnet').chainId
+
+function hasMainnetConfidentialProtocol(asset: PortfolioAssetView): boolean {
+  if (asset.asset.chainId === NEAR_MAINNET_CHAIN_ID) {
+    return asset.asset.kind === 'native' || asset.asset.namespace === 'nep141'
+  }
+  return asset.asset.chainId === SOLANA_MAINNET_CHAIN_ID && asset.asset.kind === 'native'
+}
 
 export function formatAssetDomainFiat(value: string | number | null, partial = false): string {
   if (value === null) return '—'
@@ -27,6 +37,7 @@ function completeRawParts(totalRaw: string, parts: readonly (string | undefined)
 export function getAssetShieldProvider(asset: PortfolioAssetView): ShieldProvider | null {
   if (asset.asset.chainId.startsWith('eip155:')) return 'near-confidential'
   if (ZCASH_CHAIN_ID_SET.has(asset.asset.chainId)) return 'zcash-shield'
+  if (hasMainnetConfidentialProtocol(asset)) return 'near-confidential'
   return null
 }
 
@@ -53,13 +64,19 @@ export function getAssetDomainRaw(asset: PortfolioAssetView, domain: AssetDomain
     if (domain === 'public') return balance.transparentRaw ?? null
     return balance.shieldedRaw ?? null
   }
-  if (asset.asset.chainId.startsWith('solana:')) {
-    if (domain === 'shield') return '0'
+  if (asset.asset.chainId.startsWith('solana:') || asset.asset.chainId.startsWith('near:')) {
+    if (domain === 'shield') {
+      return hasMainnetConfidentialProtocol(asset) ? (balance.confidentialRaw ?? '0') : '0'
+    }
+    // On-chain public and private are the account split. Shield is a separate protocol balance.
     if (balance.mainRaw !== undefined && balance.privateRaw !== undefined) {
       if (!completeRawParts(balance.totalRaw, [balance.mainRaw, balance.privateRaw])) return null
       return domain === 'public' ? balance.mainRaw : balance.privateRaw
     }
     return domain === 'public' ? balance.totalRaw : '0'
+  }
+  if (domain === 'shield' && hasMainnetConfidentialProtocol(asset)) {
+    return balance.confidentialRaw ?? '0'
   }
   return domain === 'public' ? balance.totalRaw : '0'
 }
@@ -72,7 +89,10 @@ export function selectHomeActionSource(
   if (!model) return null
   const candidates = model.assets.flatMap(asset => {
     const chain = model.chains.find(item => item.chain.id === asset.asset.chainId)
-    if (!chain || (domain === 'private' && !['evm', 'solana'].includes(chain.chain.family))) {
+    if (
+      !chain ||
+      (domain === 'private' && !['evm', 'solana', 'near'].includes(chain.chain.family))
+    ) {
       return []
     }
     if (chain.chain.capabilities.transaction.status !== 'available') return []
@@ -122,8 +142,15 @@ export function projectPortfolioForDomain(
       chain =>
         domain === 'public' ||
         chain.chain.family === 'evm' ||
-        (domain === 'private' && chain.chain.family === 'solana') ||
-        (domain === 'shield' && chain.chain.family === 'zcash')
+        (domain === 'private' &&
+          (chain.chain.family === 'solana' || chain.chain.family === 'near')) ||
+        (domain === 'shield' && chain.chain.family === 'zcash') ||
+        (domain === 'shield' &&
+          (chain.chain.family === 'near' || chain.chain.family === 'solana') &&
+          chain.assets.some(asset => {
+            const raw = getAssetDomainRaw(asset, 'shield')
+            return raw !== null && raw !== '0'
+          }))
     )
     .map(chain =>
       Object.freeze({
@@ -170,7 +197,10 @@ export function buildShieldProviderGroups(
   return (['near-confidential', 'zcash-shield'] as const).flatMap(id => {
     const chains = model.chains.filter(chain =>
       id === 'near-confidential'
-        ? chain.chain.family === 'evm' && chain.chain.network.kind === 'mainnet'
+        ? chain.chain.network.kind === 'mainnet' &&
+          (chain.chain.family === 'evm' ||
+            chain.chain.family === 'near' ||
+            chain.chain.family === 'solana')
         : chain.chain.family === 'zcash'
     )
     if (chains.length === 0) return []

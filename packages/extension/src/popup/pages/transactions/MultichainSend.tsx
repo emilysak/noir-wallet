@@ -1569,6 +1569,7 @@ export function MultichainSend({
               key={`${sendEntryKey}:${selection.asset.asset.id}`}
               selection={selection}
               priceUsd={availableUsdPrice(selection.asset, assetPrices)}
+              executionMode={searchParams.get('mode') === 'private' ? 'private' : 'main'}
               onSubmitted={value => setSubmission({ family: 'near', value })}
             />
           ) : null}

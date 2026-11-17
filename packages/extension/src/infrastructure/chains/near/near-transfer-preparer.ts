@@ -133,6 +133,25 @@ export type PreparedNearTransfer =
   | PreparedNearLendingSupply
 
 const FUNGIBLE_TOKEN_TRANSFER_GAS = 30_000_000_000_000n
+const FUNGIBLE_TOKEN_STORAGE_DEPOSIT_GAS = 30_000_000_000_000n
+const FUNGIBLE_TOKEN_ACCOUNT_STORAGE_BYTES = 125n
+// NEAR mainnet and testnet price one byte of account storage at 10^19 yoctoNEAR.
+const NEAR_STORAGE_AMOUNT_PER_BYTE_YOCTO = 10_000_000_000_000_000_000n
+const FUNGIBLE_TOKEN_STORAGE_DEPOSIT_YOCTO =
+  FUNGIBLE_TOKEN_ACCOUNT_STORAGE_BYTES * NEAR_STORAGE_AMOUNT_PER_BYTE_YOCTO
+
+function isNearImplicitAccountId(accountId: string): boolean {
+  return /^[0-9a-f]{64}$/.test(accountId)
+}
+
+function pricedFungibleTokenStorageDeposit(storageAmountPerByte: bigint): bigint | null {
+  // Standard NEP-141 accounts occupy 125 bytes. Price that minimum only when the
+  // RPC reports the protocol byte cost this wallet can bound. A different byte
+  // cost is not a contract-specific storage_balance_bounds quote, so leave the
+  // recipient unregistered instead of attaching an unbounded deposit.
+  if (storageAmountPerByte !== NEAR_STORAGE_AMOUNT_PER_BYTE_YOCTO) return null
+  return FUNGIBLE_TOKEN_STORAGE_DEPOSIT_YOCTO
+}
 
 function parseUnsigned(value: unknown, maximum: bigint, label: string): bigint {
   if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(value)) {
@@ -328,11 +347,7 @@ export function parsePreparedNearTokenTransfer(value: unknown): PreparedNearToke
     'NEAR storage reserve'
   )
   const totalRequired = parseUnsigned(record.totalRequiredYocto, MAXIMUM_U128, 'NEAR total debit')
-  if (
-    amount === 0n ||
-    estimatedFee > maximumFee ||
-    totalRequired !== maximumFee + storageReserve + 1n
-  ) {
+  if (amount === 0n || estimatedFee > maximumFee) {
     throw new Error('Prepared NEAR token transfer has invalid debit fields')
   }
   const transaction = readRecord(record.transaction, 'Prepared NEAR token transaction')
@@ -347,16 +362,20 @@ export function parsePreparedNearTokenTransfer(value: unknown): PreparedNearToke
     transaction.signerId !== signerId ||
     transaction.receiverId !== contractId ||
     !Array.isArray(transaction.actions) ||
-    transaction.actions.length !== 1
+    transaction.actions.length < 1 ||
+    transaction.actions.length > 2
   ) {
     throw new Error('Prepared NEAR token transaction does not match its approval fields')
   }
   const nonce = parseUnsigned(transaction.nonce, MAXIMUM_U64, 'NEAR transaction nonce')
   if (nonce === 0n) throw new Error('Prepared NEAR transaction nonce must be positive')
   const blockHash = parseNearBase58(transaction.blockHash, 32, 'Prepared NEAR block hash')
-  const action = readRecord(transaction.actions[0], 'Prepared NEAR token transfer action')
+  const transferAction = readRecord(
+    transaction.actions[transaction.actions.length - 1],
+    'Prepared NEAR token transfer action'
+  )
   assertExactKeys(
-    action,
+    transferAction,
     ['type', 'methodName', 'args', 'gas', 'depositYocto'],
     'Prepared NEAR token transfer action'
   )
@@ -364,14 +383,62 @@ export function parsePreparedNearTokenTransfer(value: unknown): PreparedNearToke
     Object.freeze({ receiver_id: recipientId, amount: amount.toString() })
   )
   if (
-    action.type !== 'functionCall' ||
-    action.methodName !== 'ft_transfer' ||
-    action.args !== expectedArgs ||
-    action.gas !== FUNGIBLE_TOKEN_TRANSFER_GAS.toString() ||
-    action.depositYocto !== '1'
+    transferAction.type !== 'functionCall' ||
+    transferAction.methodName !== 'ft_transfer' ||
+    transferAction.args !== expectedArgs ||
+    transferAction.gas !== FUNGIBLE_TOKEN_TRANSFER_GAS.toString() ||
+    transferAction.depositYocto !== '1'
   ) {
     throw new Error('Prepared NEAR token transfer action does not match its intent')
   }
+  const parsedActions: NearTransferAction[] = []
+  let storageDeposit = 0n
+  if (transaction.actions.length === 2) {
+    const storageAction = readRecord(transaction.actions[0], 'Prepared NEAR storage deposit action')
+    assertExactKeys(
+      storageAction,
+      ['type', 'methodName', 'args', 'gas', 'depositYocto'],
+      'Prepared NEAR storage deposit action'
+    )
+    const expectedStorageArgs = encodeNearFunctionArgs(
+      Object.freeze({ account_id: recipientId, registration_only: true })
+    )
+    storageDeposit = parseUnsigned(
+      storageAction.depositYocto,
+      MAXIMUM_U128,
+      'NEAR token storage deposit'
+    )
+    if (
+      storageAction.type !== 'functionCall' ||
+      storageAction.methodName !== 'storage_deposit' ||
+      storageAction.args !== expectedStorageArgs ||
+      storageAction.gas !== FUNGIBLE_TOKEN_STORAGE_DEPOSIT_GAS.toString() ||
+      storageDeposit !== FUNGIBLE_TOKEN_STORAGE_DEPOSIT_YOCTO
+    ) {
+      throw new Error('Prepared NEAR token storage deposit does not match its recipient')
+    }
+    parsedActions.push(
+      Object.freeze({
+        type: 'functionCall' as const,
+        methodName: 'storage_deposit' as const,
+        args: expectedStorageArgs,
+        gas: FUNGIBLE_TOKEN_STORAGE_DEPOSIT_GAS.toString(),
+        depositYocto: storageDeposit.toString()
+      })
+    )
+  }
+  if (totalRequired !== maximumFee + storageReserve + 1n + storageDeposit) {
+    throw new Error('Prepared NEAR token transfer has invalid debit fields')
+  }
+  parsedActions.push(
+    Object.freeze({
+      type: 'functionCall' as const,
+      methodName: 'ft_transfer' as const,
+      args: expectedArgs,
+      gas: FUNGIBLE_TOKEN_TRANSFER_GAS.toString(),
+      depositYocto: '1' as const
+    })
+  )
   return Object.freeze({
     kind: 'token',
     chainId: chain.id,
@@ -393,15 +460,7 @@ export function parsePreparedNearTokenTransfer(value: unknown): PreparedNearToke
       receiverId: contractId,
       nonce: nonce.toString(),
       blockHash,
-      actions: Object.freeze([
-        Object.freeze({
-          type: 'functionCall' as const,
-          methodName: 'ft_transfer' as const,
-          args: expectedArgs,
-          gas: FUNGIBLE_TOKEN_TRANSFER_GAS.toString(),
-          depositYocto: '1' as const
-        })
-      ]) as NearTransferTransaction['actions']
+      actions: Object.freeze(parsedActions) as NearTransferTransaction['actions']
     })
   })
 }
@@ -461,7 +520,8 @@ export async function prepareNearNativeTransfer(
   if (sender === null) {
     throw new NearTransferError('sender-not-found', 'NEAR sender account was not found')
   }
-  if (receiver === null) {
+  // A 64-hex implicit account is created by this transfer. A missing named account cannot be.
+  if (receiver === null && !isNearImplicitAccountId(receiverId)) {
     throw new NearTransferError(
       'recipient-not-found',
       'NEAR recipient account must exist before this transfer can be prepared'
@@ -584,7 +644,15 @@ export async function prepareNearTokenTransfer(
       'NEAR token transfers require a full-access key'
     )
   }
-  if (!recipientRegistered) {
+  const storageAmountPerByte = parseUnsigned(
+    costs.storageAmountPerByteRaw,
+    MAXIMUM_U128,
+    'NEAR storage amount per byte'
+  )
+  const storageDeposit = recipientRegistered
+    ? null
+    : pricedFungibleTokenStorageDeposit(storageAmountPerByte)
+  if (!recipientRegistered && storageDeposit === null) {
     throw new NearTransferError(
       'recipient-token-account-not-registered',
       'The NEAR recipient is not registered with this token contract'
@@ -601,28 +669,55 @@ export async function prepareNearTokenTransfer(
     MAXIMUM_U128,
     'NEAR minimum gas purchase price'
   )
-  const estimatedFee = checkedU128(FUNGIBLE_TOKEN_TRANSFER_GAS * gasPrice, 'NEAR estimated fee')
+  const prepaidGas =
+    FUNGIBLE_TOKEN_TRANSFER_GAS +
+    (storageDeposit === null ? 0n : FUNGIBLE_TOKEN_STORAGE_DEPOSIT_GAS)
+  const estimatedFee = checkedU128(prepaidGas * gasPrice, 'NEAR estimated fee')
   const maximumFee = checkedU128(
-    FUNGIBLE_TOKEN_TRANSFER_GAS *
-      (gasPrice > minimumPurchasePrice ? gasPrice : minimumPurchasePrice),
+    prepaidGas * (gasPrice > minimumPurchasePrice ? gasPrice : minimumPurchasePrice),
     'NEAR maximum fee'
-  )
-  const storageAmountPerByte = parseUnsigned(
-    costs.storageAmountPerByteRaw,
-    MAXIMUM_U128,
-    'NEAR storage amount per byte'
   )
   const storageReserve = checkedU128(
     BigInt(sender.storageUsage) * storageAmountPerByte,
     'NEAR storage reserve'
   )
-  const totalRequired = checkedU128(maximumFee + storageReserve + 1n, 'NEAR total debit')
+  const attachedDeposit = 1n + (storageDeposit ?? 0n)
+  const totalRequired = checkedU128(
+    maximumFee + storageReserve + attachedDeposit,
+    'NEAR total debit'
+  )
   if (totalRequired > parseUnsigned(sender.amountRaw, MAXIMUM_U128, 'NEAR sender balance')) {
     throw new NearTransferError(
       'insufficient-funds',
-      'NEAR balance cannot cover the token transfer fee and storage reserve'
+      storageDeposit === null
+        ? 'NEAR balance cannot cover the token transfer fee and storage reserve'
+        : 'NEAR balance cannot cover the token transfer fee, storage reserve, and recipient storage deposit'
     )
   }
+  const transferAction = Object.freeze({
+    type: 'functionCall' as const,
+    methodName: 'ft_transfer' as const,
+    args: encodeNearFunctionArgs(
+      Object.freeze({ receiver_id: recipientId, amount: amount.toString() })
+    ),
+    gas: FUNGIBLE_TOKEN_TRANSFER_GAS.toString(),
+    depositYocto: '1' as const
+  })
+  const actions =
+    storageDeposit === null
+      ? [transferAction]
+      : [
+          Object.freeze({
+            type: 'functionCall' as const,
+            methodName: 'storage_deposit' as const,
+            args: encodeNearFunctionArgs(
+              Object.freeze({ account_id: recipientId, registration_only: true })
+            ),
+            gas: FUNGIBLE_TOKEN_STORAGE_DEPOSIT_GAS.toString(),
+            depositYocto: storageDeposit.toString()
+          }),
+          transferAction
+        ]
   const transaction: NearTransferTransaction = Object.freeze({
     chainId: chainId.id,
     accountIndex,
@@ -630,17 +725,7 @@ export async function prepareNearTokenTransfer(
     receiverId: contractId,
     nonce: (nonce + 1n).toString(),
     blockHash: accessKey.blockHash,
-    actions: Object.freeze([
-      Object.freeze({
-        type: 'functionCall' as const,
-        methodName: 'ft_transfer' as const,
-        args: encodeNearFunctionArgs(
-          Object.freeze({ receiver_id: recipientId, amount: amount.toString() })
-        ),
-        gas: FUNGIBLE_TOKEN_TRANSFER_GAS.toString(),
-        depositYocto: '1' as const
-      })
-    ]) as NearTransferTransaction['actions']
+    actions: Object.freeze(actions) as NearTransferTransaction['actions']
   })
   return Object.freeze({
     kind: 'token',
@@ -729,13 +814,27 @@ export async function assertNearTransferSigningMatchesPrepared(
     if (!matches) throw new Error('NEAR signing summary does not match the prepared transfer')
   }
   if ('kind' in prepared && prepared.kind === 'token') {
-    const preparedAction = prepared.transaction.actions[0]
+    const transferAction = prepared.transaction.actions.at(-1)
+    const storageAction =
+      prepared.transaction.actions.length === 2 ? prepared.transaction.actions[0] : undefined
+    const storageDepositMatches =
+      storageAction === undefined ||
+      (storageAction.type === 'functionCall' &&
+        storageAction.methodName === 'storage_deposit' &&
+        storageAction.gas === FUNGIBLE_TOKEN_STORAGE_DEPOSIT_GAS.toString() &&
+        storageAction.depositYocto === FUNGIBLE_TOKEN_STORAGE_DEPOSIT_YOCTO.toString() &&
+        storageAction.args ===
+          encodeNearFunctionArgs(
+            Object.freeze({ account_id: prepared.recipientId, registration_only: true })
+          ))
     if (
       fields.receiverId !== prepared.contractId ||
-      preparedAction.type !== 'functionCall' ||
-      preparedAction.methodName !== 'ft_transfer' ||
-      preparedAction.gas !== FUNGIBLE_TOKEN_TRANSFER_GAS.toString() ||
-      preparedAction.depositYocto !== '1'
+      prepared.transaction.actions.length > 2 ||
+      transferAction?.type !== 'functionCall' ||
+      transferAction.methodName !== 'ft_transfer' ||
+      transferAction.gas !== FUNGIBLE_TOKEN_TRANSFER_GAS.toString() ||
+      transferAction.depositYocto !== '1' ||
+      !storageDepositMatches
     ) {
       throw new Error('NEAR signing summary does not match the prepared token transfer')
     }

@@ -190,6 +190,7 @@ import {
 import { getSafeRheaSwapRuntimeErrorMessage } from '@/core/services/rhea-swap/rhea-swap-error'
 import {
   assertPrivateQuoteRoute,
+  assertReviewedPrivateQuoteSender,
   parseRheaSwapQuoteRequest,
   type PrivateQuotePurpose
 } from '@/core/services/rhea-swap/rhea-swap-model'
@@ -354,6 +355,7 @@ import {
 
 import { ChromeSessionSolanaPendingTransferStore } from '@/infrastructure/chains/solana'
 import { ChromeSessionNearPendingTransferStore } from '@/infrastructure/chains/near'
+import { inspectUserNearAsset } from '@/infrastructure/chains/near/near-custom-token-inspect'
 
 import { validateVotingDecisions } from '@/lib/voting'
 
@@ -3600,6 +3602,20 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
     return true
   }
 
+  if (message.type === 'INSPECT_USER_NEAR_ASSET') {
+    void inspectUserNearAsset(message.chainId, message.contractId)
+      .then(result => sendResponse({ result }))
+      .catch(error =>
+        sendResponse({
+          error:
+            error instanceof Error && error.message.length <= 256
+              ? error.message
+              : 'Token contract could not be verified'
+        })
+      )
+    return true
+  }
+
   if (message.type === 'ADD_USER_EVM_ASSET') {
     if (!userEvmAssetCoordinator) {
       sendResponse({ error: 'User EVM Tokens are unavailable' })
@@ -4104,9 +4120,11 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
                 })
               }
               if (!purpose) throw new Error('Swap quote requires a reviewed route.')
-              if (!privateSender || !purpose) {
-                throw new Error('Private quote needs a reviewed route.')
-              }
+              assertReviewedPrivateQuoteSender({
+                purpose,
+                fromChain: request.fromChain,
+                privateSender: privateSender === true
+              })
               assertPrivateQuoteRoute(request, account ?? null, purpose)
               return rheaSwapService.quote(request, undefined, {
                 walletId: account!.walletId,
@@ -4433,6 +4451,7 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
     void operation
       .then(result => sendResponse({ result }))
       .catch(error => {
+        console.log('confidential funding error: %o', error)
         console.error('[Confidential Funding] Request failed', {
           operation: message.type,
           errorName: error instanceof Error ? error.name : 'UnknownError',

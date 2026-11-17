@@ -874,7 +874,7 @@ export function createBackgroundActivityCoordinator(
             solana.accountIndex
           )
           const main = parseSolanaPublicKey(solana.chainAccount.identity.value)
-          if (derived.address !== main) addresses.push(derived.address.toLowerCase())
+          if (derived.address !== main) addresses.push(derived.address)
         } catch (error) {
           logger.warn(
             `Activity Solana Private address derivation failed: ${formatLogError(error)}`,

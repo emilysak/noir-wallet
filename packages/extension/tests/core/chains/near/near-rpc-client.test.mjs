@@ -6,6 +6,7 @@ import {
   createNearRpcClient,
   NearRpcError
 } from '../../../../src/infrastructure/chains/near/near-rpc-client.ts'
+import { parseNearFungibleTokenMetadata } from '../../../../src/infrastructure/chains/near/near-ft-metadata.ts'
 
 const blockHash = '11111111111111111111111111111111'
 const publicKey = `ed25519:${'1'.repeat(32)}`
@@ -397,6 +398,16 @@ test.describe('NEAR JSON-RPC client', () => {
     await expect(
       confirming.client.getTransactionStatus(blockHash, 'alice.testnet')
     ).resolves.toEqual({ status: 'confirming' })
+    const executed = harness(body =>
+      jsonResult(body, {
+        final_execution_status: 'EXECUTED',
+        transaction: { hash: blockHash },
+        status: { SuccessValue: '' }
+      })
+    )
+    await expect(executed.client.getTransactionStatus(blockHash, 'alice.testnet')).resolves.toEqual(
+      { status: 'executed' }
+    )
     expect(confirming.calls[0].body).toEqual({
       jsonrpc: '2.0',
       id: 1,
@@ -442,6 +453,44 @@ test.describe('NEAR JSON-RPC client', () => {
     await expect(unknown.client.getTransactionStatus(blockHash, 'alice.testnet')).resolves.toEqual({
       status: 'unknown'
     })
+
+    const rejected = harness(
+      body =>
+        new Response(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: body.id,
+            error: {
+              code: -32000,
+              message: 'Server error',
+              data: { TxExecutionError: { InvalidTxError: { InvalidNonce: { tx_nonce: 1 } } } }
+            }
+          })
+        )
+    )
+    await expect(rejected.client.getGasPrice()).rejects.toEqual(
+      new NearRpcError('rpc-error', 'NEAR RPC request failed: InvalidNonce')
+    )
+
+    const timedOut = harness(
+      body =>
+        new Response(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: body.id,
+            error: {
+              name: 'HANDLER_ERROR',
+              cause: { name: 'TIMEOUT_ERROR' },
+              code: -32000,
+              message: 'Server error',
+              data: 'Timeout'
+            }
+          })
+        )
+    )
+    await expect(timedOut.client.getGasPrice()).rejects.toEqual(
+      new NearRpcError('rpc-error', 'NEAR RPC request failed: Timeout')
+    )
 
     const malformed = harness(body =>
       jsonResult(body, {
@@ -521,5 +570,76 @@ test.describe('NEAR JSON-RPC client', () => {
     await expect(malformed.client.getGasPrice()).rejects.toEqual(
       new NearRpcError('invalid-response', 'Invalid NEAR RPC error response')
     )
+  })
+
+  test('reads NEP-141 ft_metadata for named and implicit contracts', async () => {
+    const implicit = '3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af'
+    const metadata = {
+      spec: 'ft-1.0.0',
+      name: 'Implicit Fungible',
+      symbol: 'IFT',
+      decimals: 18,
+      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'
+    }
+    const state = harness(body =>
+      jsonResult(body, {
+        block_hash: blockHash,
+        block_height: 100,
+        logs: [],
+        result: [...Buffer.from(JSON.stringify(metadata))]
+      })
+    )
+
+    await expect(state.client.getFungibleTokenMetadata(implicit)).resolves.toEqual({
+      contractId: implicit,
+      name: 'Implicit Fungible',
+      symbol: 'IFT',
+      decimals: 18
+    })
+    expect(state.calls[0].body.params).toEqual({
+      request_type: 'call_function',
+      finality: 'final',
+      account_id: implicit,
+      method_name: 'ft_metadata',
+      args_base64: Buffer.from('{}').toString('base64')
+    })
+
+    const named = parseNearFungibleTokenMetadata(
+      {
+        block_hash: blockHash,
+        block_height: 8,
+        logs: [],
+        result: [
+          ...Buffer.from(
+            JSON.stringify({
+              spec: 'ft-1.0.0',
+              name: 'Wrap NEAR',
+              symbol: 'wNEAR',
+              decimals: 24,
+              icon: null,
+              reference: null
+            })
+          )
+        ]
+      },
+      'wrap.testnet'
+    )
+    expect(named).toEqual({
+      contractId: 'wrap.testnet',
+      name: 'Wrap NEAR',
+      symbol: 'wNEAR',
+      decimals: 24
+    })
+    expect(() =>
+      parseNearFungibleTokenMetadata(
+        {
+          block_hash: blockHash,
+          block_height: 8,
+          logs: [],
+          result: [...Buffer.from(JSON.stringify({ name: 'Missing', symbol: 'MISS' }))]
+        },
+        implicit
+      )
+    ).toThrow(NearRpcError)
   })
 })
