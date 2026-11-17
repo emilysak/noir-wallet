@@ -292,6 +292,32 @@ test.describe('Activity read model', () => {
     expect(parseActivityReadModel(structuredClone(model))).toEqual(model)
   })
 
+  test('accepts a Solana private-execution address without classifying EVM activity as private', () => {
+    const solanaAddress = '11111111111111111111111111111111'
+    const model = buildActivityReadModel({
+      scope,
+      localGraphs: [graph({ id: 'transaction:main-with-solana-pea' })],
+      privateExecutionAddresses: [solanaAddress]
+    })
+
+    expect(model.items).toHaveLength(1)
+    expect(model.items[0].accountMode).toBeUndefined()
+    expect(() =>
+      buildActivityReadModel({
+        scope,
+        localGraphs: [],
+        privateExecutionAddresses: ['not-an-address']
+      })
+    ).toThrow(/Private Execution Address/)
+    const skipped = buildActivityReadModel({
+      scope,
+      localGraphs: [graph({ id: 'transaction:kept' })],
+      privateExecutionAddresses: ['not-an-address'],
+      skipInvalidItems: true
+    })
+    expect(skipped.items.map(item => item.id)).toEqual(['transaction:kept'])
+  })
+
   test('attributes wallet-originated activity to its signer and incoming activity to its recipient', () => {
     const mainToPrivate = graph({ id: 'transaction:main-to-private' })
     mainToPrivate.root.intent.sender = {

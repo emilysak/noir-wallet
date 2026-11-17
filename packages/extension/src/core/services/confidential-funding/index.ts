@@ -7,6 +7,7 @@ export {
   assertConfidentialQuoteBinding,
   assertFlexibleExternalDepositQuoteBinding,
   canRetryConfidentialSubmission,
+  confidentialNep413Recipient,
   fingerprintConfidentialValue,
   fingerprintDirectConfidentialApproval,
   getConfidentialFundingProgress,
@@ -17,6 +18,7 @@ export {
   type ConfidentialBatchSettlement,
   type ConfidentialChildSettlement,
   type ConfidentialFundingPhase,
+  type ConfidentialIntentBinding,
   type ConfidentialFundingPlan,
   type ConfidentialFundingPreview,
   type ConfidentialFundingProgress,
@@ -44,7 +46,13 @@ export {
   filterConfidentialPortfolioMappings,
   getConfidentialAvailableForAsset,
   mergeConfidentialBalancesIntoPortfolio,
+  mergeConfidentialSignerBalances,
   projectConfidentialOnlyEvmAssets,
   type ConfidentialPortfolioAssetMapping,
   type ConfidentialPortfolioBalance
 } from './confidential-funding-portfolio'
+export {
+  NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS,
+  addConfidentialWalletChainMappings,
+  type ConfidentialFundingAssetLookup
+} from './native-confidential-protocol-assets'

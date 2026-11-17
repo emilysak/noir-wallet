@@ -65,6 +65,21 @@ test.describe('Error classification', () => {
     expect(isWalletLockedError(new Error('Wallet is syncing. Please wait.'))).toBe(false)
   })
 
+  test('maps NEAR fee and storage shortfalls to a NEAR balance error', () => {
+    const messages = [
+      'NEAR balance cannot cover the token transfer fee and storage reserve',
+      'NEAR balance cannot cover the token transfer fee, storage reserve, and recipient storage deposit',
+      'NEAR balance cannot cover the transfer, maximum fee, and storage reserve'
+    ]
+    for (const message of messages) {
+      expect(classifyError(new Error(message))).toEqual({
+        userMessage: 'The NEAR balance cannot cover the network fee and storage deposit.',
+        technicalMessage: message,
+        retryable: false
+      })
+    }
+  })
+
   test('maps the Zcash InsufficientFunds payload to an actionable balance error', () => {
     expect(
       classifyError(

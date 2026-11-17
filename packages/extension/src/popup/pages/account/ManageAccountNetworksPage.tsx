@@ -53,8 +53,7 @@ export function ManageAccountNetworksPage() {
   const guideMode =
     params.get('guide') === 'v1' && isRetainedV1UpgradeAccount(wallet, account, currentNetwork)
   const available = useMemo<readonly AccountNetworkFamily[]>(
-    () =>
-      availableSoftwareAccountFamilies().filter(family => family === 'zcash' || family === 'evm'),
+    () => availableSoftwareAccountFamilies(),
     []
   )
   const chains = useMemo(

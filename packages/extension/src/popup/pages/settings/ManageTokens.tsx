@@ -9,7 +9,10 @@ import {
   findManagedIntentsAssetByReference,
   type IntentsManagedAsset
 } from '@/core/services/intents-managed-assets'
+import { nearCustomTokenAssetId } from '@/infrastructure/chains/near/near-custom-tokens'
+import type { NearCustomTokenRecord } from '@/infrastructure/chains/near/near-custom-tokens'
 import { useSettingsStore } from '@/store/settings-store'
+import { useWalletStore } from '@/store/wallet-store'
 import { toast } from '@/store/toast-store'
 import { ChainIcon } from '../../components/common/ChainIcon'
 import { ChainSelector, type ChainSelectorOption } from '../../components/common/ChainSelector'
@@ -28,6 +31,7 @@ import {
 } from '../../components/ui/dialog'
 import { Input } from '../../components/ui/input'
 import { userEvmAssetsClient } from '../../services/user-evm-assets-client'
+import { nearCustomTokenClient } from '../../services/near-custom-token-client'
 import { swapTokenCatalogClient } from '../../services/swap-token-catalog-client'
 import {
   intentsAssetManagerClient,
@@ -47,8 +51,25 @@ import {
 } from '@/popup/services/add-token-model'
 import { isSelectableChainFamily } from '@/popup/services/chain-selection-availability'
 
+type TokenRemoval =
+  | { readonly kind: 'evm'; readonly asset: UserEvmAssetRecord }
+  | { readonly kind: 'near'; readonly asset: NearCustomTokenRecord }
+
+function nearTokenAssetId(token: NearCustomTokenRecord): string {
+  return nearCustomTokenAssetId(token.chainId, token.contractId)
+}
+
+function withNearHiddenIds(
+  evmIds: readonly string[],
+  tokens: readonly NearCustomTokenRecord[]
+): Set<string> {
+  return new Set([...evmIds, ...tokens.filter(token => token.hidden).map(nearTokenAssetId)])
+}
+
 export function ManageTokens() {
   const settings = useSettingsStore(state => state.chainEndpointSettings)
+  const walletId = useWalletStore(state => state.currentWalletId)
+  const accountId = useWalletStore(state => state.currentAccountId)
   const networks = useMemo(() => resolveEvmNetworkCatalog(DEFAULT_NETWORK, settings), [settings])
   const networkByChainId = useMemo(
     () =>
@@ -70,6 +91,7 @@ export function ManageTokens() {
     [networks]
   )
   const [assets, setAssets] = useState<readonly UserEvmAssetRecord[]>([])
+  const [nearTokens, setNearTokens] = useState<readonly NearCustomTokenRecord[]>([])
   const [detectedAssets, setDetectedAssets] = useState<readonly DetectedEvmAssetRecord[]>([])
   const [catalogAssets, setCatalogAssets] = useState<readonly IntentsManagedAsset[]>([])
   const [hiddenAssetIds, setHiddenAssetIds] = useState<ReadonlySet<string>>(() => new Set())
@@ -85,7 +107,7 @@ export function ManageTokens() {
   const [candidate, setCandidate] = useState<AddTokenCandidate | null>(null)
   const [inspecting, setInspecting] = useState(false)
   const [adding, setAdding] = useState(false)
-  const [removing, setRemoving] = useState<UserEvmAssetRecord | null>(null)
+  const [removing, setRemoving] = useState<TokenRemoval | null>(null)
   const [removeInProgress, setRemoveInProgress] = useState(false)
   const [visibilityInProgress, setVisibilityInProgress] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
@@ -94,6 +116,7 @@ export function ManageTokens() {
     network => network.chainId === chainId && !network.disabled
   )
   const isEvmNetwork = selectedNetwork?.family === 'evm'
+  const isNearNetwork = selectedNetwork?.family === 'near'
   const referencePresentation = getAddTokenReferencePresentation(selectedNetwork)
   const verifiedToken = getVerifiedTokenPresentation(candidate)
   const addTokenNetworkOptions: readonly ChainSelectorOption[] = addTokenNetworks.map(network => ({
@@ -115,17 +138,35 @@ export function ManageTokens() {
       }),
     [assets, catalogAssets, detectedAssets, networks, protocolAssetIds]
   )
-  const availableManagedAssets = useMemo(
+  const nearRows = useMemo(
     () =>
-      managedAssets.filter(asset =>
-        isSelectableChainFamily(
-          chainByChainId.get(asset.chainId)?.family ??
-            (networkByChainId.has(asset.chainId) ? 'evm' : ''),
-          __ENABLED_CHAIN_FEATURE_FLAGS__
-        )
-      ),
-    [chainByChainId, managedAssets, networkByChainId]
+      nearTokens.map(token => ({
+        assetId: nearTokenAssetId(token),
+        chainId: token.chainId,
+        reference: token.contractId,
+        blockchain: 'near',
+        metadata: {
+          name: token.name,
+          symbol: token.symbol,
+          decimals: token.decimals
+        },
+        source: 'custom' as const,
+        registered: true
+      })),
+    [nearTokens]
   )
+  const availableManagedAssets = useMemo(() => {
+    const rows = managedAssets.filter(asset =>
+      isSelectableChainFamily(
+        chainByChainId.get(asset.chainId)?.family ??
+          (networkByChainId.has(asset.chainId) ? 'evm' : ''),
+        __ENABLED_CHAIN_FEATURE_FLAGS__
+      )
+    )
+    if (!isSelectableChainFamily('near', __ENABLED_CHAIN_FEATURE_FLAGS__)) return rows
+    const known = new Set(rows.map(asset => asset.assetId))
+    return [...rows, ...nearRows.filter(row => !known.has(row.assetId))]
+  }, [chainByChainId, managedAssets, nearRows, networkByChainId])
 
   const networkFilterOptions = useMemo(() => {
     const chainIds = new Set(availableManagedAssets.map(asset => asset.chainId))
@@ -156,13 +197,17 @@ export function ManageTokens() {
     setLoading(true)
     setLoadError(false)
     try {
-      const [result, cachedTokens] = await Promise.all([
+      const [result, cachedTokens, savedNearTokens] = await Promise.all([
         userEvmAssetsClient.listManaged(),
-        swapTokenCatalogClient.readCached()
+        swapTokenCatalogClient.readCached(),
+        walletId && accountId
+          ? nearCustomTokenClient.list({ walletId, accountId })
+          : Promise.resolve([])
       ])
       setAssets(result.userAssets)
+      setNearTokens(savedNearTokens)
       setDetectedAssets(result.detectedAssets)
-      setHiddenAssetIds(new Set(result.hiddenAssetIds))
+      setHiddenAssetIds(withNearHiddenIds(result.hiddenAssetIds, savedNearTokens))
       setProtocolAssetIds(new Set(result.protocolAssetIds))
       setCatalogAssets(resolveManagedIntentsCatalog(cachedTokens))
     } catch {
@@ -170,7 +215,7 @@ export function ManageTokens() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [accountId, walletId])
 
   useEffect(() => {
     void load()
@@ -185,9 +230,13 @@ export function ManageTokens() {
         setCatalogAssets(resolveManagedIntentsCatalog(tokens))
         if (!cancelled) {
           const result = await userEvmAssetsClient.listManaged()
+          const savedNearTokens =
+            walletId && accountId ? await nearCustomTokenClient.list({ walletId, accountId }) : []
+          if (cancelled) return
           setAssets(result.userAssets)
+          setNearTokens(savedNearTokens)
           setDetectedAssets(result.detectedAssets)
-          setHiddenAssetIds(new Set(result.hiddenAssetIds))
+          setHiddenAssetIds(withNearHiddenIds(result.hiddenAssetIds, savedNearTokens))
           setProtocolAssetIds(new Set(result.protocolAssetIds))
         }
       })
@@ -195,7 +244,7 @@ export function ManageTokens() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [accountId, walletId])
 
   const resetAddForm = () => {
     setContractAddress('')
@@ -237,6 +286,14 @@ export function ManageTokens() {
             contractAddress: contractAddress.trim()
           })
         })
+      } else if (isNearNetwork) {
+        setCandidate({
+          kind: 'near',
+          asset: await nearCustomTokenClient.inspect({
+            chainId,
+            contractId: contractAddress.trim()
+          })
+        })
       } else {
         let currentCatalog = catalogAssets
         let asset = findManagedIntentsAssetByReference(currentCatalog, chainId, contractAddress)
@@ -268,6 +325,24 @@ export function ManageTokens() {
       if (candidate.kind === 'evm') {
         const added = await userEvmAssetsClient.add(candidate.asset)
         setAssets(previous => Object.freeze([...previous, added]))
+      } else if (candidate.kind === 'near') {
+        if (!walletId || !accountId) {
+          throw new Error('Select an account before adding a Token.')
+        }
+        const added = await nearCustomTokenClient.add({
+          walletId,
+          accountId,
+          token: candidate.asset
+        })
+        const assetId = nearTokenAssetId(added)
+        setNearTokens(previous =>
+          Object.freeze([...previous.filter(token => nearTokenAssetId(token) !== assetId), added])
+        )
+        setHiddenAssetIds(current => {
+          const next = new Set(current)
+          next.delete(assetId)
+          return next
+        })
       } else {
         await intentsAssetManagerClient.setVisible(candidate.asset, true)
         setProtocolAssetIds(current => new Set(current).add(candidate.asset.assetId))
@@ -292,9 +367,30 @@ export function ManageTokens() {
 
   const remove = async () => {
     if (!removing || removeInProgress) return
-    const asset = removing
     setRemoveInProgress(true)
     try {
+      if (removing.kind === 'near') {
+        if (!walletId || !accountId) {
+          throw new Error('Select an account before removing a Token.')
+        }
+        const assetId = nearTokenAssetId(removing.asset)
+        await nearCustomTokenClient.remove({
+          walletId,
+          accountId,
+          chainId: removing.asset.chainId,
+          contractId: removing.asset.contractId
+        })
+        setNearTokens(previous => previous.filter(token => nearTokenAssetId(token) !== assetId))
+        setHiddenAssetIds(current => {
+          const next = new Set(current)
+          next.delete(assetId)
+          return next
+        })
+        setRemoving(null)
+        toast.success('Token Removed', `${removing.asset.symbol} was removed from your wallet.`)
+        return
+      }
+      const asset = removing.asset
       await userEvmAssetsClient.remove(asset.assetId)
       setAssets(previous => previous.filter(item => item.assetId !== asset.assetId))
       setRemoving(null)
@@ -332,6 +428,35 @@ export function ManageTokens() {
 
   const setVisible = async (asset: ManagedTokenRow, visible: boolean) => {
     if (visibilityInProgress) return
+    if (asset.source === 'custom' && asset.chainId.startsWith('near:')) {
+      if (!walletId || !accountId) return
+      setVisibilityInProgress(asset.assetId)
+      try {
+        const updated = await nearCustomTokenClient.setHidden({
+          walletId,
+          accountId,
+          contractId: asset.reference,
+          hidden: !visible
+        })
+        setNearTokens(previous =>
+          previous.map(token => (nearTokenAssetId(token) === asset.assetId ? updated : token))
+        )
+        setHiddenAssetIds(current => {
+          const next = new Set(current)
+          if (updated.hidden) next.add(asset.assetId)
+          else next.delete(asset.assetId)
+          return next
+        })
+      } catch (error) {
+        toast.error(
+          'Token Visibility Could Not Be Changed',
+          error instanceof Error ? error.message : 'Try again.'
+        )
+      } finally {
+        setVisibilityInProgress(null)
+      }
+      return
+    }
     if (asset.catalogAsset && (asset.catalogAsset.management === 'protocol' || !asset.registered)) {
       setVisibilityInProgress(asset.assetId)
       try {
@@ -476,7 +601,25 @@ export function ManageTokens() {
                     <button
                       type="button"
                       aria-label={`Remove ${asset.metadata.symbol}`}
-                      onClick={() => setRemoving(asset.removableAsset ?? null)}
+                      onClick={() => {
+                        if (!asset.removableAsset) return
+                        setRemoving({ kind: 'evm', asset: asset.removableAsset })
+                      }}
+                      className="flex size-8 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-destructive/10 hover:text-destructive"
+                    >
+                      <Icon icon="lucide:trash-2" className="size-4" />
+                    </button>
+                  )}
+                  {asset.source === 'custom' && asset.chainId.startsWith('near:') && (
+                    <button
+                      type="button"
+                      aria-label={`Remove ${asset.metadata.symbol}`}
+                      onClick={() => {
+                        const token = nearTokens.find(
+                          item => nearTokenAssetId(item) === asset.assetId
+                        )
+                        if (token) setRemoving({ kind: 'near', asset: token })
+                      }}
                       className="flex size-8 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-destructive/10 hover:text-destructive"
                     >
                       <Icon icon="lucide:trash-2" className="size-4" />
@@ -613,7 +756,15 @@ export function ManageTokens() {
       >
         <DialogContent position="bottom">
           <DialogHeader>
-            <DialogTitle>Remove {removing?.metadata.symbol}?</DialogTitle>
+            <DialogTitle>
+              Remove{' '}
+              {removing?.kind === 'evm'
+                ? removing.asset.metadata.symbol
+                : removing?.kind === 'near'
+                  ? removing.asset.symbol
+                  : ''}
+              ?
+            </DialogTitle>
             <DialogDescription>
               This only hides the Token from Noir Wallet. It does not move or delete your balance.
             </DialogDescription>

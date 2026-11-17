@@ -540,6 +540,42 @@ export function parseActivityReadModel(value: unknown): ActivityReadModel {
   })
 }
 
+const EVM_PRIVATE_EXECUTION_ADDRESS = /^0x[0-9a-fA-F]{40}$/
+// Solana private-execution addresses are base58. Classification lowercases them only
+// after this check, so the accepted form stays the canonical public key.
+const SOLANA_PRIVATE_EXECUTION_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/
+
+function isPrivateExecutionAddress(address: string): boolean {
+  return (
+    EVM_PRIVATE_EXECUTION_ADDRESS.test(address) || SOLANA_PRIVATE_EXECUTION_ADDRESS.test(address)
+  )
+}
+
+function activityItemChainLabel(item: ActivityItem): string {
+  const target = item.segments.find(segment => segment.target.kind === 'onchain')?.target
+  const chainId = target?.kind === 'onchain' ? target.chainId : undefined
+  return chainId ? `${item.source} ${chainId}` : item.source
+}
+
+function retainActivityItem(
+  item: ActivityItem,
+  scope: ActivityScope,
+  skipInvalidItems: boolean
+): ActivityItem | null {
+  try {
+    assertItem(item, scope)
+    return item
+  } catch (error) {
+    if (!skipInvalidItems) throw error
+    console.warn(
+      '[Activity] Skipping invalid item:',
+      activityItemChainLabel(item),
+      error instanceof Error ? error.message : 'UnknownError'
+    )
+    return null
+  }
+}
+
 export function buildActivityReadModel(input: {
   readonly scope: ActivityScope
   readonly localGraphs: readonly TransactionGraph[]
@@ -547,6 +583,7 @@ export function buildActivityReadModel(input: {
   readonly privateExecutionAddresses?: readonly string[]
   readonly limit?: number
   readonly hasMore?: boolean
+  readonly skipInvalidItems?: boolean
 }): ActivityReadModel {
   const scope = parseScope(input.scope)
   const supplementalItems = input.supplementalItems ?? []
@@ -562,15 +599,21 @@ export function buildActivityReadModel(input: {
   }
 
   const privateAddressValues = input.privateExecutionAddresses ?? []
-  if (
-    privateAddressValues.length > 32 ||
-    privateAddressValues.some(address => !/^0x[0-9a-fA-F]{40}$/.test(address))
-  ) {
+  if (privateAddressValues.length > 32) {
     throw new Error('Invalid Activity Private Execution Address set')
   }
+  const acceptedPrivateAddresses = privateAddressValues.filter(address => {
+    if (isPrivateExecutionAddress(address)) return true
+    if (!input.skipInvalidItems) {
+      throw new Error('Invalid Activity Private Execution Address set')
+    }
+    console.warn('[Activity] Skipping unrecognized Private execution address')
+    return false
+  })
   const privateExecutionAddresses = new Set(
-    privateAddressValues.map(address => address.toLowerCase())
+    acceptedPrivateAddresses.map(address => address.toLowerCase())
   )
+  const skipInvalidItems = input.skipInvalidItems === true
   const confirmedSpeedUps = new Map<string, TransactionGraph[]>()
   for (const graph of input.localGraphs) {
     const relation = graph.root.relation
@@ -579,41 +622,54 @@ export function buildActivityReadModel(input: {
     linked.push(graph)
     confirmedSpeedUps.set(relation.transactionId, linked)
   }
-  const candidates = [
-    ...input.localGraphs
-      .map(graph => {
-        const item = mapTransactionGraphToActivityItem(graph, privateExecutionAddresses)
-        const origin = graph.segments.find(segment => segment.role === 'origin')
-        const replacementHash = origin?.evidence?.replacementTransactionHash
-        if (origin?.status !== 'final' || !replacementHash || !item.snapshot) return item
-        const replacement = confirmedSpeedUps.get(graph.root.id)?.find(candidate => {
-          const replacementOrigin = candidate.segments.find(segment => segment.role === 'origin')
-          return (
-            replacementOrigin?.status === 'final' &&
-            replacementOrigin.evidence?.transactionHash?.toLowerCase() ===
-              replacementHash.toLowerCase() &&
-            isEvmSpeedUpReplacement(graph, candidate)
-          )
-        })
-        const next = replacement?.root.intent
-        const fee = next?.feeLimit
-        const transaction = next?.evm?.unsignedTransaction
-        if (!fee || !transaction || fee.assetId !== item.snapshot.feeLimit?.assetId) return item
+  const candidates: ActivityItem[] = []
+  for (const graph of input.localGraphs) {
+    let item: ActivityItem
+    try {
+      item = mapTransactionGraphToActivityItem(graph, privateExecutionAddresses)
+    } catch (error) {
+      if (!skipInvalidItems) throw error
+      console.warn(
+        '[Activity] Skipping invalid local transaction:',
+        error instanceof Error ? error.message : 'UnknownError'
+      )
+      continue
+    }
+    const origin = graph.segments.find(segment => segment.role === 'origin')
+    const replacementHash = origin?.evidence?.replacementTransactionHash
+    if (origin?.status === 'final' && replacementHash && item.snapshot) {
+      const replacement = confirmedSpeedUps.get(graph.root.id)?.find(candidate => {
+        const replacementOrigin = candidate.segments.find(segment => segment.role === 'origin')
+        return (
+          replacementOrigin?.status === 'final' &&
+          replacementOrigin.evidence?.transactionHash?.toLowerCase() ===
+            replacementHash.toLowerCase() &&
+          isEvmSpeedUpReplacement(graph, candidate)
+        )
+      })
+      const next = replacement?.root.intent
+      const fee = next?.feeLimit
+      const transaction = next?.evm?.unsignedTransaction
+      if (fee && transaction && fee.assetId === item.snapshot.feeLimit?.assetId) {
         const maxFeePerGas =
           transaction.type === 'legacy' ? transaction.gasPrice : transaction.maxFeePerGas
-        if (fee.amountRaw !== (BigInt(transaction.gasLimit) * BigInt(maxFeePerGas)).toString()) {
-          return item
+        if (fee.amountRaw === (BigInt(transaction.gasLimit) * BigInt(maxFeePerGas)).toString()) {
+          // The stored intent remains immutable; only the displayed maximum reflects the confirmed replacement.
+          item = Object.freeze({
+            ...item,
+            snapshot: Object.freeze({ ...item.snapshot, feeLimit: fee, evm: next.evm })
+          })
         }
-        // The stored intent remains immutable; only the displayed maximum reflects the confirmed replacement.
-        return Object.freeze({
-          ...item,
-          snapshot: Object.freeze({ ...item.snapshot, feeLimit: fee, evm: next.evm })
-        })
-      })
-      .filter(item => !isUnbroadcastUserCancellation(item)),
-    ...supplementalItems
-  ]
-  for (const item of candidates) assertItem(item, scope)
+      }
+    }
+    if (isUnbroadcastUserCancellation(item)) continue
+    const retained = retainActivityItem(item, scope, skipInvalidItems)
+    if (retained) candidates.push(retained)
+  }
+  for (const item of supplementalItems) {
+    const retained = retainActivityItem(item, scope, skipInvalidItems)
+    if (retained) candidates.push(retained)
+  }
   candidates.sort(
     (left, right) =>
       SOURCE_PRIORITY[right.source] - SOURCE_PRIORITY[left.source] ||
@@ -631,9 +687,18 @@ export function buildActivityReadModel(input: {
       undefined
     )
     if (duplicateIndex !== undefined) {
-      const reconciled = reconcileRpcDuplicate(deduplicated[duplicateIndex], item)
-      assertItem(reconciled, scope)
-      deduplicated[duplicateIndex] = reconciled
+      try {
+        const reconciled = reconcileRpcDuplicate(deduplicated[duplicateIndex], item)
+        assertItem(reconciled, scope)
+        deduplicated[duplicateIndex] = reconciled
+      } catch (error) {
+        if (!skipInvalidItems) throw error
+        console.warn(
+          '[Activity] Skipping invalid activity reconciliation:',
+          activityItemChainLabel(item),
+          error instanceof Error ? error.message : 'UnknownError'
+        )
+      }
       continue
     }
     const index = deduplicated.length

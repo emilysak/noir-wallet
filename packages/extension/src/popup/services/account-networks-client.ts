@@ -243,6 +243,15 @@ function parseNetwork(value: unknown, chains: AddressGatedChainRegistry): Accoun
         throw new Error('Invalid Confidential address')
       }
       privateExecutionAddress = rawPrivateExecutionAddress
+    } else if (chain.family === 'near') {
+      if (
+        typeof rawPrivateExecutionAddress !== 'string' ||
+        conflictsWithListedAddress ||
+        !/^[0-9a-f]{64}$/.test(rawPrivateExecutionAddress)
+      ) {
+        throw new Error('Invalid Confidential address')
+      }
+      privateExecutionAddress = rawPrivateExecutionAddress
     } else if (
       chain.family !== 'evm' ||
       typeof rawPrivateExecutionAddress !== 'string' ||

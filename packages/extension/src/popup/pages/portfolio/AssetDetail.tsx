@@ -408,7 +408,7 @@ export function AssetDetail() {
   const canReceive = Boolean(
     chain &&
     chain.chain.capabilities.address.status === 'available' &&
-    operableFamilies.includes(chain.chain.family)
+    (operableFamilies.includes(chain.chain.family) || chain.chain.family === 'near')
   )
   const canSwap = Boolean(
     asset && chain && !fundingUnavailableReason && operableFamilies.includes(chain.chain.family)

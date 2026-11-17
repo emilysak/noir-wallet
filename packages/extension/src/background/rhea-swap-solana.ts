@@ -409,7 +409,14 @@ export class RheaSwapSolanaCoordinator {
           (await this.options.rpc.broadcastSignedTransaction(signedTransaction)) === sourceHash
       } catch {
         const observed = await this.options.rpc.getSignatureStatus(sourceHash).catch(() => null)
-        accepted = observed !== null && observed.status !== 'unknown'
+        // A landed failure is terminal. Only a reached commitment means the broadcast succeeded.
+        if (observed?.status === 'failed') {
+          throw new Error('RHEA Swap Solana transaction execution failed')
+        }
+        accepted =
+          observed?.status === 'processed' ||
+          observed?.status === 'confirmed' ||
+          observed?.status === 'finalized'
       }
       if (!accepted) {
         await this.options.scheduleMonitoring().catch(() => {})

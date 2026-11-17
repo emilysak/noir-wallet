@@ -272,15 +272,18 @@ export function parseRheaSwapNearTransactionBatchReview(
       'payloadFingerprint',
       'expiresAt'
     ],
-    [],
+    ['networkFeeRaw'],
     'RHEA Swap NEAR review'
   )
   const chainId = parseChainId(readString(value.chainId, 'RHEA Swap NEAR chain', 64)).id
+  const networkFeeRaw = value.networkFeeRaw
   if (
     !chainId.startsWith('near:') ||
     !Array.isArray(value.summaries) ||
     value.summaries.length === 0 ||
     value.summaries.length > 16 ||
+    (networkFeeRaw !== undefined &&
+      (typeof networkFeeRaw !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(networkFeeRaw))) ||
     typeof value.payloadFingerprint !== 'string' ||
     !/^[0-9a-f]{64}$/.test(value.payloadFingerprint) ||
     !Number.isSafeInteger(value.expiresAt) ||
@@ -298,6 +301,7 @@ export function parseRheaSwapNearTransactionBatchReview(
         parseSigningSummary(summary, { family: 'near', chainId, operation: 'transaction' })
       )
     ),
+    ...(typeof networkFeeRaw === 'string' ? { networkFeeRaw } : {}),
     payloadFingerprint: value.payloadFingerprint,
     expiresAt: value.expiresAt as number
   })

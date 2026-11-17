@@ -12,17 +12,20 @@ import {
 } from '@/core/chains/registry'
 import { BITCOIN_ADDRESS_POLICY } from '@/core/chains/bitcoin'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import { supportsNearPrivateExecution } from '@/core/chains/near'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import type { KeyDomainId } from '@/core/keyring/domain'
 import type { HardwareCredentialMetadata } from '@/core/keyring/domain'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import type { EvmNetworkConfig } from '@/config/networks'
+import { NearMultichainSigningClient } from '@/infrastructure/keyring/multichain/near-signing-client'
 import { IndexedDbStorageV2Repository } from '@/infrastructure/persistence/repositories'
 import type { BitcoinAddressDerivationPort } from '@/infrastructure/keyring/multichain/bitcoin-derivation-client'
 import { parseEvmAccountBinding } from '@/infrastructure/chains/evm'
 import type { StorageV2GenerationId, StorageV2ReadRepository } from '@/ports/repositories'
 import type { AccountNetworkFamily } from '@/core/wallet/account-network-selection'
 import { isStoredAccountNetworkEnabled } from '@/lib/wallet-metadata-storage'
+import { credentialSession } from './credential-session'
 
 type AccountNetworksRepository = Pick<StorageV2ReadRepository, 'getActivePointer' | 'getSnapshot'>
 
@@ -89,6 +92,12 @@ export interface AccountNetworksCoordinatorOptions {
   }>
   readonly solanaPeaDerivation?: Readonly<{
     deriveSolanaPea(
+      keyDomainId: KeyDomainId,
+      accountIndex: number
+    ): Promise<Readonly<{ readonly address: string }>>
+  }>
+  readonly nearPeaDerivation?: Readonly<{
+    deriveNearPea(
       keyDomainId: KeyDomainId,
       accountIndex: number
     ): Promise<Readonly<{ readonly address: string }>>
@@ -162,6 +171,7 @@ export class AccountNetworksCoordinator {
         const seenChains = new Set<string>()
         const privateExecutionAddresses = new Map<number, Promise<string>>()
         const solanaPrivateExecutionAddresses = new Map<number, Promise<string>>()
+        const nearPrivateExecutionAddresses = new Map<number, Promise<string>>()
         const networks = (
           await Promise.all(
             snapshot.chainAccounts
@@ -326,6 +336,32 @@ export class AccountNetworksCoordinator {
                     }
                   }
                 }
+                const nearPeaDerivation = this.options.nearPeaDerivation
+                if (
+                  chain.family === 'near' &&
+                  supportsNearPrivateExecution(keyDomain.source) &&
+                  nearPeaDerivation &&
+                  deriveMissingAddresses
+                ) {
+                  try {
+                    let derived = nearPrivateExecutionAddresses.get(account.accountIndex)
+                    if (!derived) {
+                      derived = nearPeaDerivation
+                        .deriveNearPea(account.keyDomainId, account.accountIndex)
+                        .then(result => result.address)
+                      nearPrivateExecutionAddresses.set(account.accountIndex, derived)
+                    }
+                    privateExecutionAddress = await derived
+                  } catch (error) {
+                    if (
+                      !(error instanceof Error) ||
+                      (error.message !== 'Wallet is locked' &&
+                        error.message !== 'Credential is not unlocked')
+                    ) {
+                      throw error
+                    }
+                  }
+                }
 
                 if (addresses.length === 0) {
                   throw new Error('Enabled ChainAccount has no displayable Address')
@@ -407,6 +443,7 @@ export function createBackgroundAccountNetworksCoordinator(
     evmPeaDerivation,
     getZcashShieldedReceiveAddress,
     solanaPeaDerivation,
+    nearPeaDerivation: new NearMultichainSigningClient({ credentials: credentialSession }),
     isNetworkEnabled: (scope, family, chainId) =>
       isStoredAccountNetworkEnabled(
         scope.keyDomainId,

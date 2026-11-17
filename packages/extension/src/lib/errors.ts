@@ -250,6 +250,12 @@ const ERROR_MAPPINGS: ErrorMapping[] = [
     retryable: false
   },
   {
+    pattern:
+      /^NEAR balance cannot cover the (?:token transfer fee and storage reserve|token transfer fee, storage reserve, and recipient storage deposit|transfer, maximum fee, and storage reserve)$/i,
+    message: 'The NEAR balance cannot cover the network fee and storage deposit.',
+    retryable: false
+  },
+  {
     pattern: /InsufficientFunds|insufficient.*(?:balance|fund)|not enough.*fund/i,
     message: 'Insufficient balance for this transaction.',
     retryable: false
@@ -332,6 +338,23 @@ const ERROR_MAPPINGS: ErrorMapping[] = [
     pattern: /Unrecognized QR code|Unexpected QR content/i,
     message: 'Unrecognized QR code format. Please scan a valid Zcash QR code.',
     retryable: false
+  },
+
+  {
+    pattern: /RHEA Swap NEAR transaction \d+ is confirming/i,
+    message: 'The NEAR transaction is signed and still confirming.',
+    retryable: true
+  },
+  {
+    pattern: /RHEA Swap NEAR private account cannot pay the network fee/i,
+    message:
+      'The private account does not have enough NEAR to pay the network fee. Send NEAR to the private account and try again.',
+    retryable: true
+  },
+  {
+    pattern: /RHEA Swap NEAR transaction \d+ was rejected/i,
+    message: 'The NEAR transaction was rejected. Request a new quote and try again.',
+    retryable: true
   },
 
   // --- User Action ---

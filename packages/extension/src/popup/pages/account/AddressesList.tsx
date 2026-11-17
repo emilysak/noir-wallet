@@ -36,12 +36,40 @@ import { AccountAvatar } from '../../components/account/AccountAvatar'
 import { availableSoftwareAccountFamilies } from '@/popup/services/account-network-selection-client'
 import { useDAppExecutionMode } from '@/popup/hooks/useDAppExecutionMode'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import type { AccountNetworkFamily } from '@/core/wallet/account-network-selection'
 
 interface AddressQrTarget {
   readonly network: AccountNetworkView
   readonly address: AccountNetworkAddressView
   readonly displayName?: string
   readonly confidential?: boolean
+}
+
+const ACCOUNT_NETWORK_FAMILY_LABELS: Record<AccountNetworkFamily, string> = {
+  zcash: 'Zcash',
+  evm: 'Ethereum & EVM',
+  bitcoin: 'Bitcoin',
+  solana: 'Solana',
+  near: 'NEAR',
+  tron: 'Tron'
+}
+
+const ACCOUNT_NETWORK_FAMILY_ADD_LABELS: Record<AccountNetworkFamily, string> = {
+  zcash: 'Zcash',
+  evm: 'EVM',
+  bitcoin: 'Bitcoin',
+  solana: 'Solana',
+  near: 'NEAR',
+  tron: 'Tron'
+}
+
+function showsPrivateExecutionAddress(network: AccountNetworkView): boolean {
+  return (
+    (network.chain.family === 'evm' ||
+      network.chain.family === 'solana' ||
+      network.chain.family === 'near') &&
+    Boolean(network.privateExecutionAddress)
+  )
 }
 
 function PrivateAddressRisk() {
@@ -223,10 +251,9 @@ function AddressNetworkGroup({
             Number(left.privacy === 'shielded') - Number(right.privacy === 'shielded')
         )
       : network.addresses
-  const privateExecutionAddress =
-    network.chain.family === 'evm' || network.chain.family === 'solana'
-      ? network.privateExecutionAddress
-      : undefined
+  const privateExecutionAddress = showsPrivateExecutionAddress(network)
+    ? network.privateExecutionAddress
+    : undefined
   const displayName = accountNetworkLabel(network)
   const singleAddress = addresses.length === 1 ? addresses[0] : null
   const singleBitcoinType =
@@ -426,15 +453,13 @@ export function AddressesList() {
     (wallet?.keySource === undefined || wallet.keySource === 'software')
   const missingFamilies =
     !scopedReceive && !shieldedZcashOnly && !receiveView && canManageNetworks
-      ? (['zcash', 'evm'] as const).filter(
-          family =>
-            availableFamilies.includes(family) &&
+      ? availableFamilies.filter(family => {
+          const query = networkQuery.trim().toLowerCase()
+          return (
             !selectedFamilies.includes(family) &&
-            (!networkQuery.trim() ||
-              (family === 'evm' ? 'Ethereum & EVM' : 'Zcash')
-                .toLowerCase()
-                .includes(networkQuery.trim().toLowerCase()))
-        )
+            (!query || ACCOUNT_NETWORK_FAMILY_LABELS[family].toLowerCase().includes(query))
+          )
+        })
       : []
   const [selectedMode, setMode] = useState<'public' | 'private' | null>(null)
   const mode = privateExecutionSupported ? (selectedMode ?? defaultMode) : 'public'
@@ -526,7 +551,9 @@ export function AddressesList() {
         }
         if (requestedPrivacy) return []
         if (
-          (network.chain.family === 'evm' || network.chain.family === 'solana') &&
+          (network.chain.family === 'evm' ||
+            network.chain.family === 'solana' ||
+            network.chain.family === 'near') &&
           requestedMode === 'private' &&
           !network.privateExecutionAddress
         )
@@ -541,8 +568,7 @@ export function AddressesList() {
       return (receiveView ||
         mode === 'public' ||
         network.chain.family === 'zcash' ||
-        (network.chain.family === 'evm' && Boolean(network.privateExecutionAddress)) ||
-        (network.chain.family === 'solana' && Boolean(network.privateExecutionAddress))) &&
+        showsPrivateExecutionAddress(network)) &&
         (!query ||
           `${accountNetworkLabel(network)} ${network.chain.displayName}`
             .toLowerCase()
@@ -562,11 +588,7 @@ export function AddressesList() {
     scopedReceive,
     shieldedZcashOnly
   ])
-  const hasPrivateAddresses = networks.some(
-    network =>
-      (network.chain.family === 'evm' || network.chain.family === 'solana') &&
-      Boolean(network.privateExecutionAddress)
-  )
+  const hasPrivateAddresses = networks.some(showsPrivateExecutionAddress)
   const evmNetworks = filteredNetworks.filter(network => network.chain.family === 'evm')
   const otherNetworks = filteredNetworks.filter(network => network.chain.family !== 'evm')
   const otherChainNetworks = otherNetworks.filter(network => network.chain.family !== 'zcash')
@@ -603,36 +625,38 @@ export function AddressesList() {
     />
   )
 
-  const renderMissingFamily = (family: 'zcash' | 'evm') => (
-    <div
-      key={family}
-      className="flex min-h-[64px] min-w-0 items-center gap-3 border-b border-border/40 py-2"
-    >
-      {family === 'evm' ? (
-        <img src={evmGroupIcon} alt="" aria-hidden="true" className="size-8 shrink-0" />
-      ) : (
-        <ChainIcon chain="zcash" width={32} height={32} className="shrink-0 rounded-lg" />
-      )}
-      <span className="min-w-0 flex-1 truncate text-base font-medium">
-        {family === 'evm' ? 'Ethereum & EVM' : 'Zcash'}
-      </span>
-      <Button
-        type="button"
-        variant="secondary"
-        size="sm"
-        aria-label={`Add ${family === 'evm' ? 'EVM' : 'Zcash'} network`}
-        className="shrink-0"
-        onClick={() =>
-          navigate(
-            `/account-networks?walletId=${encodeURIComponent(walletId!)}&accountId=${encodeURIComponent(accountId!)}`
-          )
-        }
+  const renderMissingFamily = (family: AccountNetworkFamily) => {
+    const label = ACCOUNT_NETWORK_FAMILY_LABELS[family]
+    const addLabel = ACCOUNT_NETWORK_FAMILY_ADD_LABELS[family]
+    return (
+      <div
+        key={family}
+        className="flex min-h-[64px] min-w-0 items-center gap-3 border-b border-border/40 py-2"
       >
-        <Icon icon="lucide:plus" width={16} height={16} />
-        Add {family === 'evm' ? 'EVM' : 'Zcash'}
-      </Button>
-    </div>
-  )
+        {family === 'evm' ? (
+          <img src={evmGroupIcon} alt="" aria-hidden="true" className="size-8 shrink-0" />
+        ) : (
+          <ChainIcon chain={family} width={32} height={32} className="shrink-0 rounded-lg" />
+        )}
+        <span className="min-w-0 flex-1 truncate text-base font-medium">{label}</span>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          aria-label={`Add ${addLabel} network`}
+          className="shrink-0"
+          onClick={() =>
+            navigate(
+              `/account-networks?walletId=${encodeURIComponent(walletId!)}&accountId=${encodeURIComponent(accountId!)}`
+            )
+          }
+        >
+          <Icon icon="lucide:plus" width={16} height={16} />
+          Add {addLabel}
+        </Button>
+      </div>
+    )
+  }
 
   if (!walletId || !accountId) {
     return (
@@ -825,6 +849,10 @@ export function AddressesList() {
               </div>
             )}
             {!scopedReceive && otherChainNetworks.map(renderNetwork)}
+            {!scopedReceive &&
+              missingFamilies
+                .filter(family => family !== 'zcash' && family !== 'evm')
+                .map(renderMissingFamily)}
           </div>
         )}
       </div>

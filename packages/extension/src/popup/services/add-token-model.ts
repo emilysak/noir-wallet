@@ -22,8 +22,18 @@ export type AddTokenNetwork = Readonly<{
   disabled?: true
 }>
 
+export interface NearAddTokenAsset {
+  readonly assetId: string
+  readonly chainId: string
+  readonly contractId: string
+  readonly name: string
+  readonly symbol: string
+  readonly decimals: number
+}
+
 export type AddTokenCandidate =
   | Readonly<{ kind: 'evm'; asset: UserEvmAssetCandidate }>
+  | Readonly<{ kind: 'near'; asset: NearAddTokenAsset }>
   | Readonly<{ kind: 'protocol'; asset: IntentsManagedAsset }>
 
 export function buildAddTokenNetworks(
@@ -40,7 +50,7 @@ export function buildAddTokenNetworks(
       iconChain: evmNetwork.iconChain,
       family: 'evm' as const
     })),
-    ...(network === 'mainnet' && isSelectableChainFamily('near', enabledFlags)
+    ...(isSelectableChainFamily('near', enabledFlags)
       ? [
           {
             chainId: near.chainId,
@@ -97,7 +107,9 @@ export function isAddTokenReferenceSearch(
   }
   try {
     if (network.family === 'solana') return parseSolanaPublicKey(reference) === reference
-    if (network.family === 'near' && reference.includes('.')) {
+    if (network.family === 'near') {
+      const implicitAccount = /^[0-9a-f]{64}$/.test(reference)
+      if (!reference.includes('.') && !implicitAccount) return false
       return parseNearAccountId(reference) === reference
     }
   } catch {
@@ -124,6 +136,16 @@ export function getVerifiedTokenPresentation(candidate: AddTokenCandidate | null
       decimals: candidate.asset.metadata.decimals,
       ...(candidate.asset.metadata.iconUrl ? { iconUrl: candidate.asset.metadata.iconUrl } : {}),
       reference: candidate.asset.contractAddress
+    })
+  }
+  if (candidate.kind === 'near') {
+    return Object.freeze({
+      assetId: candidate.asset.assetId,
+      name: candidate.asset.name,
+      symbol: candidate.asset.symbol,
+      decimals: candidate.asset.decimals,
+      blockchain: 'near',
+      reference: candidate.asset.contractId
     })
   }
   return Object.freeze({

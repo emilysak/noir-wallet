@@ -119,6 +119,7 @@ export function SendTransferForm(
             family,
             selection,
             priceUsd,
+            executionMode: executionMode ?? 'main',
             onSubmitted: value => onSubmitted({ family, value }),
             parseRecipient: parseNearAccountId,
             recipientPlaceholder:
@@ -131,7 +132,10 @@ export function SendTransferForm(
             feeDecimals: 24,
             feeSymbol: 'NEAR',
             totalLabel: 'Maximum total',
-            prepare: nearWalletClient.prepareTransfer,
+            prepare: intent =>
+              nearWalletClient.prepareTransfer(intent, {
+                executionMode: executionMode ?? 'main'
+              }),
             approve: nearWalletClient.approveTransfer,
             reject: nearWalletClient.rejectTransfer,
             estimateFeeRaw: value => value.debit.maximumFeeRaw,

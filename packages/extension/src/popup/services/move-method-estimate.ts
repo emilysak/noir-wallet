@@ -1,7 +1,9 @@
 import type { PortfolioAssetView, PortfolioChainView } from '@/core/portfolio'
+import type { SwapToken } from '@/core/services/intents-api'
 import { resolveRheaPrivateTransferToken } from '@/core/services/rhea-swap'
 import { preferWalletEvmQuoteToken } from './token-address-discovery'
 import type { ConfidentialFundingPreview } from '@/core/services/confidential-funding'
+import { findShieldCatalogToken } from './shield-transfer'
 import { formatBaseUnitDecimalAmount, formatFeeAmount } from '@/lib/number-format'
 import { evmWalletClient, type EvmFeeEstimate } from './evm-wallet-client'
 import { rheaSwapClient } from './rhea-swap-client'
@@ -54,7 +56,15 @@ export async function estimateDirectMove(input: {
   readonly signal: AbortSignal
 }): Promise<MoveMethodEstimate> {
   const match = /^eip155:([1-9][0-9]*)$/.exec(input.chain.chain.id)
-  if (!match) throw new Error('Unsupported Move network')
+  if (!match) {
+    if (
+      input.chain.chain.network?.kind === 'mainnet' &&
+      (input.chain.chain.family === 'near' || input.chain.chain.family === 'solana')
+    ) {
+      return estimateConfidentialChainMove(input)
+    }
+    throw new Error('Unsupported Move network')
+  }
   const catalog = await rheaSwapClient
     .listTokens({ direction: 'from', tokenListChainIds: [Number(match[1])] })
     .catch(() => null)
@@ -143,6 +153,60 @@ export async function estimateDirectMove(input: {
     } catch {
       input.signal.throwIfAborted()
       return result
+    }
+  } finally {
+    await rheaSwapClient.discard(quote.quoteHandle).catch(() => {})
+  }
+}
+
+export function findDirectConfidentialChainToken<T extends SwapToken>(
+  tokens: readonly T[],
+  asset: Pick<PortfolioAssetView, 'asset' | 'metadata'>
+): T | undefined {
+  return findShieldCatalogToken(asset, tokens, 'mainnet')
+}
+
+async function estimateConfidentialChainMove(
+  input: Parameters<typeof estimateDirectMove>[0]
+): Promise<MoveMethodEstimate> {
+  const tokenListChainId = input.chain.chain.family === 'near' ? 900001 : 501
+  const catalog = await rheaSwapClient.listTokens({
+    direction: 'from',
+    tokenListChainIds: [tokenListChainId]
+  })
+  input.signal.throwIfAborted()
+  const token = findDirectConfidentialChainToken(catalog.tokens, input.asset)
+  if (!token || token.decimals !== input.asset.metadata.decimals) {
+    throw new Error('Move route unavailable')
+  }
+  const asset = {
+    chain: token.rheaChainId,
+    address: token.rheaAddress,
+    symbol: token.symbol,
+    decimals: token.decimals,
+    isNative: token.isNative
+  }
+  const quote = await rheaSwapClient.quote(
+    {
+      fromChain: token.rheaChainId,
+      toChain: token.rheaChainId,
+      tokenIn: asset,
+      tokenOut: asset,
+      amountIn: input.amountRaw,
+      sender: input.sender,
+      recipient: input.recipient,
+      slippageBps: 100,
+      confidentiality: 'basic'
+    },
+    input.executionMode === 'private' ? 'private-transfer' : 'confidential-funding'
+  )
+  try {
+    input.signal.throwIfAborted()
+    return {
+      expiresAt: Math.min(quote.expiresAt ?? Infinity, Date.now() + 30_000),
+      routeFeeRaw: routeFee(input.amountRaw, quote.estimatedOut),
+      time: '—',
+      timeScope: 'Network only'
     }
   } finally {
     await rheaSwapClient.discard(quote.quoteHandle).catch(() => {})

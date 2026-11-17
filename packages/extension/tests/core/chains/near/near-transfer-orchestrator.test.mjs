@@ -7,6 +7,7 @@ import {
   getBundledInitialProductAssetDefinitions,
   parseChainId
 } from '../../../../src/core/chains/registry/index.ts'
+import { nearPublicKeyFromImplicitAccountId } from '../../../../src/core/chains/near/index.ts'
 import {
   ChromeSessionNearPendingTransferStore,
   computeNearTransactionFingerprint,
@@ -147,7 +148,7 @@ function harness(options = {}) {
   const orchestrator = new NearTransferOrchestrator({
     repository,
     pendingStore,
-    signer: signer(calls),
+    signer: options.signer ?? signer(calls),
     rpc: options.rpc ?? rpc(),
     assets,
     now: () => 1_000,
@@ -330,4 +331,84 @@ test('does not persist a rejected NEAR approval as Activity', async () => {
   await expect(pendingStore.get(approval.graph.root.id)).resolves.toBeNull()
   await expect(pendingStore.getReviewGraph(approval.graph.root.id)).resolves.toBeNull()
   expect(calls.map(call => call[0])).toEqual(['prepare', 'cancel'])
+})
+
+test('private NEAR sends sign from the derived PEA implicit account', async () => {
+  const peaAddress = 'b90b217039eed36162aef24e79ec0be08063210c65eff1a1c3d1af7c11fa8af4'
+  const peaPublicKey = nearPublicKeyFromImplicitAccountId(peaAddress)
+  const calls = []
+  const signing = {
+    prepare: async (keyDomainId, payload) => {
+      calls.push(['prepare', keyDomainId, payload])
+      const transaction = payload.transaction
+      return {
+        commandId: 'signing-command:near:pea',
+        chainId,
+        operation: 'transaction',
+        summary: {
+          schema: 'near.transaction.v1',
+          chainId,
+          operation: 'transaction',
+          review: { level: 'standard', issues: [] },
+          fields: {
+            signerId: transaction.signerId,
+            publicKey: peaPublicKey,
+            nonce: transaction.nonce,
+            receiverId: transaction.receiverId,
+            blockHash: transaction.blockHash,
+            actions: transaction.actions.map(action => ({
+              kind: 'transfer',
+              depositYocto: action.depositYocto
+            }))
+          }
+        },
+        payloadFingerprint: {
+          algorithm: 'sha256',
+          digestHex: await computeNearTransactionFingerprint(transaction)
+        },
+        execution: { kind: 'internal' },
+        expiresAt: 5_000
+      }
+    },
+    confirm: async () => {
+      throw new Error('unused')
+    },
+    cancel: async (keyDomainId, commandId) => calls.push(['cancel', keyDomainId, commandId]),
+    deriveNearPea: async (keyDomainId, accountIndex) => {
+      calls.push(['derive', keyDomainId, accountIndex])
+      return { address: peaAddress, publicKey: peaPublicKey }
+    }
+  }
+  const input = {
+    chainAccount: account,
+    accountIndex: 0,
+    publicKey,
+    receiverId,
+    depositYocto: '2000000000000000000000000',
+    executionMode: 'private'
+  }
+  const { orchestrator } = harness({ signer: signing })
+  const approval = await orchestrator.prepare(input)
+  expect(calls[0]).toEqual(['derive', account.scope.keyDomainId, 0])
+  expect(calls[1][2]).toMatchObject({
+    kind: 'pea-near-transaction',
+    accountIndex: 0,
+    transaction: { signerId: peaAddress }
+  })
+  expect(approval.signing.summary.fields).toMatchObject({
+    signerId: peaAddress,
+    publicKey: peaPublicKey
+  })
+
+  const colliding = harness({
+    signer: {
+      ...signing,
+      deriveNearPea: async () => ({ address: signerId, publicKey })
+    }
+  })
+  await expect(colliding.orchestrator.prepare(input)).rejects.toThrow(/differ from the NEAR account/)
+
+  await expect(harness().orchestrator.prepare(input)).rejects.toThrow(
+    /private execution is unavailable/
+  )
 })

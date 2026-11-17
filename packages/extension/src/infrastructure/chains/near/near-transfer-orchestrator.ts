@@ -23,6 +23,12 @@ import {
 } from '@/core/transactions/domain'
 import type { TransactionRepository } from '@/ports/repositories'
 import type { NearTransactionSigningPreparePayload } from '@/infrastructure/keyring/multichain/near-signing-client'
+
+type NearTransferSigningPreparePayload =
+  | NearTransactionSigningPreparePayload
+  | (Omit<NearTransactionSigningPreparePayload, 'kind'> & {
+      readonly kind: 'pea-near-transaction'
+    })
 import {
   hasReachedTransactionStatus,
   persistSignedTransactionGraph,
@@ -47,9 +53,14 @@ import { createNearTransferGraph } from './near-transaction-graph'
 export interface NearTransferSigningPort {
   readonly prepare: (
     keyDomainId: ChainAccount['scope']['keyDomainId'],
-    payload: NearTransactionSigningPreparePayload,
+    payload: NearTransferSigningPreparePayload,
     signal?: AbortSignal
   ) => Promise<PreparedSigningCommand>
+  readonly deriveNearPea?: (
+    keyDomainId: ChainAccount['scope']['keyDomainId'],
+    accountIndex: number,
+    signal?: AbortSignal
+  ) => Promise<{ readonly address: string; readonly publicKey: string }>
   readonly confirm: (
     keyDomainId: ChainAccount['scope']['keyDomainId'],
     commandId: SigningCommandId,
@@ -86,6 +97,7 @@ interface PrepareNearTransferBaseInput {
   readonly accountIndex: number
   readonly publicKey: string
   readonly receiverId: string
+  readonly executionMode?: 'main' | 'private'
   readonly signal?: AbortSignal
   readonly nearIntentsBinding?: NearIntentsTransactionBinding
 }
@@ -201,13 +213,33 @@ export class NearTransferOrchestrator {
     if (asset.asset.chainId !== input.chainAccount.scope.chainId) {
       throw new Error('NEAR transfer asset does not match its ChainAccount')
     }
+    const mainSignerId = input.chainAccount.identity.value
+    let signerId = mainSignerId
+    let publicKey = input.publicKey
+    let signingKind: NearTransferSigningPreparePayload['kind'] = 'near-transaction'
+    if (input.executionMode === 'private') {
+      if (!this.signer.deriveNearPea) {
+        throw new Error('NEAR private execution is unavailable')
+      }
+      const pea = await this.signer.deriveNearPea(
+        input.chainAccount.scope.keyDomainId,
+        input.accountIndex,
+        input.signal
+      )
+      if (pea.address === mainSignerId) {
+        throw new Error('Confidential address must differ from the NEAR account')
+      }
+      signerId = pea.address
+      publicKey = pea.publicKey
+      signingKind = 'pea-near-transaction'
+    }
     const prepared =
       asset.asset.kind === 'native'
         ? await prepareNearNativeTransfer({
             chainId: input.chainAccount.scope.chainId,
             accountIndex: input.accountIndex,
-            signerId: input.chainAccount.identity.value,
-            publicKey: input.publicKey,
+            signerId,
+            publicKey,
             receiverId: input.receiverId,
             depositYocto: amountRaw,
             rpc: this.rpc,
@@ -217,8 +249,8 @@ export class NearTransferOrchestrator {
             chainId: input.chainAccount.scope.chainId,
             accountIndex: input.accountIndex,
             assetId: asset.asset.id,
-            signerId: input.chainAccount.identity.value,
-            publicKey: input.publicKey,
+            signerId,
+            publicKey,
             recipientId: input.receiverId,
             contractId: asset.asset.reference.replace(/%5F/gi, '_'),
             amountRaw,
@@ -237,7 +269,7 @@ export class NearTransferOrchestrator {
     const signing = await this.signer.prepare(
       input.chainAccount.scope.keyDomainId,
       Object.freeze({
-        kind: 'near-transaction' as const,
+        kind: signingKind,
         chainId: input.chainAccount.scope.chainId,
         accountIndex: prepared.accountIndex,
         transaction: signingTransaction

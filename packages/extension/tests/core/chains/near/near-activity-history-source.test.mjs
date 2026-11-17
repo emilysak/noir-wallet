@@ -1,8 +1,17 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
+import { NEAR_CHAIN_FEATURE_FLAG } from '../../../../src/config/multichain-feature-flags.ts'
 import { NEAR_NETWORKS } from '../../../../src/config/networks.ts'
+import { buildActivityReadModel } from '../../../../src/core/activity/index.ts'
+import {
+  createAssetRegistry,
+  createInitialProductChainRegistry,
+  getBundledInitialProductAssetDefinitions
+} from '../../../../src/core/chains/registry/index.ts'
+import { createConfiguredActivityHistorySources } from '../../../../src/infrastructure/activity/configured-history-sources.ts'
 import { createNearActivityHistorySource } from '../../../../src/infrastructure/chains/near/near-activity-history-source.ts'
+import { createNearTransferGraph } from '../../../../src/infrastructure/chains/near/near-transaction-graph.ts'
 
 const scope = { keyDomainId: 'wallet-domain', accountId: 'account-1' }
 
@@ -90,5 +99,73 @@ test.describe('NEAR activity history source', () => {
     await expect(source.readAddressActivity({ scope, address: 'alice.near' })).rejects.toThrow(
       /FastNear/
     )
+  })
+
+  test('leaves remote testnet history absent and keeps local testnet transfers', () => {
+    expect(() =>
+      createNearActivityHistorySource({ chainId: NEAR_NETWORKS.testnet.chainId })
+    ).toThrow(/mainnet only/)
+
+    const testnetSources = createConfiguredActivityHistorySources({
+      network: 'testnet',
+      enabledChainFeatureFlags: [NEAR_CHAIN_FEATURE_FLAG]
+    })
+    const mainnetSources = createConfiguredActivityHistorySources({
+      network: 'mainnet',
+      enabledChainFeatureFlags: [NEAR_CHAIN_FEATURE_FLAG]
+    })
+    expect(testnetSources.nearNetwork.chainId).toBe(NEAR_NETWORKS.testnet.chainId)
+    expect(testnetSources.nearHistory).toBeUndefined()
+    expect(mainnetSources.nearHistory).toBeDefined()
+
+    const chains = createInitialProductChainRegistry('testnet')
+    const assets = createAssetRegistry(chains, getBundledInitialProductAssetDefinitions('testnet'))
+    const localScope = { keyDomainId: 'key-domain:test', accountId: 'account:test' }
+    const signerId = '00'.repeat(32)
+    const graph = createNearTransferGraph({
+      prepared: {
+        chainId: NEAR_NETWORKS.testnet.chainId,
+        accountIndex: 0,
+        signerId,
+        publicKey: `ed25519:${'1'.repeat(32)}`,
+        receiverId: 'alice.testnet',
+        depositYocto: '2000000000000000000000000',
+        estimatedFeeYocto: '44636512500000000000',
+        maximumFeeYocto: '446365125000000000000',
+        storageReserveYocto: '1000000000000000000000',
+        totalRequiredYocto: '2001446365125000000000000',
+        transaction: {
+          chainId: NEAR_NETWORKS.testnet.chainId,
+          accountIndex: 0,
+          signerId,
+          receiverId: 'alice.testnet',
+          nonce: '42',
+          blockHash: '11111111111111111111111111111111',
+          actions: [{ type: 'transfer', depositYocto: '2000000000000000000000000' }]
+        }
+      },
+      scope: localScope,
+      transactionId: 'transaction:near:testnet-local',
+      segmentId: 'segment:near:testnet-local',
+      assets,
+      createdAt: 1_700_000_000_000
+    })
+    const model = buildActivityReadModel({
+      scope: localScope,
+      localGraphs: [graph],
+      supplementalItems: []
+    })
+    expect(model.items).toEqual([
+      expect.objectContaining({
+        id: graph.root.id,
+        source: 'wallet-v2',
+        kind: 'transfer',
+        snapshot: expect.objectContaining({
+          direction: 'outgoing',
+          sender: { chainId: NEAR_NETWORKS.testnet.chainId, address: signerId },
+          recipient: { chainId: NEAR_NETWORKS.testnet.chainId, address: 'alice.testnet' }
+        })
+      })
+    ])
   })
 })

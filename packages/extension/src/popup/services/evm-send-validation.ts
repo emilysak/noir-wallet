@@ -1,5 +1,9 @@
+import { getNearNetworkConfig, getSolanaNetworkConfig } from '@/config/networks'
 import { ZEC_ZCASH_ASSET } from '@/config/intents'
 import { parseZcashAddress } from '@/core/address-book/address-book'
+import { parseNearAccountId } from '@/core/chains/near'
+import { parseSolanaPublicKey } from '@/core/chains/solana'
+import { RHEA_SWAP_CHAIN_CATALOG } from '@/core/services/rhea-swap'
 import { EvmWalletClientError } from './evm-wallet-client'
 
 export type EvmSendSourceMode = 'main' | 'private'
@@ -56,6 +60,106 @@ export function buildMoveToMainEvmPath(input: {
   if (!/^0x[0-9a-fA-F]{40}$/.test(input.mainAddress)) {
     throw new Error('Invalid Main EVM address route')
   }
+  const query = new URLSearchParams({
+    privateTransfer: '1',
+    balanceTransfer: '1',
+    source: input.assetId,
+    recipient: input.mainAddress
+  })
+  appendTransferAmount(query, input.amount, input.maximum)
+  return `/swap?${query.toString()}`
+}
+
+type ConfidentialMoveFamily = 'evm' | 'near' | 'solana'
+
+function confidentialMoveApiChainId(family: 'near' | 'solana'): string {
+  const apiChainId = RHEA_SWAP_CHAIN_CATALOG.find(
+    chain => chain.walletFamily === family
+  )?.apiChainId
+  // Swap compares destinationChain with rheaChainId, which is this api id.
+  // The numeric token-list ids are not rheaChainId.
+  if (!apiChainId || /^\d+$/.test(apiChainId)) {
+    throw new Error(family === 'near' ? 'Invalid NEAR chain route' : 'Invalid Solana chain route')
+  }
+  return apiChainId
+}
+
+function assertConfidentialMoveChain(family: 'near' | 'solana', chainId: string): void {
+  const expected =
+    family === 'near'
+      ? getNearNetworkConfig('mainnet').chainId
+      : getSolanaNetworkConfig('mainnet').chainId
+  if (chainId !== expected) {
+    throw new Error(family === 'near' ? 'Invalid NEAR chain route' : 'Invalid Solana chain route')
+  }
+}
+
+function assertNearMoveAddress(address: string): void {
+  try {
+    // A 0x address is an EVM recipient, not a NEAR implicit or named account.
+    if (/^0x/i.test(address) || parseNearAccountId(address) !== address) throw new Error('invalid')
+  } catch {
+    throw new Error('Invalid Main NEAR address route')
+  }
+}
+
+function assertSolanaMoveAddress(address: string): void {
+  try {
+    if (parseSolanaPublicKey(address) !== address) throw new Error('invalid')
+  } catch {
+    throw new Error('Invalid Main Solana address route')
+  }
+}
+
+export function isPrivateFundingDestinationChain(chainId: string | null | undefined): boolean {
+  if (!chainId) return false
+  if (/^\d+$/.test(chainId)) return true
+  return RHEA_SWAP_CHAIN_CATALOG.some(
+    chain =>
+      chain.apiChainId === chainId &&
+      (chain.walletFamily === 'near' || chain.walletFamily === 'solana')
+  )
+}
+
+export function buildAddToPrivateMovePath(input: {
+  readonly assetId: string
+  readonly chainId: string
+  readonly family: ConfidentialMoveFamily
+  readonly amount?: string
+  readonly maximum?: boolean
+}): string {
+  if (input.family === 'evm') return buildAddToPrivateEvmPath(input)
+  assertRoutableAssetId(input.assetId)
+  assertConfidentialMoveChain(input.family, input.chainId)
+  const query = new URLSearchParams({
+    privateDestination: '1',
+    balanceTransfer: '1',
+    destinationChain: confidentialMoveApiChainId(input.family),
+    destinationAsset: input.assetId,
+    source: input.assetId
+  })
+  appendTransferAmount(query, input.amount, input.maximum)
+  return `/swap?${query.toString()}`
+}
+
+export function buildMoveToMainMovePath(input: {
+  readonly assetId: string
+  readonly mainAddress: string
+  readonly family: ConfidentialMoveFamily
+  readonly amount?: string
+  readonly maximum?: boolean
+}): string {
+  if (input.family === 'evm') {
+    return buildMoveToMainEvmPath({
+      assetId: input.assetId,
+      mainAddress: input.mainAddress,
+      amount: input.amount,
+      maximum: input.maximum
+    })
+  }
+  assertRoutableAssetId(input.assetId)
+  if (input.family === 'near') assertNearMoveAddress(input.mainAddress)
+  else assertSolanaMoveAddress(input.mainAddress)
   const query = new URLSearchParams({
     privateTransfer: '1',
     balanceTransfer: '1',

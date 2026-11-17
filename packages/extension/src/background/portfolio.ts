@@ -1,4 +1,5 @@
 import type { EvmNetworkConfig } from '@/config/networks'
+import type { ChainAccount } from '@/core/accounts/domain'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import {
   resolveNearRuntimeNetworkConfig,
@@ -13,7 +14,8 @@ import {
   getBundledInitialProductAssetDefinitions,
   getZcashChainId,
   parseChainId,
-  type AssetDefinitionInput
+  type AssetDefinitionInput,
+  type AssetRegistry
 } from '@/core/chains/registry'
 import { createConfiguredEvmRpcClient, EvmPortfolioCoordinator } from '@/infrastructure/chains/evm'
 import { resolvePreferredEvmPortfolioRpc } from '@/infrastructure/chains/evm/evm-portfolio-batch'
@@ -22,11 +24,18 @@ import {
   createConfiguredNearRpcClient,
   readNearPortfolioSource
 } from '@/infrastructure/chains/near'
+import type { NearFungibleTokenDefinition } from '@/infrastructure/chains/near/near-balance-reader'
+import {
+  nearCustomTokenAssetId,
+  nearCustomTokenDefinition,
+  nearCustomTokenStore
+} from '@/infrastructure/chains/near/near-custom-tokens'
 import {
   createConfiguredSolanaRpcClient,
   readSolanaPortfolioSource
 } from '@/infrastructure/chains/solana'
 import { EvmMultichainSigningClient } from '@/infrastructure/keyring/multichain/evm-signing-client'
+import { NearMultichainSigningClient } from '@/infrastructure/keyring/multichain/near-signing-client'
 import { SolanaMultichainSigningClient } from '@/infrastructure/keyring/multichain/solana-signing-client'
 import { parseEvmAccountBinding } from '@/infrastructure/chains/evm/evm-account'
 import {
@@ -49,11 +58,13 @@ import { formatLogError } from '@/lib/log-format'
 import { logger } from '@/lib/logger'
 import { useAccountDataStore } from '@/store/account-data-store'
 import { useWalletStore } from '@/store/wallet-store'
+import { supportsNearPrivateExecution } from '@/core/chains/near'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import { createBackgroundBitcoinPortfolioCoordinator } from './bitcoin-transfer'
 import { credentialSession } from './credential-session'
 import { markWalletNeedsCatchUp } from './tx-sync'
 import { backgroundZcashWalletRuntime } from './zcash-wallet-runtime'
+import { loadActiveNearTransferContext } from './near-transfer'
 import { loadActiveSolanaTransferContext } from './solana-transfer'
 import {
   isStoredAccountNetworkEnabled,
@@ -77,19 +88,60 @@ export function createBackgroundPortfolioCoordinator(
   const chains = createBuildAddressGatedChainRegistry(
     createInitialProductChainRegistry(DEFAULT_NETWORK, customEvmNetworks)
   )
-  const assets = createAssetRegistry(
-    chains,
-    filterAssetDefinitionsForChains(
-      [
-        ...getBundledInitialProductAssetDefinitions(DEFAULT_NETWORK, customEvmNetworks),
-        ...userEvmAssets,
-        ...protocolAssets
-      ],
-      chains
-    )
+  const baseDefinitions = filterAssetDefinitionsForChains(
+    [
+      ...getBundledInitialProductAssetDefinitions(DEFAULT_NETWORK, customEvmNetworks),
+      ...userEvmAssets,
+      ...protocolAssets
+    ],
+    chains
   )
+  const baseAssets = createAssetRegistry(chains, baseDefinitions)
+  let listedAssets: AssetRegistry = baseAssets
+  const assets: AssetRegistry = {
+    list: chainId => listedAssets.list(chainId),
+    listQuarantined: chainId => listedAssets.listQuarantined(chainId),
+    get: assetId => listedAssets.get(assetId),
+    resolve: assetId => listedAssets.resolve(assetId),
+    inspect: assetId => listedAssets.inspect(assetId)
+  }
+  const syncNearCustomTokens = async (
+    chainAccount: ChainAccount
+  ): Promise<readonly NearFungibleTokenDefinition[]> => {
+    try {
+      const saved = await nearCustomTokenStore.list({
+        walletId: chainAccount.scope.keyDomainId,
+        accountId: chainAccount.scope.accountId
+      })
+      const visible = saved.filter(
+        token => !token.hidden && token.chainId === chainAccount.scope.chainId
+      )
+      const extras: AssetDefinitionInput[] = []
+      for (const token of visible) {
+        try {
+          if (baseAssets.inspect(nearCustomTokenAssetId(token.chainId, token.contractId))) continue
+          extras.push(nearCustomTokenDefinition(token))
+        } catch {
+          continue
+        }
+      }
+      listedAssets = createAssetRegistry(chains, [...baseDefinitions, ...extras])
+      return Object.freeze(
+        visible.map(token =>
+          Object.freeze({
+            contractId: token.contractId,
+            symbol: token.symbol,
+            decimals: token.decimals
+          })
+        )
+      )
+    } catch {
+      return Object.freeze([])
+    }
+  }
   const peaSigner = new EvmMultichainSigningClient({ credentials: credentialSession })
   const solanaPeaSigner = new SolanaMultichainSigningClient({ credentials: credentialSession })
+  const nearPeaSigner = new NearMultichainSigningClient({ credentials: credentialSession })
   const isNetworkEnabled = (
     scope: { readonly keyDomainId: string; readonly accountId: string },
     family: Parameters<typeof isStoredAccountNetworkEnabled>[3],
@@ -189,7 +241,7 @@ export function createBackgroundPortfolioCoordinator(
     rpcUrl: nearNetwork.rpcUrl
   })
   const nearTokenInventory = createFastNearAccountTokenClient({ chainId: nearNetwork.chainId })
-  const nearPortfolio = chains.get(parseChainId(nearNetwork.chainId).id)
+  const nearPortfolioCoordinator = chains.get(parseChainId(nearNetwork.chainId).id)
     ? new SingleChainPortfolioCoordinator({
         canCommit: () => runtimeActive,
         storageRepository,
@@ -199,9 +251,62 @@ export function createBackgroundPortfolioCoordinator(
         chainId: nearNetwork.chainId,
         family: 'near',
         isNetworkEnabled,
-        readSource: input =>
-          readNearPortfolioSource({ ...input, rpc: nearRpc, tokenInventory: nearTokenInventory })
+        readSource: async input => {
+          const customTokens = await syncNearCustomTokens(input.chainAccount)
+          const context = await loadActiveNearTransferContext(
+            storageRepository,
+            nearNetwork.chainId
+          ).catch(error => {
+            if (
+              error instanceof Error &&
+              error.message === 'Active NEAR Account has no derived implicit address'
+            ) {
+              return null
+            }
+            throw error
+          })
+          const activePrivateAccount =
+            context !== null &&
+            context.chainAccount.id === input.chainAccount.id &&
+            context.chainAccount.scope.accountId === input.chainAccount.scope.accountId &&
+            supportsNearPrivateExecution(context.keyDomainSource)
+          const portfolioInput = {
+            ...input,
+            rpc: nearRpc,
+            tokenInventory: nearTokenInventory,
+            ...(customTokens.length > 0 ? { customTokens } : {})
+          }
+          if (!activePrivateAccount || !context) {
+            return readNearPortfolioSource(portfolioInput)
+          }
+          if (!(await credentialSession.hasUnlockSession())) {
+            return Object.freeze({
+              chainAccount: input.chainAccount,
+              status: 'error' as const,
+              balances: Object.freeze([]),
+              errorCode: 'unknown' as const
+            })
+          }
+          const pea = await nearPeaSigner.deriveNearPea(
+            context.chainAccount.scope.keyDomainId,
+            context.accountIndex
+          )
+          return readNearPortfolioSource({
+            ...portfolioInput,
+            privateAddress: pea.address
+          })
+        }
       })
+    : undefined
+  const nearPortfolio = nearPortfolioCoordinator
+    ? {
+        readCachedActiveSource: async () => {
+          const source = await nearPortfolioCoordinator.readCachedActiveSource()
+          if (source) await syncNearCustomTokens(source.chainAccount)
+          return source
+        },
+        refreshActiveSource: () => nearPortfolioCoordinator.refreshActiveSource()
+      }
     : undefined
 
   const coordinator = new UnifiedPortfolioCoordinator({

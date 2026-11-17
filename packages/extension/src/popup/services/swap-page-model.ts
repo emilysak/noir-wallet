@@ -329,6 +329,22 @@ export function resolveSwapStatusPollingProvider(input: {
   return input.depositAddress ? 'near-intents' : null
 }
 
+export function formatMoveNetworkFee(input: {
+  readonly raw: string | null | undefined
+  readonly decimals: number
+  readonly symbol: string
+}): { readonly amount: string; readonly symbol: string } | null {
+  if (typeof input.raw !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(input.raw)) return null
+  if (!Number.isSafeInteger(input.decimals) || input.decimals < 0 || input.decimals > 36) {
+    return null
+  }
+  if (input.symbol.length === 0) return null
+  return Object.freeze({
+    amount: formatBaseUnitAmount(input.raw, input.decimals),
+    symbol: input.symbol
+  })
+}
+
 export function getPreparedSwapNetworkFee(
   prepared: PreparedQuoteDepositTransfer | null
 ): { readonly amount: string; readonly symbol: string } | null {
@@ -515,7 +531,12 @@ export function filterConfidentialFundingSourceTokens(
   if (!portfolio || !receiveTargets) return []
   return tokens.filter(token => {
     if (isZecToken(token)) return false
-    return resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets)?.family === 'evm'
+    const owned = resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets)
+    if (owned?.family === 'evm') return true
+    return (
+      (owned?.family === 'near' || owned?.family === 'solana') &&
+      owned.chain.chain.network?.kind === 'mainnet'
+    )
   })
 }
 
@@ -543,6 +564,14 @@ export function isPrivateSwapDestinationSupported(
   if (!portfolio || !isConfidentialSwapDestinationSupported(token)) return false
   if (isZecToken(token)) return Boolean(zcashAddresses?.shielded && zcashAddresses.transparent)
   const target = resolveWalletQuoteReceiveTarget(token, portfolio, receiveTargets)
+  if (target?.kind === 'near')
+    return target.chain.network?.kind === 'mainnet' && target.address.length > 0
+  if (target?.kind === 'solana') {
+    if (target.chain.network?.kind !== 'mainnet') return false
+    if (mode === 'main') return target.address.length > 0
+    const privateAddress = privateExecutionAddresses.get(target.chain.id)
+    return Boolean(privateAddress && privateAddress !== target.address)
+  }
   if (target?.kind !== 'evm') return false
   if (mode === 'main') return /^0x[0-9a-fA-F]{40}$/.test(target.address)
   const privateAddress = privateExecutionAddresses.get(target.chain.id)
@@ -608,6 +637,17 @@ export function resolveLockedWalletSwapSourceToken(input: {
   )
 }
 
+function isConfidentialFundingWalletDestination(
+  destination: WalletOwnedQuoteAsset | null
+): destination is WalletOwnedQuoteAsset {
+  if (!destination) return false
+  if (destination.family === 'evm') return true
+  return (
+    (destination.family === 'near' || destination.family === 'solana') &&
+    destination.chain.chain.network?.kind === 'mainnet'
+  )
+}
+
 export function resolveConfidentialFundingDestinationToken(input: {
   readonly tokens: readonly RheaSwapToken[]
   readonly destinationChain: string | null
@@ -622,7 +662,7 @@ export function resolveConfidentialFundingDestinationToken(input: {
       if (String(token.rheaChainId) !== input.destinationChain) return false
       if (!isConfidentialSwapDestinationSupported(token)) return false
       const destination = resolveWalletOwnedQuoteAsset(token, portfolio, input.receiveTargets)
-      if (destination?.family !== 'evm') return false
+      if (!isConfidentialFundingWalletDestination(destination)) return false
       return input.destinationAsset
         ? token.assetId === input.destinationAsset ||
             destination.asset.asset.id === input.destinationAsset

@@ -1,5 +1,4 @@
 import { getSolanaNetworkConfig } from '@/config/networks'
-import { parseSolanaPublicKey } from '@/core/chains/solana'
 import { getActiveChainEndpointSettings } from '@/core/chains/chain-endpoint-settings'
 import { resolveEvmNetworkCatalog } from '@/core/chains/evm-runtime-config'
 import {
@@ -15,10 +14,13 @@ import {
   isDeprecatedIntentsToken,
   resolveIntentsEvmChainId
 } from '@/core/services/intents-evm-assets'
+import { resolveIntentsWalletAsset } from '@/core/services/intents-wallet-assets'
 import type { SwapToken } from '@/core/services/intents-api'
 import { resolveManagedIntentsCatalogAsset } from './intents-asset-manager-client'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import { parseZcashAddress } from '@/core/address-book/address-book'
+import { parseNearAccountId } from '@/core/chains/near'
+import { parseSolanaPublicKey } from '@/core/chains/solana'
 import {
   formatBaseUnitDecimalAmount,
   formatDecimalAmount,
@@ -48,6 +50,8 @@ export function depositSourceAssetId(token: SwapToken, network: ChainDefinition)
       mapping.protocolAssetId === token.assetId && mapping.assetId.startsWith(`${network.id}/`)
   )
   if (bundled) return bundled.assetId
+  const intents = resolveIntentsWalletAsset(token, 'mainnet')
+  if (intents?.chainId === network.id) return intents.assetId
   const managed = resolveManagedIntentsCatalogAsset([token], token.assetId)
   return managed?.chainId === network.id ? managed.assetId : null
 }
@@ -57,6 +61,9 @@ export function depositTokenChainId(token: SwapToken): string | null {
   if (blockchain === 'zec' || blockchain === 'zcash') return getZcashChainId('mainnet')
   if (blockchain === 'sol' || blockchain === 'solana')
     return getSolanaNetworkConfig('mainnet').chainId
+  if (DEFAULT_NETWORK === 'mainnet' && blockchain === 'near') {
+    return resolveIntentsWalletAsset(token, 'mainnet')?.chainId ?? null
+  }
   return resolveIntentsEvmChainId(
     blockchain,
     resolveEvmNetworkCatalog('mainnet', getActiveChainEndpointSettings())
@@ -71,7 +78,11 @@ export function depositSourceNetworks(): readonly ChainDefinition[] {
   return createBuildAddressGatedChainRegistry(createInitialProductChainRegistry('mainnet', custom))
     .list()
     .filter(
-      chain => chain.family === 'evm' || chain.family === 'zcash' || chain.family === 'solana'
+      chain =>
+        chain.family === 'evm' ||
+        chain.family === 'zcash' ||
+        chain.family === 'near' ||
+        chain.family === 'solana'
     )
 }
 
@@ -147,8 +158,12 @@ export function defaultDepositRefundAddress(
   accountNetworks: readonly AccountNetworkView[]
 ): string {
   const accountNetwork = accountNetworks.find(item => item.chain.id === network?.id)
-  if (network?.family === 'evm' && accountNetwork?.privateExecutionAddress)
+  if (
+    (network?.family === 'evm' || network?.family === 'near') &&
+    accountNetwork?.privateExecutionAddress
+  ) {
     return accountNetwork.privateExecutionAddress
+  }
   if (network?.family === 'solana') {
     const mainAddress =
       accountNetwork?.addresses.find(address => address.preferredForReceive)?.value ??
@@ -163,7 +178,13 @@ export function defaultDepositRefundAddress(
     }
     return mainAddress ?? ''
   }
-  return accountNetwork?.addresses.find(address => address.privacy === 'transparent')?.value ?? ''
+  return (
+    accountNetwork?.addresses.find(
+      address => address.preferredForReceive && address.privacy === 'transparent'
+    )?.value ??
+    accountNetwork?.addresses.find(address => address.privacy === 'transparent')?.value ??
+    ''
+  )
 }
 
 export function depositRefundAddressError(
@@ -193,6 +214,14 @@ export function depositRefundAddressError(
         : 'Enter a transparent Zcash address'
     } catch {
       return 'Enter a valid transparent Zcash address'
+    }
+  }
+  if (network.family === 'near') {
+    try {
+      parseNearAccountId(value)
+      return null
+    } catch {
+      return 'Enter a valid NEAR account'
     }
   }
   return 'Select a supported network'

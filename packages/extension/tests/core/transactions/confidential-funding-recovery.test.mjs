@@ -1,7 +1,10 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
-import { ConfidentialFundingCoordinator } from '../../../src/background/confidential-funding-coordinator.ts'
+import {
+  ConfidentialFundingCoordinator,
+  directApprovalIntent
+} from '../../../src/background/confidential-funding-coordinator.ts'
 import { ConfidentialFundingApiError } from '../../../src/background/confidential-funding-api.ts'
 import { serializeConfidentialFundingPlan } from '../../../src/background/confidential-funding-store.ts'
 import {
@@ -20,6 +23,7 @@ import {
   getActivityDetailTitle,
   getActivityRouteTitle
 } from '../../../src/popup/components/transaction/multichain-activity-presentation.ts'
+import { getNearNetworkConfig, getSolanaNetworkConfig } from '../../../src/config/networks.ts'
 
 const scope = { keyDomainId: 'wallet:one', accountId: 'account:one' }
 const signerId = '0x1111111111111111111111111111111111111111'
@@ -158,9 +162,12 @@ async function harness(
     refreshes: 0,
     refreshTargets: [],
     statusRequests: [],
+    statusChainIds: [],
     originStatus: 'FAILED',
     statuses: withdraws.map(() => (phase === 'processing' ? 'PROCESSING' : 'PENDING_DEPOSIT')),
     settledOutputs: new Map(),
+    balances: [],
+    balancesByToken: {},
     session: {
       accessToken: 'token',
       refreshToken: 'refresh',
@@ -178,6 +185,14 @@ async function harness(
     historyAuthError: null,
     depositSignatures: 0,
     cancelledDeposits: 0,
+    quoteCalls: [],
+    quotesByDeposit: new Map(),
+    generateIntentCalls: 0,
+    generateIntentError: null,
+    signIntent: false,
+    identityAddress: undefined,
+    identityPea: undefined,
+    identityError: null,
     historyToken: {
       token: 'wallet-history-token',
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
@@ -250,8 +265,9 @@ async function harness(
       const sequence = Number(signedData.payload.split('-').at(-1))
       return { intentHash: `intent-${sequence}`, correlationId: `submit-${sequence}` }
     },
-    async getStatus(address) {
+    async getStatus(address, chainId) {
       state.statusRequests.push(address)
+      state.statusChainIds.push(chainId)
       if (state.statusError) throw state.statusError
       if (address === 'origin-deposit.near') return { status: state.originStatus }
       const sequence = initial.withdraws.find(row => row.depositAddress === address).sequence
@@ -271,8 +287,79 @@ async function harness(
           : {})
       }
     },
-    async getBalances() {
-      return []
+    async getBalances(accessToken) {
+      return state.balancesByToken[accessToken] ?? state.balances
+    },
+    async quote(input) {
+      const sequence = state.quoteCalls.length % 3
+      state.quoteCalls.push(input)
+      const deadline = new Date(state.now + 60_000).toISOString()
+      const depositAddress = `deposit-${sequence}.near`
+      const quoted = {
+        correlationId: `quote-${sequence}`,
+        quoteRequest: {
+          swapType: 'EXACT_INPUT',
+          confidentiality: 'basic',
+          originAsset: input.originAsset,
+          destinationAsset: input.destinationAsset,
+          amount: input.amountRaw,
+          refundTo: input.signerId,
+          depositType: input.depositType,
+          refundType: input.refundType,
+          recipient: input.recipient,
+          recipientType: input.recipientType,
+          slippageTolerance: input.slippageBps
+        },
+        quote: {
+          amountIn: input.amountRaw,
+          amountOut: input.amountRaw,
+          minAmountOut: input.amountRaw,
+          depositAddress,
+          deadline
+        }
+      }
+      state.quotesByDeposit.set(depositAddress, { quoted, amountRaw: input.amountRaw })
+      return quoted
+    },
+    async generateIntent(input) {
+      state.generateIntentCalls += 1
+      if (state.generateIntentError) {
+        const error = state.generateIntentError
+        state.generateIntentError = null
+        throw error
+      }
+      const saved = state.quotesByDeposit.get(input.depositAddress)
+      const nonceBytes = new Uint8Array(32)
+      nonceBytes[31] = state.generateIntentCalls
+      const message = JSON.stringify({
+        verifying_contract: 'intents.far',
+        signer_id: input.signerId,
+        deadline: saved.quoted.quote.deadline,
+        nonce: btoa(String.fromCharCode(...nonceBytes)),
+        intents: [
+          {
+            intent: 'transfer',
+            receiver_id: input.depositAddress,
+            tokens: {
+              [confidentialPrivateTokenId(saved.quoted.quoteRequest.originAsset)]: saved.amountRaw
+            }
+          }
+        ]
+      })
+      return {
+        intent:
+          input.standard === 'nep413'
+            ? {
+                standard: 'nep413',
+                payload: {
+                  message,
+                  recipient: 'intents.near',
+                  nonce: btoa(String.fromCharCode(...nonceBytes))
+                }
+              }
+            : { standard: input.standard ?? 'raw_ed25519', payload: message },
+        correlationId: `generated-${state.generateIntentCalls}`
+      }
     },
     async createAuthPayload() {
       return { payload: 'authorize-session' }
@@ -283,9 +370,10 @@ async function harness(
   }
   const signer = {
     async resolveIdentity() {
+      if (state.identityError) throw state.identityError
       return {
-        address: signerId,
-        peaAddress,
+        address: state.identityAddress ?? signerId,
+        peaAddress: state.identityPea ?? peaAddress,
         addressIndex: 0,
         context: {
           chainAccount: {
@@ -301,7 +389,21 @@ async function harness(
       }
       if (payload !== 'authorize-session') {
         state.intentSignatures += 1
-        throw new Error('Recovery must not re-sign withdraws')
+        if (!state.signIntent) throw new Error('Recovery must not re-sign withdraws')
+        const parsed = JSON.parse(payload)
+        return parsed.recipient
+          ? {
+              standard: 'nep413',
+              payload: parsed,
+              public_key: 'ed25519:key',
+              signature: 'ed25519:sig'
+            }
+          : {
+              standard: 'raw_ed25519',
+              payload,
+              public_key: 'ed25519:key',
+              signature: 'ed25519:sig'
+            }
       }
       state.authSignatures += 1
       return { standard: 'erc191', payload, signature: 'auth-signature' }
@@ -372,6 +474,172 @@ async function harness(
       }
     })
   return { initial, state, store, repository, restart }
+}
+
+async function nearDepositClusterHarness() {
+  const chainId = getNearNetworkConfig('mainnet').chainId
+  const assetId = `${chainId}/slip44:397`
+  const protocolAssetId = 'nep141:wrap.near'
+  const signerId = 'alice.near'
+  const peaAddress = 'ab'.repeat(32)
+  const keyDomainId = 'wallet:one'
+  const accountId = 'account:one'
+  const sourceAmountRaw = '2000'
+  const splitSourceAmounts = ['1000', '1000']
+  const withdraws = splitSourceAmounts.map((amount, sequence) => ({
+    sequence,
+    sourceAmountRaw: amount,
+    amountRaw: '990',
+    depositAddress: `deposit-${sequence}.near`,
+    destinationAddress: peaAddress,
+    destinationChain: 'near',
+    token: protocolAssetId,
+    deadline: 60_000,
+    status: 'PREVIEW'
+  }))
+  const plan = {
+    schemaVersion: 1,
+    planId: 'near-deposit-cluster',
+    transactionId: 'tx:confidential:near-deposit-cluster',
+    network: 'mainnet',
+    phase: 'prepared',
+    operation: 'cluster',
+    sourceDomain: 'public',
+    destinationDomain: 'private',
+    keyDomainId,
+    accountId,
+    source: {
+      chainId,
+      chainName: 'near',
+      assetId,
+      protocolAssetId,
+      amountRaw: sourceAmountRaw,
+      address: signerId
+    },
+    destination: {
+      chainId,
+      chainName: 'near',
+      assetId,
+      protocolAssetId,
+      address: peaAddress
+    },
+    signerId,
+    addressIndex: 0,
+    slippageBps: 100,
+    requiresDeposit: true,
+    confidentialBaselineRaw: sourceAmountRaw,
+    depositQuote: { quote: { amountOut: sourceAmountRaw } },
+    preparedDeposit: { commandId: 'near-prepared-deposit' },
+    approvalExpiresAt: 50_000,
+    expectedOutputRaw: '1980',
+    minimumOutputRaw: '1960',
+    splitSourceAmounts,
+    withdraws,
+    createdAt: now,
+    updatedAt: now
+  }
+  plan.approvalFingerprint = await fingerprintDirectConfidentialApproval({
+    network: plan.network,
+    keyDomainId: plan.keyDomainId,
+    accountId: plan.accountId,
+    operation: plan.operation,
+    sourceDomain: plan.sourceDomain,
+    destinationDomain: plan.destinationDomain,
+    source: plan.source,
+    destination: plan.destination,
+    signerId: plan.signerId,
+    addressIndex: plan.addressIndex,
+    slippageBps: plan.slippageBps,
+    expectedOutputRaw: plan.expectedOutputRaw,
+    minimumOutputRaw: plan.minimumOutputRaw,
+    expiresAt: plan.approvalExpiresAt,
+    depositQuote: plan.depositQuote,
+    preparedDeposit: plan.preparedDeposit,
+    withdraws: plan.withdraws
+  })
+  const plans = new Map()
+  const state = {
+    historyChallenges: 0,
+    depositSignatures: 0,
+    cancelledDeposits: 0,
+    identityChainIds: []
+  }
+  const store = {
+    async getPlan(id) {
+      return structuredClone(plans.get(id) ?? null)
+    },
+    async putPlan(value) {
+      plans.set(value.planId, serializeConfidentialFundingPlan(value))
+    },
+    async listPlans() {
+      return [...plans.values()].map(value => structuredClone(value))
+    },
+    async listExternalDeposits() {
+      return []
+    },
+    async getSession() {
+      return {
+        accessToken: 'token',
+        refreshToken: 'refresh',
+        expiresAt: 1_000_000,
+        refreshExpiresAt: 2_000_000,
+        signerId
+      }
+    },
+    async putSession() {},
+    async deleteSession() {},
+    async putBalances() {},
+    async getHistorySession() {
+      return null
+    },
+    async putHistorySession() {},
+    async deleteHistorySession() {}
+  }
+  const api = {
+    async createOrderAuthChallenge() {
+      state.historyChallenges += 1
+      throw new Error('Wallet history identity is invalid')
+    },
+    async getBalances() {
+      return []
+    }
+  }
+  const signer = {
+    async resolveIdentity(requestedChainId) {
+      state.identityChainIds.push(requestedChainId)
+      return {
+        address: signerId,
+        peaAddress,
+        addressIndex: 0,
+        context: {
+          chainAccount: {
+            scope: { keyDomainId, accountId, chainId }
+          }
+        }
+      }
+    },
+    async confirmTransaction() {
+      state.depositSignatures += 1
+      throw new Error('deposit signing reached')
+    },
+    async cancelTransaction() {
+      state.cancelledDeposits += 1
+    }
+  }
+  const coordinator = new ConfidentialFundingCoordinator({
+    network: 'mainnet',
+    api,
+    store,
+    signer,
+    repository: new SignedTransactionRepository(),
+    assets: { list: () => [] },
+    evmNetworks: [],
+    assetMappings: [],
+    now: () => now,
+    scheduleMonitoring: async () => {},
+    refreshPortfolio: async () => {}
+  })
+  return { plan, state, store, coordinator, chainId }
 }
 
 function directPreparationHarness(protocolTokens, getNativeZecActiveAccount) {
@@ -611,6 +879,7 @@ test.describe('confidential funding persisted recovery', () => {
     }
     const review = await h.coordinator.prepare(withdraw)
     expect(review).toMatchObject({ sourceAmountRaw: '100000', destinationAddress: recipient })
+    expect(review.sourceNetworkFee).toBeUndefined()
     expect(h.state.lastQuoteRequest).toMatchObject({
       originAsset: h.zcashProtocolId,
       destinationAsset: 'nep141:eth.omft.near',
@@ -657,6 +926,49 @@ test.describe('confidential funding persisted recovery', () => {
       recipientType: 'DESTINATION_CHAIN'
     })
     expect(h.state.identityChains.slice(-2)).toEqual(['eip155:1', 'eip155:1'])
+    const nearAsset = {
+      chainId: 'near:mainnet',
+      chainName: 'near',
+      assetId: 'near:mainnet/slip44:397',
+      protocolAssetId: 'nep141:wrap.near'
+    }
+    await expect(
+      h.coordinator.prepare({
+        ...h.request('1000'),
+        source: { ...nearAsset, amountRaw: '1000' },
+        destination: nearAsset
+      })
+    ).rejects.toThrow('request is invalid')
+    await expect(
+      h.coordinator.prepare({
+        ...h.request('1000'),
+        source: {
+          ...nearAsset,
+          chainId: 'near:testnet',
+          assetId: 'near:testnet/slip44:397',
+          amountRaw: '1000'
+        },
+        destination: { ...nearAsset, chainId: 'near:testnet', assetId: 'near:testnet/slip44:397' }
+      })
+    ).rejects.toThrow('EVM signing chain')
+    await expect(
+      h.coordinator.prepare({
+        ...h.request('1000'),
+        source: {
+          chainId: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+          chainName: 'solana',
+          assetId: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/slip44:501',
+          protocolAssetId: 'nep141:sol.omft.near',
+          amountRaw: '1000'
+        },
+        destination: {
+          chainId: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+          chainName: 'solana',
+          assetId: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/slip44:501',
+          protocolAssetId: 'nep141:sol.omft.near'
+        }
+      })
+    ).rejects.toThrow('EVM signing chain')
   })
 
   test('binds Confidential ZEC Move to the current account native receive address and reviewed purpose', async () => {
@@ -1325,14 +1637,14 @@ test.describe('confidential funding persisted recovery', () => {
       }),
       quote: async input => ({
         correlationId: 'quote-one',
-        quoteRequest: {
-          swapType: 'EXACT_INPUT',
-          confidentiality: 'basic',
-          originAsset: input.originAsset,
-          destinationAsset: input.destinationAsset,
-          amount: input.amountRaw,
-          refundTo: input.refundTo,
-          depositType: input.depositType,
+          quoteRequest: {
+            swapType: 'EXACT_INPUT',
+            confidentiality: 'basic',
+            originAsset: input.originAsset,
+            destinationAsset: input.destinationAsset,
+            amount: input.amountRaw,
+            refundTo: input.refundTo ?? input.signerId,
+            depositType: input.depositType,
           refundType: input.refundType,
           recipient: input.recipient,
           recipientType: input.recipientType,
@@ -1614,6 +1926,176 @@ test.describe('confidential funding persisted recovery', () => {
     })
     expect((await coordinator.continuePlan(customPlan.planId)).phase).toBe('ready')
     expect(state.broadcasts).toBe(2)
+  })
+
+  test('keeps a prepared NEAR or Solana deposit fee on the confirmation review', async () => {
+    const plans = new Map()
+    const nearChainId = getNearNetworkConfig('mainnet').chainId
+    const solanaChainId = getSolanaNetworkConfig('mainnet').chainId
+    const nearAssetId = `${nearChainId}/slip44:397`
+    const solanaAssetId = `${solanaChainId}/slip44:501`
+    const nearProtocolAssetId = 'nep141:wrap.near'
+    const solanaProtocolAssetId = 'nep141:sol.omft.near'
+    const nearAddress = 'alice.near'
+    const solanaAddress = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk'
+    const store = {
+      getPlan: async id => structuredClone(plans.get(id) ?? null),
+      listPlans: async () => [...plans.values()].map(value => structuredClone(value)),
+      putPlan: async value => {
+        plans.set(value.planId, structuredClone(value))
+      },
+      deletePlan: async id => {
+        plans.delete(id)
+      },
+      getSession: async () => null,
+      putBalances: async () => {}
+    }
+    const assets = [
+      {
+        asset: {
+          id: nearAssetId,
+          chainId: nearChainId,
+          kind: 'native',
+          namespace: 'slip44',
+          reference: '397'
+        },
+        metadata: { symbol: 'NEAR', decimals: 24 },
+        verification: 'verified'
+      },
+      {
+        asset: {
+          id: solanaAssetId,
+          chainId: solanaChainId,
+          kind: 'native',
+          namespace: 'slip44',
+          reference: '501'
+        },
+        metadata: { symbol: 'SOL', decimals: 9 },
+        verification: 'verified'
+      }
+    ]
+    const signer = {
+      resolveIdentity: async chainId => ({
+        address: chainId.startsWith('solana:') ? solanaAddress : nearAddress,
+        peaAddress: chainId.startsWith('solana:') ? `${'A'.repeat(43)}1` : 'ab'.repeat(32),
+        addressIndex: 0,
+        context: {
+          chainAccount: {
+            scope: { ...scope, chainId },
+            identity: {
+              kind: 'account-identifier',
+              value: chainId.startsWith('solana:') ? solanaAddress : nearAddress
+            }
+          }
+        }
+      }),
+      prepareChainDeposit: async ({ chainId }) => ({
+        commandId: 'command-chain',
+        payloadFingerprint: 'c'.repeat(64),
+        expiresAt: Date.now() + 600_000,
+        preparedTransfer: {
+          family: chainId.startsWith('solana:') ? 'solana' : 'near',
+          chainId,
+          networkFeeRaw: chainId.startsWith('solana:') ? '5000' : '446365125000000000000'
+        }
+      })
+    }
+    const coordinator = new ConfidentialFundingCoordinator({
+      network: 'mainnet',
+      api: {
+        getBalances: async () => [],
+        quote: async input => ({
+          correlationId: 'quote-chain',
+          quoteRequest: {
+            swapType: 'EXACT_INPUT',
+            confidentiality: 'basic',
+            originAsset: input.originAsset,
+            destinationAsset: input.destinationAsset,
+            amount: input.amountRaw,
+            refundTo: input.refundTo ?? input.signerId,
+            depositType: input.depositType,
+            refundType: input.refundType,
+            recipient: input.recipient,
+            recipientType: input.recipientType,
+            slippageTolerance: input.slippageBps
+          },
+          quote: {
+            amountIn: input.amountRaw,
+            amountOut: input.amountRaw,
+            minAmountOut: input.amountRaw,
+            depositAddress: 'deposit.near',
+            deadline: new Date(Date.now() + 300_000).toISOString()
+          }
+        })
+      },
+      store,
+      signer,
+      repository: new InMemoryTransactionRepository(),
+      assets: {
+        get: id => assets.find(entry => entry.asset.id === id),
+        list: chainId => assets.filter(entry => entry.asset.chainId === chainId)
+      },
+      evmNetworks: [],
+      assetMappings: [
+        { assetId: nearAssetId, protocolAssetId: nearProtocolAssetId },
+        { assetId: solanaAssetId, protocolAssetId: solanaProtocolAssetId }
+      ],
+      scheduleMonitoring: async () => {}
+    })
+    const nearReview = await coordinator.prepare({
+      network: 'mainnet',
+      ...scope,
+      operation: 'deposit',
+      sourceDomain: 'public',
+      destinationDomain: 'shield',
+      source: {
+        chainId: nearChainId,
+        chainName: 'near',
+        assetId: nearAssetId,
+        protocolAssetId: nearProtocolAssetId,
+        amountRaw: '1000'
+      },
+      destination: {
+        chainId: nearChainId,
+        chainName: 'near',
+        assetId: nearAssetId,
+        protocolAssetId: nearProtocolAssetId
+      },
+      slippageBps: 100
+    })
+    expect(nearReview.sourceNetworkFee).toEqual({
+      raw: '446365125000000000000',
+      symbol: 'NEAR',
+      decimals: 24
+    })
+    expect(nearReview.sourceEvmFee).toBeUndefined()
+    const solanaReview = await coordinator.prepare({
+      network: 'mainnet',
+      ...scope,
+      operation: 'cluster',
+      sourceDomain: 'public',
+      destinationDomain: 'private',
+      source: {
+        chainId: solanaChainId,
+        chainName: 'sol',
+        assetId: solanaAssetId,
+        protocolAssetId: solanaProtocolAssetId,
+        amountRaw: '1000'
+      },
+      destination: {
+        chainId: solanaChainId,
+        chainName: 'sol',
+        assetId: solanaAssetId,
+        protocolAssetId: solanaProtocolAssetId
+      },
+      slippageBps: 100
+    })
+    expect(solanaReview.sourceNetworkFee).toEqual({
+      raw: '5000',
+      symbol: 'SOL',
+      decimals: 9
+    })
+    expect(solanaReview.sourceEvmFee).toBeUndefined()
   })
 
   test('reserves Shield funds across concurrent prepares and releases cancelled or expired reviews', async () => {
@@ -2547,6 +3029,288 @@ test.describe('confidential funding persisted recovery', () => {
     expect(h.state.cancelledDeposits).toBe(1)
     expect(h.state.batchSubmissions).toBe(0)
     expect(h.state.intentSignatures).toBe(0)
+  })
+
+  test('polls NEAR and Solana Cluster deposits without an EVM receipt lookup', async () => {
+    const solanaAddress = '11111111111111111111111111111111'
+    const cases = [
+      {
+        chainId: getNearNetworkConfig('mainnet').chainId,
+        chainName: 'near',
+        statusChainId: 'near',
+        assetId: `${getNearNetworkConfig('mainnet').chainId}/slip44:397`,
+        protocolAssetId: 'nep141:wrap.near',
+        address: 'alice.near',
+        destination: 'bob.near'
+      },
+      {
+        chainId: getSolanaNetworkConfig('mainnet').chainId,
+        chainName: 'solana',
+        statusChainId: 'solana',
+        assetId: `${getSolanaNetworkConfig('mainnet').chainId}/slip44:501`,
+        protocolAssetId: 'nep141:sol.omft.near',
+        address: solanaAddress,
+        destination: solanaAddress
+      }
+    ]
+    for (const chain of cases) {
+      const h = await harness('deposit-confirming', false, true, true)
+      const plan = structuredClone(h.initial)
+      plan.source = {
+        ...plan.source,
+        chainId: chain.chainId,
+        chainName: chain.chainName,
+        assetId: chain.assetId,
+        protocolAssetId: chain.protocolAssetId,
+        address: chain.address
+      }
+      plan.destination = {
+        ...plan.destination,
+        chainId: chain.chainId,
+        chainName: chain.chainName,
+        assetId: chain.assetId,
+        protocolAssetId: chain.protocolAssetId,
+        address: chain.destination
+      }
+      plan.signerId = chain.address
+      plan.withdraws = plan.withdraws.map(row => ({
+        ...row,
+        destinationAddress: chain.destination,
+        destinationChain: chain.chainName,
+        token: chain.protocolAssetId
+      }))
+      plan.frozenRequest = {
+        ...plan.frozenRequest,
+        signer_id: chain.address,
+        from_chain: chain.chainName,
+        from_token: chain.protocolAssetId,
+        withdraws: plan.frozenRequest.withdraws.map(row => ({
+          ...row,
+          destination_address: chain.destination,
+          destination_chain: chain.chainName,
+          token: chain.protocolAssetId
+        }))
+      }
+      await h.store.putPlan(plan)
+      h.state.session = { ...h.state.session, signerId: chain.address }
+      h.state.originStatus = 'PROCESSING'
+      const continued = await h.restart().continuePlan(plan.planId)
+      expect(continued.phase).toBe('deposit-confirming')
+      expect(continued.errorStatus).toBeUndefined()
+      expect(h.state.statusRequests).toEqual(['origin-deposit.near'])
+      expect(h.state.statusChainIds).toEqual([chain.statusChainId])
+    }
+  })
+
+  function expiredDepositCluster(h, chain) {
+    const plan = structuredClone(h.initial)
+    plan.confidentialBaselineRaw = '0'
+    plan.frozenRequest = undefined
+    plan.requestFingerprint = undefined
+    // The receipt lookup needs a configured EVM client. Credit confirmation follows order status.
+    if (plan.preparedDeposit) {
+      const { transactionHash: _transactionHash, ...preparedDeposit } = plan.preparedDeposit
+      plan.preparedDeposit = preparedDeposit
+    }
+    plan.depositQuote = {
+      ...plan.depositQuote,
+      quote: { ...plan.depositQuote.quote, deadline: new Date(0).toISOString(), amountOut: '3000' }
+    }
+    if (!chain) return plan
+    plan.signerId = chain.address
+    plan.source = {
+      ...plan.source,
+      chainId: chain.chainId,
+      chainName: chain.chainName,
+      assetId: chain.assetId,
+      protocolAssetId: chain.protocolAssetId,
+      address: chain.address
+    }
+    plan.destination = {
+      ...plan.destination,
+      chainId: chain.chainId,
+      chainName: chain.chainName,
+      assetId: chain.assetId,
+      protocolAssetId: chain.protocolAssetId,
+      address: chain.destination
+    }
+    plan.withdraws = plan.withdraws.map(row => ({
+      ...row,
+      destinationAddress: chain.destination,
+      destinationChain: chain.chainName,
+      token: chain.protocolAssetId
+    }))
+    return plan
+  }
+
+  async function withApprovalFingerprint(plan) {
+    const stored = serializeConfidentialFundingPlan(plan)
+    return {
+      ...stored,
+      approvalFingerprint: await fingerprintDirectConfidentialApproval(directApprovalIntent(stored))
+    }
+  }
+
+  async function settledPlan(store, planId, phase) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const current = await store.getPlan(planId)
+      if (current.phase !== phase) return current
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    return store.getPlan(planId)
+  }
+
+  test('keeps an in-flight EVM Cluster on its legacy session after the deposit is credited', async () => {
+    const h = await harness('deposit-confirming', false, true, true)
+    const plan = expiredDepositCluster(h)
+    await h.store.putPlan(plan)
+    h.state.originStatus = 'SUCCESS'
+    h.state.balances = [
+      { tokenId: plan.source.protocolAssetId, available: '3000', source: 'private' }
+    ]
+    h.state.generateIntentError = new Error('stop after credit')
+    const continued = await h.restart().continuePlan(plan.planId)
+    expect(continued.phase).toBe('signing-withdraws')
+    expect(continued.errorStatus).not.toBe('DEPOSIT_AMOUNT_TOO_LOW')
+    expect(continued.phase).not.toBe('needs-auth')
+  })
+
+  for (const chain of [
+    {
+      name: 'NEAR',
+      chainId: getNearNetworkConfig('mainnet').chainId,
+      chainName: 'near',
+      protocolAssetId: 'nep141:wrap.near',
+      address: 'alice.near',
+      destination: 'ab'.repeat(32),
+      token: 'near-token'
+    },
+    {
+      name: 'Solana',
+      chainId: getSolanaNetworkConfig('mainnet').chainId,
+      chainName: 'solana',
+      protocolAssetId: 'nep141:sol.omft.near',
+      address: '11111111111111111111111111111111',
+      destination: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+      token: 'solana-token'
+    }
+  ]) {
+    test(`does not treat an EVM Shield session as a credited ${chain.name} Cluster deposit`, async () => {
+      const h = await harness('deposit-confirming', false, true, true)
+      const plan = await withApprovalFingerprint(
+        expiredDepositCluster(h, {
+          ...chain,
+          assetId: `${chain.chainId}/slip44:${chain.chainName === 'near' ? '397' : '501'}`
+        })
+      )
+      await h.store.putPlan(plan)
+      h.state.originStatus = 'SUCCESS'
+      h.state.balances = []
+      const paused = await h.restart().continuePlan(plan.planId)
+      expect(paused.phase).toBe('needs-auth')
+      expect(paused.resumePhase).toBe('deposit-confirming')
+      expect(paused.errorStatus).not.toBe('DEPOSIT_AMOUNT_TOO_LOW')
+      h.state.session = {
+        accessToken: chain.token,
+        refreshToken: 'refresh',
+        expiresAt: 1_000_000,
+        refreshExpiresAt: 2_000_000,
+        signerId: chain.address
+      }
+      h.state.balancesByToken[chain.token] = [
+        { tokenId: chain.protocolAssetId, available: '3000', source: 'private' }
+      ]
+      h.state.identityAddress = chain.address
+      h.state.identityPea = chain.destination
+      h.state.generateIntentError = new Error('stop after credit')
+      const coordinator = h.restart()
+      const resumed = await coordinator.confirm(plan.planId, plan.approvalFingerprint)
+      expect(resumed.phase).toBe('deposit-confirming')
+      const continued = await settledPlan(h.store, plan.planId, 'deposit-confirming')
+      expect(continued.phase).toBe('signing-withdraws')
+      expect(continued.errorStatus).not.toBe('DEPOSIT_AMOUNT_TOO_LOW')
+    })
+  }
+
+  test('retries an unsigned Solana Cluster after a local intent failure', async () => {
+    const chainId = getSolanaNetworkConfig('mainnet').chainId
+    const protocolAssetId = 'nep141:sol.omft.near'
+    const address = '11111111111111111111111111111111'
+    const destination = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+    const h = await harness('signing-withdraws', false, true, true)
+    const plan = structuredClone(h.initial)
+    plan.source = {
+      ...plan.source,
+      chainId,
+      chainName: 'solana',
+      assetId: `${chainId}/slip44:501`,
+      protocolAssetId,
+      address
+    }
+    plan.destination = {
+      ...plan.destination,
+      chainId,
+      chainName: 'solana',
+      assetId: `${chainId}/slip44:501`,
+      protocolAssetId,
+      address: destination
+    }
+    plan.signerId = address
+    plan.phase = 'signing-withdraws'
+    plan.frozenRequest = undefined
+    plan.withdraws = plan.withdraws.map(row => ({
+      ...row,
+      destinationAddress: destination,
+      destinationChain: 'solana',
+      token: protocolAssetId,
+      status: 'PREPARED',
+      signedPayload: undefined
+    }))
+    await h.store.putPlan(plan)
+    h.state.session = { ...h.state.session, signerId: address }
+    h.state.identityAddress = address
+    h.state.identityPea = destination
+    h.state.signIntent = true
+    h.state.generateIntentError = new Error('Shield withdraw intent payload is invalid')
+    const stalled = await h.restart().continuePlan(plan.planId)
+    expect(stalled.phase).toBe('signing-withdraws')
+    expect(stalled.frozenRequest).toBeUndefined()
+    expect(stalled.errorStatus).toBe('LOCAL_PROCESSING_FAILED')
+    expect(h.state.monitoring).toBe(1)
+    expect(h.state.generateIntentCalls).toBe(1)
+    const continued = await h.restart().continuePlan(plan.planId)
+    expect(continued.phase).toBe('processing')
+    expect(continued.errorStatus).toBeUndefined()
+    expect(continued.frozenRequest).toBeTruthy()
+    expect(h.state.generateIntentCalls).toBe(4)
+    expect(h.state.batchSubmissions).toBe(1)
+  })
+
+  test('does not reschedule an EVM direct withdraw after the same local failure', async () => {
+    const h = await harness('signing-withdraws', true)
+    h.state.identityError = new Error('Shield withdraw intent payload is invalid')
+    const stalled = await h.restart().continuePlan(h.initial.planId)
+    expect(stalled.phase).toBe('signing-withdraws')
+    expect(stalled.errorStatus).toBe('LOCAL_PROCESSING_FAILED')
+    expect(h.state.monitoring).toBe(0)
+    expect(h.state.generateIntentCalls).toBe(0)
+  })
+
+  test('confirms a NEAR deposit-backed Cluster without EVM history authentication', async () => {
+    const h = await nearDepositClusterHarness()
+    await h.store.putPlan(h.plan)
+    const confirmation = h.coordinator.confirm(h.plan.planId, h.plan.approvalFingerprint)
+    await expect(confirmation).rejects.toThrow('deposit signing reached')
+    await expect(confirmation).rejects.not.toThrow('Wallet history identity is invalid')
+    expect(h.state.historyChallenges).toBe(0)
+    expect(h.state.depositSignatures).toBe(1)
+    expect(h.state.cancelledDeposits).toBe(0)
+    expect(h.state.identityChainIds.length).toBeGreaterThan(0)
+    expect(h.state.identityChainIds.every(chainId => chainId === h.chainId)).toBe(true)
+    const failed = await h.store.getPlan(h.plan.planId)
+    expect(failed.phase).toBe('failed')
+    expect(failed.errorStatus).toBe('DEPOSIT_SIGNING_INTERRUPTED')
+    expect(failed.errorStatus).not.toBe('HISTORY_AUTH_REJECTED')
   })
 
   test('retains an attempted Cluster batch when history authentication is rejected', async () => {

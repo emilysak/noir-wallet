@@ -357,6 +357,134 @@ test.describe('Solana and NEAR address-only Portfolio', () => {
     expect(rpcReads).toBe(1)
   })
 
+  test('reads a saved custom NEP-141 with ft_balance_of when FastNear has not indexed it', async () => {
+    const implicit = '3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af'
+    const assetsWithCustomNear = createAssetRegistry(chains, [
+      ...filterAssetDefinitionsForChains(
+        getBundledInitialProductAssetDefinitions('testnet'),
+        chains
+      ),
+      {
+        chainId: nearChainId,
+        namespace: 'nep141',
+        reference: implicit,
+        kind: 'token',
+        metadata: { name: 'Custom Fungible', symbol: 'CSTM', decimals: 18 },
+        source: 'user-added',
+        verification: 'user-approved'
+      },
+      {
+        chainId: nearChainId,
+        namespace: 'nep141',
+        reference: nearUsdtContract,
+        kind: 'token',
+        metadata: { name: 'Tether USD', symbol: 'USDT', decimals: 6 },
+        source: 'protocol',
+        verification: 'trusted'
+      }
+    ])
+    const queried = []
+    await expect(
+      readNearPortfolioSource({
+        chainAccount: nearChainAccount,
+        assets: assetsWithCustomNear,
+        rpc: nearRpc({
+          getFungibleTokenBalance: async (contractId, requestedAccountId) => {
+            queried.push(contractId)
+            return {
+              contractId,
+              accountId: requestedAccountId,
+              amountRaw: '42',
+              blockHash,
+              blockHeight: 40
+            }
+          }
+        }),
+        tokenInventory: {
+          getFungibleTokenBalances: async () => [
+            { contractId: implicit, amountRaw: '1', lastUpdateBlockHeight: 3 }
+          ]
+        },
+        customTokens: [{ contractId: nearUsdtContract, symbol: 'USDT', decimals: 6 }],
+        now: () => 2_000
+      })
+    ).resolves.toMatchObject({
+      status: 'ready',
+      balances: [
+        { assetId: `${nearChainId}/slip44:397` },
+        { assetId: `${nearChainId}/nep141:${implicit}`, totalRaw: '42' },
+        { assetId: `${nearChainId}/nep141:${nearUsdtContract}`, totalRaw: '42' }
+      ]
+    })
+    expect(queried.sort()).toEqual([implicit, nearUsdtContract].sort())
+  })
+
+  test('splits NEAR native and tracked NEP-141 balances across the main account and PEA', async () => {
+    const privateAddress = 'b90b217039eed36162aef24e79ec0be08063210c65eff1a1c3d1af7c11fa8af4'
+    const queried = []
+    await expect(
+      readNearPortfolioSource({
+        chainAccount: nearChainAccount,
+        assets: assetsWithNearUsdt,
+        privateAddress,
+        rpc: nearRpc({
+          getAccount: async requestedAccountId => {
+            queried.push(['account', requestedAccountId])
+            return {
+              accountId: requestedAccountId,
+              amountRaw: requestedAccountId === privateAddress ? '7' : '100',
+              lockedRaw: '20',
+              storageUsage: 30,
+              codeHash: blockHash,
+              blockHash,
+              blockHeight: 40
+            }
+          },
+          getFungibleTokenBalance: async (contractId, requestedAccountId) => ({
+            contractId,
+            accountId: requestedAccountId,
+            amountRaw: requestedAccountId === privateAddress ? '3' : '5',
+            blockHash,
+            blockHeight: 40
+          })
+        }),
+        now: () => 2_000
+      })
+    ).resolves.toMatchObject({
+      status: 'ready',
+      balances: [
+        {
+          assetId: `${nearChainId}/slip44:397`,
+          totalRaw: '107',
+          mainRaw: '100',
+          privateRaw: '7',
+          spendableRaw: '107',
+          availableRaw: '107'
+        },
+        {
+          assetId: `${nearChainId}/nep141:${nearUsdtContract}`,
+          totalRaw: '8',
+          mainRaw: '5',
+          privateRaw: '3'
+        }
+      ]
+    })
+    expect(queried).toEqual([
+      ['account', nearAddress],
+      ['account', privateAddress]
+    ])
+
+    await expect(
+      readNearPortfolioSource({
+        chainAccount: nearChainAccount,
+        assets,
+        rpc: nearRpc(),
+        privateAddress: nearAddress,
+        now: () => 2_000
+      })
+    ).resolves.toMatchObject({ status: 'error', errorCode: 'unknown', balances: [] })
+  })
+
   test('persists generation-bound cache and composes both Beta chains through the unified model', async () => {
     const records = new Map()
     const get = async (requestedGenerationId, chainAccountId) =>

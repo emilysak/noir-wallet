@@ -1,14 +1,18 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
+import { RHEA_SWAP_CHAIN_CATALOG } from '../../../../src/core/services/rhea-swap/rhea-swap-model.ts'
 import {
   buildAddToPrivateEvmPath,
+  buildAddToPrivateMovePath,
   buildMoveToMainEvmPath,
+  buildMoveToMainMovePath,
   buildPrivateEvmTransferPath,
   buildPublicPrivateEvmSendPath,
   buildPrivateGasFundingPath,
   getEvmSendPrepareError,
   getEvmTokenFeeBalanceError,
+  isPrivateFundingDestinationChain,
   parsePublicPrivateEvmSendDraft,
   parsePublicPrivateEvmSwapRoute,
   resolveEvmNativeMaximumAmount
@@ -201,6 +205,177 @@ test.describe('EVM send validation', () => {
       review: '1',
       amount: '0.5'
     })
+  })
+
+  test('routes mainnet NEAR and Solana balance transfers through Swap review', () => {
+    const near = RHEA_SWAP_CHAIN_CATALOG.find(chain => chain.walletFamily === 'near')
+    const solana = RHEA_SWAP_CHAIN_CATALOG.find(chain => chain.walletFamily === 'solana')
+    const nearAsset = 'near:mainnet/slip44:397'
+    const solanaAsset = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501'
+    const implicit = 'ab'.repeat(32)
+    const solanaAddress = 'So11111111111111111111111111111111111111112'
+    const addNear = new URL(
+      buildAddToPrivateMovePath({
+        family: 'near',
+        assetId: nearAsset,
+        chainId: 'near:mainnet',
+        amount: '1.25',
+        maximum: true
+      }),
+      'https://wallet.invalid'
+    )
+    expect(near.apiChainId).toBe('near')
+    expect(String(near.tokenListChainId)).not.toBe(near.apiChainId)
+    expect(Object.fromEntries(addNear.searchParams)).toEqual({
+      privateDestination: '1',
+      balanceTransfer: '1',
+      destinationChain: near.apiChainId,
+      destinationAsset: nearAsset,
+      source: nearAsset,
+      amount: '1.25',
+      review: '1',
+      maximum: '1'
+    })
+    const moveNamed = new URL(
+      buildMoveToMainMovePath({
+        family: 'near',
+        assetId: nearAsset,
+        mainAddress: 'alice.near',
+        amount: '0.5'
+      }),
+      'https://wallet.invalid'
+    )
+    expect(Object.fromEntries(moveNamed.searchParams)).toEqual({
+      privateTransfer: '1',
+      balanceTransfer: '1',
+      source: nearAsset,
+      recipient: 'alice.near',
+      amount: '0.5',
+      review: '1'
+    })
+    expect(
+      new URL(
+        buildMoveToMainMovePath({
+          family: 'near',
+          assetId: nearAsset,
+          mainAddress: implicit,
+          amount: '0.5'
+        }),
+        'https://wallet.invalid'
+      ).searchParams.get('recipient')
+    ).toBe(implicit)
+    const addSolana = new URL(
+      buildAddToPrivateMovePath({
+        family: 'solana',
+        assetId: solanaAsset,
+        chainId: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+        amount: '2'
+      }),
+      'https://wallet.invalid'
+    )
+    expect(solana.apiChainId).toBe('solana')
+    expect(String(solana.tokenListChainId)).not.toBe(solana.apiChainId)
+    expect(Object.fromEntries(addSolana.searchParams)).toEqual({
+      privateDestination: '1',
+      balanceTransfer: '1',
+      destinationChain: solana.apiChainId,
+      destinationAsset: solanaAsset,
+      source: solanaAsset,
+      amount: '2',
+      review: '1'
+    })
+    const moveSolana = new URL(
+      buildMoveToMainMovePath({
+        family: 'solana',
+        assetId: solanaAsset,
+        mainAddress: solanaAddress,
+        amount: '2',
+        maximum: true
+      }),
+      'https://wallet.invalid'
+    )
+    expect(Object.fromEntries(moveSolana.searchParams)).toEqual({
+      privateTransfer: '1',
+      balanceTransfer: '1',
+      source: solanaAsset,
+      recipient: solanaAddress,
+      amount: '2',
+      review: '1',
+      maximum: '1'
+    })
+    expect(
+      buildAddToPrivateMovePath({
+        family: 'evm',
+        assetId: 'eip155:1/slip44:60',
+        chainId: 'eip155:1',
+        amount: '1'
+      })
+    ).toBe(
+      buildAddToPrivateEvmPath({
+        assetId: 'eip155:1/slip44:60',
+        chainId: 'eip155:1',
+        amount: '1'
+      })
+    )
+    expect(() =>
+      buildAddToPrivateEvmPath({
+        assetId: nearAsset,
+        chainId: 'near:mainnet',
+        amount: '1'
+      })
+    ).toThrow('Invalid EVM chain route')
+    expect(() =>
+      buildMoveToMainEvmPath({
+        assetId: nearAsset,
+        mainAddress: 'alice.near',
+        amount: '1'
+      })
+    ).toThrow('Invalid Main EVM address route')
+    expect(() =>
+      buildAddToPrivateMovePath({
+        family: 'near',
+        assetId: nearAsset,
+        chainId: 'eip155:1',
+        amount: '1'
+      })
+    ).toThrow('Invalid NEAR chain route')
+    expect(() =>
+      buildAddToPrivateMovePath({
+        family: 'near',
+        assetId: nearAsset,
+        chainId: 'near:testnet',
+        amount: '1'
+      })
+    ).toThrow('Invalid NEAR chain route')
+    expect(() =>
+      buildAddToPrivateMovePath({
+        family: 'solana',
+        assetId: solanaAsset,
+        chainId: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+        amount: '1'
+      })
+    ).toThrow('Invalid Solana chain route')
+    expect(() =>
+      buildMoveToMainMovePath({
+        family: 'near',
+        assetId: nearAsset,
+        mainAddress: '0x2222222222222222222222222222222222222222',
+        amount: '1'
+      })
+    ).toThrow('Invalid Main NEAR address route')
+    expect(() =>
+      buildMoveToMainMovePath({
+        family: 'solana',
+        assetId: solanaAsset,
+        mainAddress: 'alice.near',
+        amount: '1'
+      })
+    ).toThrow('Invalid Main Solana address route')
+    expect(isPrivateFundingDestinationChain('1')).toBe(true)
+    expect(isPrivateFundingDestinationChain('near')).toBe(true)
+    expect(isPrivateFundingDestinationChain('solana')).toBe(true)
+    expect(isPrivateFundingDestinationChain('btc')).toBe(false)
+    expect(isPrivateFundingDestinationChain('zcash')).toBe(false)
   })
 
   test('rejects malformed one-click transfer amounts', () => {

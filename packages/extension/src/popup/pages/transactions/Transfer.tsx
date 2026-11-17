@@ -105,6 +105,7 @@ import { openConfidentialActivity } from '@/popup/components/transaction/Confide
 import { resolveNativeRouteMaximum } from '@/popup/services/transfer-maximum'
 import {
   normalizePrivateBalanceTransferInput,
+  getNearMoveChainIds,
   getPrivateTransferChainIds,
   getTransferDomainBalanceRaw,
   resolvePrivateBalanceTransferAmount,
@@ -114,8 +115,8 @@ import {
   type TransferDomain
 } from '@/popup/services/private-balance-transfer'
 import {
-  buildAddToPrivateEvmPath,
-  buildMoveToMainEvmPath,
+  buildAddToPrivateMovePath,
+  buildMoveToMainMovePath,
   getEvmTokenFeeBalanceError
 } from '@/popup/services/evm-send-validation'
 import { initialMoveDraft, readMoveAssetHint, readMoveDraft } from './move-draft'
@@ -679,6 +680,10 @@ function TransferForm() {
         : [],
     [activeAccount]
   )
+  const nearChainIds = useMemo(
+    () => getNearMoveChainIds(activeAccount, currentNetwork === 'mainnet'),
+    [activeAccount, currentNetwork]
+  )
   const currentShieldBalances = useMemo(
     () => shieldBalances ?? shieldPortfolioBalances(portfolio),
     [shieldBalances, portfolio]
@@ -691,7 +696,8 @@ function TransferForm() {
       return chain &&
         chain.chain.capabilities.transaction.status === 'available' &&
         ((chain.chain.family === 'evm' && eligibleChainIds.includes(chain.chain.id)) ||
-          (chain.chain.family === 'solana' && solanaChainIds.includes(chain.chain.id)))
+          (chain.chain.family === 'solana' && solanaChainIds.includes(chain.chain.id)) ||
+          (chain.chain.family === 'near' && nearChainIds.includes(chain.chain.id)))
         ? [{ asset, chain }]
         : []
     })
@@ -710,7 +716,10 @@ function TransferForm() {
       ...fallbackAssets
         .filter(
           item =>
-            eligibleChainIds.includes(item.chain.chain.id) && !existing.has(item.asset.asset.id)
+            (eligibleChainIds.includes(item.chain.chain.id) ||
+              nearChainIds.includes(item.chain.chain.id) ||
+              (currentNetwork === 'mainnet' && solanaChainIds.includes(item.chain.chain.id))) &&
+            !existing.has(item.asset.asset.id)
         )
         .map(({ asset, chain }) => ({ asset, chain }))
     ]
@@ -722,6 +731,7 @@ function TransferForm() {
     currentNetwork,
     eligibleChainIds,
     solanaChainIds,
+    nearChainIds,
     shieldEntry
   ])
   const defaultAssetId = useMemo(
@@ -938,7 +948,17 @@ function TransferForm() {
   const mainAddress =
     accountNetwork?.addresses.find(address => address.preferredForReceive)?.value ?? ''
   const privateAddress = accountNetwork?.privateExecutionAddress ?? ''
-  const eligible = Boolean(selected && eligibleChainIds.includes(selected.chain.chain.id))
+  const mainnetConfidentialChain = Boolean(
+    currentNetwork === 'mainnet' &&
+    selected &&
+    (selected.chain.chain.family === 'near' || selected.chain.chain.family === 'solana')
+  )
+  const eligible = Boolean(
+    selected &&
+    (eligibleChainIds.includes(selected.chain.chain.id) ||
+      solanaChainIds.includes(selected.chain.chain.id) ||
+      nearChainIds.includes(selected.chain.chain.id))
+  )
   const direction: PrivateBalanceTransferDirection =
     from === 'private' ? 'private-to-main' : 'main-to-private'
   const publicRaw = selected ? getTransferDomainBalanceRaw(selected.asset, 'public') : null
@@ -970,10 +990,22 @@ function TransferForm() {
           mainAddress,
           privateAddress
         })
-      : null
+      : mainnetConfidentialChain && mainAddress
+        ? {
+            availableRaw: sourceRaw ?? '0',
+            sender: from === 'private' && privateAddress ? privateAddress : mainAddress,
+            recipient: to === 'private' && privateAddress ? privateAddress : mainAddress,
+            executionMode: (from === 'private' && privateAddress ? 'private' : 'main') as
+              | 'main'
+              | 'private',
+            sourceLabel: from === 'private' ? ('Private' as const) : ('Public' as const)
+          }
+        : null
   const supportedPair =
     (from === 'public' && to === 'private') || (from === 'private' && to === 'public')
-  const shieldPair = isShieldTransferRoute(from, to) && selected?.chain.chain.family === 'evm'
+  const shieldPair =
+    isShieldTransferRoute(from, to) &&
+    (selected?.chain.chain.family === 'evm' || mainnetConfidentialChain)
   const managedAsset = useMemo(
     () =>
       selected
@@ -992,7 +1024,9 @@ function TransferForm() {
     mainAddress !== privateAddress
   )
   const clusterPair =
-    (isClusterTransferRoute(from, to) && selected?.chain.chain.family === 'evm') ||
+    (isClusterTransferRoute(from, to) &&
+      (selected?.chain.chain.family === 'evm' ||
+        (selected?.chain.chain.family === 'near' && mainnetConfidentialChain))) ||
     solanaClusterPair
   const clusterSelected = method === 'cluster' && clusterPair
   const fundingRoute = Boolean(shieldPair || clusterSelected)
@@ -1412,16 +1446,20 @@ function TransferForm() {
       wallet.currentNetwork !== currentNetwork
     )
       return
+    const family = selected.chain.chain.family
+    if (family !== 'evm' && family !== 'near' && family !== 'solana') return
     navigate(
       direction === 'main-to-private'
-        ? buildAddToPrivateEvmPath({
+        ? buildAddToPrivateMovePath({
             assetId: selected.asset.asset.id,
             chainId: selected.chain.chain.id,
+            family,
             amount: currentAmount,
             maximum: maxSelected
           })
-        : buildMoveToMainEvmPath({
+        : buildMoveToMainMovePath({
             assetId: selected.asset.asset.id,
+            family,
             mainAddress,
             amount: currentAmount,
             maximum: maxSelected
@@ -1890,7 +1928,7 @@ function TransferForm() {
             ...(networkFee
               ? [
                   {
-                    label: 'Max network fee',
+                    label: activeShieldReview.sourceEvmFee ? 'Max network fee' : 'Network fee',
                     content: activeShieldReview.sourceEvmFee ? (
                       <NetworkFeeTierPicker
                         chainFamily="evm"
@@ -2017,6 +2055,7 @@ function TransferForm() {
   }
 
   if (
+    currentNetwork !== 'mainnet' &&
     selected?.chain.chain.family === 'solana' &&
     from !== 'shield' &&
     to !== 'shield' &&
@@ -2042,6 +2081,51 @@ function TransferForm() {
           <SendTransferForm
             family="solana"
             selection={{ asset: solanaAsset, chain: selected.chain }}
+            priceUsd={
+              assetPrices
+                ? (findAssetPrice(assetPrices, selected.asset.asset.id)?.priceUsd ?? null)
+                : null
+            }
+            executionMode={from === 'private' ? 'private' : 'main'}
+            initialRecipient={from === 'private' ? mainAddress : privateAddress}
+            initialAmount={amount}
+            onSubmitted={submission =>
+              navigate(
+                `/?tab=activity&transactionId=${encodeURIComponent(submission.value.graph.root.id)}`
+              )
+            }
+          />
+        </div>
+      </div>
+    )
+  }
+
+  if (
+    currentNetwork !== 'mainnet' &&
+    selected?.chain.chain.family === 'near' &&
+    from !== 'shield' &&
+    to !== 'shield' &&
+    mainAddress &&
+    privateAddress &&
+    mainAddress !== privateAddress &&
+    sourceRaw
+  ) {
+    const nearAsset = {
+      ...selected.asset,
+      balance: {
+        ...selected.asset.balance,
+        totalRaw: sourceRaw,
+        spendableRaw: sourceRaw,
+        availableRaw: sourceRaw
+      }
+    }
+    return (
+      <div className="page-container" data-wallet-mode={walletMode}>
+        <PageHeader title="Move" showBack onBack={goBack} />
+        <div className="page-content min-h-0">
+          <SendTransferForm
+            family="near"
+            selection={{ asset: nearAsset, chain: selected.chain }}
             priceUsd={
               assetPrices
                 ? (findAssetPrice(assetPrices, selected.asset.asset.id)?.priceUsd ?? null)

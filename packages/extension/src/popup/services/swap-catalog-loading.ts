@@ -15,6 +15,7 @@ import {
   EVM_USDC_PROTOCOL_ASSET_BY_CHAIN_ID,
   getEvmNativeProtocolAssetId
 } from '@/config/asset-market-assets'
+import { WNEAR_NEAR_ASSET } from '@/config/intents'
 import { getEvmNetworkConfigs } from '@/config/networks'
 
 export function getSwapCatalogDisplaySeeds(chainIds: readonly number[]): readonly RheaSwapToken[] {
@@ -365,6 +366,26 @@ export const ALL_DESTINATION_CHAIN_IDS = Object.freeze(
   ].map(chain => chain.tokenListChainId)
 )
 
+function swapCatalogKey(token: RheaSwapToken): string {
+  if (token.assetId === WNEAR_NEAR_ASSET && token.blockchain.toLowerCase() === 'near') {
+    return `${token.rheaChainId}:${WNEAR_NEAR_ASSET}`
+  }
+  return `${token.rheaChainId}:${token.rheaAddress}`
+}
+
+function nativeNearCatalogScore(token: RheaSwapToken): number {
+  const sources = token.sources?.map(source => source.toLowerCase()) ?? []
+  return (
+    (token.rheaAddress === 'wrap.near' ? 2 : 0) +
+    (sources.some(source => source === 'nearintents' || source === 'preswap-nearintents') ? 1 : 0)
+  )
+}
+
+function preferSwapCatalogToken(current: RheaSwapToken, next: RheaSwapToken): RheaSwapToken {
+  if (current.assetId !== WNEAR_NEAR_ASSET || next.assetId !== WNEAR_NEAR_ASSET) return next
+  return nativeNearCatalogScore(next) > nativeNearCatalogScore(current) ? next : current
+}
+
 export function mergeTokenCatalogs(
   ...catalogs: readonly (readonly RheaSwapToken[])[]
 ): readonly RheaSwapToken[] {
@@ -375,10 +396,12 @@ export function mergeTokenCatalogs(
       const address = /^[1-9]\d*$/.test(token.rheaChainId)
         ? token.rheaAddress.toLowerCase()
         : token.rheaAddress
-      tokens.set(
-        `${token.rheaChainId}:${address}:${token.assetId}:${token.decimals}:${token.isNative}`,
-        token
-      )
+      const key =
+        token.assetId === WNEAR_NEAR_ASSET && token.blockchain.toLowerCase() === 'near'
+          ? swapCatalogKey(token)
+          : `${token.rheaChainId}:${address}:${token.assetId}:${token.decimals}:${token.isNative}`
+      const existing = tokens.get(key)
+      tokens.set(key, existing ? preferSwapCatalogToken(existing, token) : token)
     }
   }
   const values = [...tokens.values()]

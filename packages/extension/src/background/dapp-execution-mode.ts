@@ -1,7 +1,11 @@
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import { supportsNearPrivateExecution } from '@/core/chains/near'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
-import { resolveSolanaRuntimeNetworkConfig } from '@/core/chains/solana-near-runtime-config'
+import {
+  resolveNearRuntimeNetworkConfig,
+  resolveSolanaRuntimeNetworkConfig
+} from '@/core/chains/solana-near-runtime-config'
 import { getEvmNetworkConfig } from '@/config/networks'
 import {
   DAppExecutionModeCoordinator,
@@ -11,6 +15,7 @@ import {
 } from '@/core/dapp/dapp-execution-mode'
 import { loadActiveEvmPortfolioContext } from '@/infrastructure/chains/evm'
 import { IndexedDbStorageV2Repository } from '@/infrastructure/persistence/repositories'
+import { loadActiveNearTransferContext } from './near-transfer'
 import { loadActiveSolanaTransferContext } from './solana-transfer'
 
 const DAPP_EXECUTION_MODE_STORAGE_KEY = 'dapp_execution_modes_v1'
@@ -53,11 +58,23 @@ export const dappExecutionModeCoordinator = new DAppExecutionModeCoordinator(
         storageRepository,
         resolveSolanaRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
       )
-      return (
+      if (
         solanaContext !== null &&
         supportsSolanaPrivateExecution(solanaContext.keyDomainSource) &&
         solanaContext.chainAccount.scope.keyDomainId === scope.keyDomainId &&
         solanaContext.chainAccount.scope.accountId === scope.accountId
+      ) {
+        return true
+      }
+      const nearContext = await loadActiveNearTransferContext(
+        storageRepository,
+        resolveNearRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
+      )
+      return (
+        nearContext !== null &&
+        supportsNearPrivateExecution(nearContext.keyDomainSource) &&
+        nearContext.chainAccount.scope.keyDomainId === scope.keyDomainId &&
+        nearContext.chainAccount.scope.accountId === scope.accountId
       )
     }
   }

@@ -225,6 +225,10 @@ it('maps supported RHEA destinations to wallet asset identities', () => {
     resolveRheaSwapCanonicalAssetId('nep141:zec.omft.near'),
     'bip122:00040fe8ec8471911baa1db1266ea15d/slip44:133'
   )
+  assert.equal(
+    resolveRheaSwapCanonicalAssetId('nep141:wrap.near'),
+    'near:mainnet/slip44:397'
+  )
   assert.equal(resolveRheaSwapCanonicalAssetId('unknown:asset'), null)
   assert.equal(resolveRheaSwapCanonicalAssetId(protocolUsdc, 'testnet'), null)
   assert.equal(

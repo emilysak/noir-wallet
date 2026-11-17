@@ -27,7 +27,11 @@ export function filterConfidentialPortfolioMappings(
 ): readonly ConfidentialPortfolioAssetMapping[] {
   const zcashAssetId = `${getZcashChainId(network)}/slip44:133`
   return mappings.filter(
-    mapping => mapping.assetId.startsWith('eip155:') || mapping.assetId === zcashAssetId
+    mapping =>
+      mapping.assetId.startsWith('eip155:') ||
+      mapping.assetId.startsWith('near:') ||
+      mapping.assetId.startsWith('solana:') ||
+      mapping.assetId === zcashAssetId
   )
 }
 
@@ -38,6 +42,37 @@ export const CONFIDENTIAL_PRIVATE_TREASURY_ACCOUNT_ID =
 
 export function confidentialPrivateTokenId(protocolAssetId: string): string {
   return `imt:${CONFIDENTIAL_PRIVATE_TREASURY_ACCOUNT_ID}:${protocolAssetId}`
+}
+
+export function mergeConfidentialSignerBalances(
+  groups: readonly (readonly Readonly<{
+    tokenId: string
+    available: string
+    source?: string
+  }>[])[]
+): readonly Readonly<{ tokenId: string; available: string; source: string }>[] {
+  const totals = new Map<string, { available: bigint; source: string }>()
+  for (const group of groups) {
+    for (const row of group) {
+      if (!row.tokenId || !/^(0|[1-9][0-9]*)$/.test(row.available)) continue
+      const amount = BigInt(row.available)
+      const current = totals.get(row.tokenId)
+      if (current) {
+        current.available += amount
+        continue
+      }
+      totals.set(row.tokenId, { available: amount, source: row.source ?? '' })
+    }
+  }
+  return Object.freeze(
+    [...totals].map(([tokenId, row]) =>
+      Object.freeze({
+        tokenId,
+        available: row.available.toString(),
+        source: row.source
+      })
+    )
+  )
 }
 
 export function getConfidentialAvailableForAsset(
@@ -137,12 +172,23 @@ function mergeAsset(
   snapshot?: Readonly<{ freshness: 'fresh' | 'stale'; updatedAt: number }>
 ): PortfolioAssetView {
   const mapping = mappings.find(candidate => candidate.assetId === asset.asset.id)
-  if (!mapping || asset.balance.mainRaw === undefined || asset.balance.privateRaw === undefined) {
-    return asset
-  }
+  if (!mapping) return asset
   const confidentialRaw = isDeprecatedIntentsToken({ assetId: mapping.protocolAssetId })
     ? '0'
     : (getConfidentialAvailableForAsset(balances, mapping.protocolAssetId) ?? '0')
+  // NEAR and Solana keep the protocol amount on confidentialRaw. Their on-chain split stays main + private.
+  if (asset.asset.id.startsWith('near:') || asset.asset.id.startsWith('solana:')) {
+    return Object.freeze({
+      ...asset,
+      balance: Object.freeze({
+        ...asset.balance,
+        confidentialRaw
+      })
+    })
+  }
+  if (asset.balance.mainRaw === undefined || asset.balance.privateRaw === undefined) {
+    return asset
+  }
   const previousConfidential = BigInt(asset.balance.confidentialRaw ?? '0')
   const privateOnchain = BigInt(
     asset.balance.privateOnchainRaw ??

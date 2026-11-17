@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
 import {
+  getNearMoveChainIds,
   normalizePrivateBalanceTransferInput,
   resolvePrivateBalanceTransferAmount,
   selectDefaultTransferAssetId
@@ -32,6 +33,38 @@ import {
   selectShieldMoveAssetId,
   shieldMovePreferenceKey
 } from '../../../src/popup/pages/transactions/move-preference.ts'
+
+test('keeps testnet NEAR Move on the direct PEA chain and mainnet NEAR available without one', () => {
+  const nearChain = chainId => ({
+    chain: { id: chainId, family: 'near' },
+    addresses: [{ preferredForReceive: true, value: 'alice.testnet' }],
+    privateExecutionAddress: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  })
+  const account = (walletSource, network = nearChain('near:testnet')) => ({
+    walletSource,
+    networks: [network]
+  })
+  expect(getNearMoveChainIds(account({ kind: 'software' }), false)).toEqual(['near:testnet'])
+  expect(
+    getNearMoveChainIds(account({ kind: 'private-key', chainFamily: 'near' }), false)
+  ).toEqual(['near:testnet'])
+  expect(getNearMoveChainIds(account({ kind: 'hardware', hardware: {} }), false)).toEqual([])
+  expect(
+    getNearMoveChainIds(account({ kind: 'private-key', chainFamily: 'eip155' }), false)
+  ).toEqual([])
+  expect(
+    getNearMoveChainIds(
+      account({ kind: 'software' }, { ...nearChain('near:testnet'), privateExecutionAddress: '' }),
+      false
+    )
+  ).toEqual([])
+  expect(
+    getNearMoveChainIds(
+      account({ kind: 'software' }, { ...nearChain('near:mainnet'), privateExecutionAddress: undefined }),
+      true
+    )
+  ).toEqual(['near:mainnet'])
+})
 
 test('restores a Move draft only for its wallet account and network', () => {
   const scope = 'mainnet:wallet-1:account-1:rpc-1'
@@ -780,4 +813,108 @@ test('lists official cross-network USDC destinations from the managed catalog', 
     source: { protocolAssetId: sourceProtocolId, amountRaw: '10000' },
     destination: { chainId: 'eip155:8453', protocolAssetId: destinationProtocolId }
   })
+})
+
+test('submits same-chain NEAR and Solana Shield sends and rejects cross-chain destinations', () => {
+  const fundingAsset = (family, chainId, assetId, protocolAssetId) => {
+    const chain = {
+      chain: {
+        id: chainId,
+        family,
+        capabilities: { transaction: { status: 'available' } }
+      }
+    }
+    return {
+      chain,
+      asset: {
+        asset: { id: assetId, chainId },
+        metadata: { symbol: protocolAssetId, decimals: 6, name: protocolAssetId }
+      },
+      managed: { assetId, chainId, protocolAssetId, blockchain: family }
+    }
+  }
+  const near = fundingAsset(
+    'near',
+    'near:mainnet',
+    'near:mainnet/slip44:397',
+    'nep141:wrap.near'
+  )
+  const nearUsdt = fundingAsset(
+    'near',
+    'near:mainnet',
+    'near:mainnet/nep141:usdt.tether-token.near',
+    'nep141:usdt.tether-token.near'
+  )
+  const solana = fundingAsset(
+    'solana',
+    'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+    'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501',
+    'nep141:sol.omft.near'
+  )
+  const evm = fundingAsset(
+    'evm',
+    'eip155:1',
+    'eip155:1/slip44:60',
+    'nep141:eth.omft.near'
+  )
+  const request = {
+    network: 'mainnet',
+    keyDomainId: 'wallet',
+    accountId: 'account',
+    amountRaw: '50000',
+    slippageBps: 50
+  }
+  expect(listShieldSendDestinations(near, [near, nearUsdt, solana, evm], 'mainnet')).toEqual([
+    near
+  ])
+  expect(
+    buildExternalShieldWithdrawRequest({
+      ...request,
+      recipient: 'alice.near',
+      source: near,
+      destination: near
+    })
+  ).toMatchObject({
+    operation: 'withdraw',
+    sourceDomain: 'shield',
+    destinationDomain: 'public',
+    externalRecipient: 'alice.near',
+    source: { chainId: 'near:mainnet', protocolAssetId: 'nep141:wrap.near', amountRaw: '50000' },
+    destination: { chainId: 'near:mainnet', protocolAssetId: 'nep141:wrap.near' }
+  })
+  expect(
+    buildExternalShieldWithdrawRequest({
+      ...request,
+      recipient: '11111111111111111111111111111111',
+      source: solana,
+      destination: solana
+    })
+  ).toMatchObject({
+    externalRecipient: '11111111111111111111111111111111',
+    destination: { chainId: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp' }
+  })
+  expect(() =>
+    buildExternalShieldWithdrawRequest({
+      ...request,
+      recipient: 'alice.near',
+      source: evm,
+      destination: near
+    })
+  ).toThrow('Shield withdrawal is unavailable')
+  expect(() =>
+    buildExternalShieldWithdrawRequest({
+      ...request,
+      recipient: '11111111111111111111111111111111',
+      source: near,
+      destination: solana
+    })
+  ).toThrow('Shield withdrawal is unavailable')
+  expect(() =>
+    buildExternalShieldWithdrawRequest({
+      ...request,
+      recipient: 'alice.near',
+      source: near,
+      destination: nearUsdt
+    })
+  ).toThrow('Shield withdrawal is unavailable')
 })
