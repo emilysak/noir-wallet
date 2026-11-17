@@ -58,7 +58,10 @@ export class SolanaWalletClientError extends Error {
 export interface SolanaWalletClient {
   readonly prepareTransfer: (
     intent: SolanaTransferIntent,
-    options?: Readonly<{ nearIntentsBinding?: NearIntentsTransactionBinding }>
+    options?: Readonly<{
+      nearIntentsBinding?: NearIntentsTransactionBinding
+      executionMode?: 'main' | 'private'
+    }>
   ) => Promise<SolanaTransferReview>
   readonly getPendingTransfer: (
     transactionId: TransactionId
@@ -297,7 +300,10 @@ export function createSolanaWalletClient(sendMessage: SolanaRuntimeMessenger): S
   return Object.freeze({
     prepareTransfer: async (
       intentValue: SolanaTransferIntent,
-      options?: Readonly<{ nearIntentsBinding?: NearIntentsTransactionBinding }>
+      options?: Readonly<{
+        nearIntentsBinding?: NearIntentsTransactionBinding
+        executionMode?: 'main' | 'private'
+      }>
     ) => {
       const intent = parseClientInput(() => parseIntent(intentValue))
       return send(
@@ -306,7 +312,8 @@ export function createSolanaWalletClient(sendMessage: SolanaRuntimeMessenger): S
           intent,
           ...(options?.nearIntentsBinding === undefined
             ? {}
-            : { nearIntentsBinding: options.nearIntentsBinding })
+            : { nearIntentsBinding: options.nearIntentsBinding }),
+          ...(options?.executionMode === undefined ? {} : { executionMode: options.executionMode })
         },
         value => parseReview(value, undefined, intent)
       )

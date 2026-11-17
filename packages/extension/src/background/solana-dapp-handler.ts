@@ -50,6 +50,7 @@ export interface AuthorizedSolanaDAppAccount {
   readonly context: ActiveNativeTransferContext
   readonly reference: { readonly walletId: KeyDomainId; readonly accountId: string }
   readonly address: string
+  readonly executionMode: 'main' | 'private'
 }
 
 export interface BackgroundSolanaDAppHandlerOptions {
@@ -273,7 +274,7 @@ export class BackgroundSolanaDAppHandler {
       )
     }
     const prepared = await this.options.signer.prepare(active.reference.walletId, {
-      kind: 'solana-transaction',
+      kind: active.executionMode === 'private' ? 'pea-solana-transaction' : 'solana-transaction',
       chainId: active.context.chainAccount.scope.chainId,
       accountIndex: active.context.accountIndex,
       transaction
@@ -312,6 +313,7 @@ export class BackgroundSolanaDAppHandler {
           current.reference.walletId !== active.reference.walletId ||
           current.reference.accountId !== active.reference.accountId ||
           current.context.chainAccount.id !== active.context.chainAccount.id ||
+          current.executionMode !== active.executionMode ||
           current.address !== active.address
         ) {
           throw new NativeTransferProviderError(
@@ -339,6 +341,7 @@ export class BackgroundSolanaDAppHandler {
           current.reference.walletId !== active.reference.walletId ||
           current.reference.accountId !== active.reference.accountId ||
           current.context.chainAccount.id !== active.context.chainAccount.id ||
+          current.executionMode !== active.executionMode ||
           current.address !== active.address
         ) {
           throw new NativeTransferProviderError(
@@ -414,7 +417,7 @@ export class BackgroundSolanaDAppHandler {
       )
     }
     const prepared = await this.options.signer.prepare(active.reference.walletId, {
-      kind: 'solana-message',
+      kind: active.executionMode === 'private' ? 'pea-solana-message' : 'solana-message',
       chainId: active.context.chainAccount.scope.chainId,
       accountIndex: active.context.accountIndex,
       message
@@ -450,6 +453,7 @@ export class BackgroundSolanaDAppHandler {
           current.reference.walletId !== active.reference.walletId ||
           current.reference.accountId !== active.reference.accountId ||
           current.context.chainAccount.id !== active.context.chainAccount.id ||
+          current.executionMode !== active.executionMode ||
           current.address !== active.address
         ) {
           throw new NativeTransferProviderError(

@@ -224,7 +224,9 @@ function AddressNetworkGroup({
         )
       : network.addresses
   const privateExecutionAddress =
-    network.chain.family === 'evm' ? network.privateExecutionAddress : undefined
+    network.chain.family === 'evm' || network.chain.family === 'solana'
+      ? network.privateExecutionAddress
+      : undefined
   const displayName = accountNetworkLabel(network)
   const singleAddress = addresses.length === 1 ? addresses[0] : null
   const singleBitcoinType =
@@ -520,7 +522,7 @@ export function AddressesList() {
         }
         if (requestedPrivacy) return []
         if (
-          network.chain.family === 'evm' &&
+          (network.chain.family === 'evm' || network.chain.family === 'solana') &&
           requestedMode === 'private' &&
           !network.privateExecutionAddress
         )
@@ -535,7 +537,8 @@ export function AddressesList() {
       return (receiveView ||
         mode === 'public' ||
         network.chain.family === 'zcash' ||
-        (network.chain.family === 'evm' && Boolean(network.privateExecutionAddress))) &&
+        (network.chain.family === 'evm' && Boolean(network.privateExecutionAddress)) ||
+        (network.chain.family === 'solana' && Boolean(network.privateExecutionAddress))) &&
         (!query ||
           `${accountNetworkLabel(network)} ${network.chain.displayName}`
             .toLowerCase()
@@ -556,7 +559,9 @@ export function AddressesList() {
     shieldedZcashOnly
   ])
   const hasPrivateAddresses = networks.some(
-    network => network.chain.family === 'evm' && Boolean(network.privateExecutionAddress)
+    network =>
+      (network.chain.family === 'evm' || network.chain.family === 'solana') &&
+      Boolean(network.privateExecutionAddress)
   )
   const evmNetworks = filteredNetworks.filter(network => network.chain.family === 'evm')
   const otherNetworks = filteredNetworks.filter(network => network.chain.family !== 'evm')

@@ -1,6 +1,7 @@
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import { projectExternalShieldDepositActivityGraph } from '@/core/services/confidential-funding'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import type { ChainEndpointSettings } from '@/core/chains/chain-endpoint-settings'
 import { keySourceSupportsChainFamily, resolveKeyDomain } from '@/core/accounts/application'
 import {
@@ -25,6 +26,7 @@ import { parseEvmAccountBinding } from '@/infrastructure/chains/evm'
 import { listEvmHistoryCacheByScope } from '@/infrastructure/chains/evm/evm-activity-history-cache'
 import { filterTrackedEvmTokenActivity } from '@/infrastructure/chains/evm/evm-indexed-activity'
 import { EvmMultichainSigningClient } from '@/infrastructure/keyring/multichain/evm-signing-client'
+import { SolanaMultichainSigningClient } from '@/infrastructure/keyring/multichain/solana-signing-client'
 import type { StorageV2ReadRepository } from '@/ports/repositories'
 import {
   IndexedDbStorageV2Repository,
@@ -37,6 +39,8 @@ import { ACTIVITY_HISTORY_CACHE_ITEM_LIMIT, ActivityHistoryCache } from './activ
 import { getBitcoinAccountPreferences } from './bitcoin-account-preferences'
 import type { BitcoinSupportedAddressType } from '@/core/chains/bitcoin'
 import { credentialSession } from './credential-session'
+import { loadActiveSolanaTransferContext } from './solana-transfer'
+import { parseSolanaPublicKey } from '@/infrastructure/chains/solana'
 import { ChromeConfidentialFundingStore } from './confidential-funding-store'
 
 const ACTIVITY_REFRESH_TTL_MS = 5 * 60_000
@@ -239,6 +243,7 @@ export function createBackgroundActivityCoordinator(
 ): ActivityCoordinator {
   const storageRepository = new IndexedDbStorageV2Repository()
   const peaSigner = new EvmMultichainSigningClient({ credentials: credentialSession })
+  const solanaPeaSigner = new SolanaMultichainSigningClient({ credentials: credentialSession })
   const historyCache = new ActivityHistoryCache(DEFAULT_NETWORK)
   const accountPreferences = getBitcoinAccountPreferences()
   const {
@@ -822,38 +827,64 @@ export function createBackgroundActivityCoordinator(
     loadSupplementalItems,
     loadCachedSupplementalItems,
     loadSupplementalHasMore,
-    ...(evmHistorySources.length > 0
-      ? {
-          loadPrivateExecutionAddresses: async (
-            scope: ActivityScope,
-            localGraphs: readonly TransactionGraph[]
-          ) => {
-            const account = await resolveEvmMainAddress(storageRepository, scope)
-            if (!account?.privateAvailable) return Object.freeze([])
-            if (await credentialSession.hasUnlockSession()) {
-              try {
-                const derived = await peaSigner.deriveGlobalPea(
-                  scope.keyDomainId,
-                  account.addressIndex
-                )
-                return Object.freeze([derived.address.toLowerCase()])
-              } catch (error) {
-                logger.warn(
-                  `Activity Private address derivation failed: ${formatLogError(error)}`,
-                  scope.keyDomainId,
-                  scope.accountId
-                )
-              }
+    loadPrivateExecutionAddresses: async (
+      scope: ActivityScope,
+      localGraphs: readonly TransactionGraph[]
+    ) => {
+      const addresses: string[] = []
+      if (evmHistorySources.length > 0) {
+        const account = await resolveEvmMainAddress(storageRepository, scope)
+        if (account?.privateAvailable) {
+          if (await credentialSession.hasUnlockSession()) {
+            try {
+              const derived = await peaSigner.deriveGlobalPea(
+                scope.keyDomainId,
+                account.addressIndex
+              )
+              addresses.push(derived.address.toLowerCase())
+            } catch (error) {
+              logger.warn(
+                `Activity Private address derivation failed: ${formatLogError(error)}`,
+                scope.keyDomainId,
+                scope.accountId
+              )
             }
+          }
+          if (addresses.length === 0) {
             const inferred = inferPrivateExecutionAddressFromLocalGraphs(
               localGraphs,
               scope,
               account.main
             )
-            return Object.freeze(inferred ? [inferred] : [])
+            if (inferred) addresses.push(inferred)
           }
         }
-      : {}),
+      }
+      const solana = await loadActiveSolanaTransferContext(storageRepository, solanaNetwork.chainId)
+      if (
+        solana &&
+        supportsSolanaPrivateExecution(solana.keyDomainSource) &&
+        solana.chainAccount.scope.keyDomainId === scope.keyDomainId &&
+        solana.chainAccount.scope.accountId === scope.accountId &&
+        (await credentialSession.hasUnlockSession())
+      ) {
+        try {
+          const derived = await solanaPeaSigner.deriveSolanaPea(
+            scope.keyDomainId,
+            solana.accountIndex
+          )
+          const main = parseSolanaPublicKey(solana.chainAccount.identity.value)
+          if (derived.address !== main) addresses.push(derived.address.toLowerCase())
+        } catch (error) {
+          logger.warn(
+            `Activity Solana Private address derivation failed: ${formatLogError(error)}`,
+            scope.keyDomainId,
+            scope.accountId
+          )
+        }
+      }
+      return Object.freeze(addresses)
+    },
     filterLocalGraphs
   })
 }

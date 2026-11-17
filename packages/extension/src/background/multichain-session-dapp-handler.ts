@@ -779,7 +779,9 @@ export class BackgroundMultichainSessionDAppHandler {
       }
 
       const evm = supported.find(scope => scope.family === 'evm')
-      const executionAccounts = evm ? await this.getScopeAccounts(origin, evm) : []
+      const solana = supported.find(scope => scope.family === 'solana')
+      const evmExecutionAccounts = evm ? await this.getScopeAccounts(origin, evm) : []
+      const solanaExecutionAccounts = solana ? await this.getScopeAccounts(origin, solana) : []
       const scopes: Record<string, Caip25Session['scopes'][string]> = Object.create(null)
       for (const scope of supported) {
         const available = snapshot.accounts[scope.chainId]
@@ -790,7 +792,16 @@ export class BackgroundMultichainSessionDAppHandler {
             account.reference.accountId === snapshot.activeReference?.accountId
         )
         // An unavailable private identity must never fall back to Main addresses.
-        if (scope.family === 'evm' && snapshot.executionMode === 'private') {
+        const executionAccounts =
+          scope.family === 'evm'
+            ? evmExecutionAccounts
+            : scope.family === 'solana'
+              ? solanaExecutionAccounts
+              : []
+        if (
+          (scope.family === 'evm' || scope.family === 'solana') &&
+          snapshot.executionMode === 'private'
+        ) {
           addresses =
             active &&
             executionAccounts.length === 1 &&

@@ -1330,7 +1330,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   )
   const sourcePrivateExecutionAddress = useMemo(
     () =>
-      privateExecutionSupported && walletSourceQuoteTarget?.kind === 'evm'
+      privateExecutionSupported &&
+      (walletSourceQuoteTarget?.kind === 'evm' || walletSourceQuoteTarget?.kind === 'solana')
         ? storageV2Account?.networks.find(
             network => network.chain.id === walletSourceQuoteTarget.chain.id
           )?.privateExecutionAddress
@@ -1365,7 +1366,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
     ? 'main'
     : privateTransferRequested && privateExecutionSupported
       ? 'private'
-      : !isPrivateFunding && sourceMode === 'private' && walletOwnedSourceBase?.family === 'evm'
+      : !isPrivateFunding &&
+          sourceMode === 'private' &&
+          (walletOwnedSourceBase?.family === 'evm' || walletOwnedSourceBase?.family === 'solana')
         ? 'private'
         : resolveSwapExecutionSourceMode({
             requestedMode: sourceMode,

@@ -2,6 +2,7 @@ import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import type { ChainEndpointSettings } from '@/core/chains/chain-endpoint-settings'
 import { resolveSolanaRuntimeNetworkConfig } from '@/core/chains/solana-near-runtime-config'
 import { parseAccountId } from '@/core/accounts/domain'
+import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import { parseKeyDomainId } from '@/core/keyring/domain'
 import { parseSigningCommandId, type SigningCommandId } from '@/core/keyring/ports'
 import type {
@@ -212,7 +213,10 @@ export interface RheaSwapSolanaCoordinatorOptions {
     RheaSwapService,
     'readSolanaTransactionPlan' | 'recordTransactionSubmission' | 'reportSubmission' | 'discard'
   >
-  readonly signer: Pick<SolanaMultichainSigningClient, 'prepare' | 'confirm' | 'cancel'>
+  readonly signer: Pick<
+    SolanaMultichainSigningClient,
+    'prepare' | 'confirm' | 'cancel' | 'deriveSolanaPea'
+  >
   readonly rpc: Pick<SolanaBroadcastRpc, 'broadcastSignedTransaction'> &
     Pick<SolanaReadRpc, 'getSignatureStatus'>
   readonly pending: RheaSwapSolanaPendingStore
@@ -239,7 +243,23 @@ export class RheaSwapSolanaCoordinator {
   ): Promise<RheaSwapSolanaTransactionReview> {
     const plan = await this.options.service.readSolanaTransactionPlan(quoteHandle)
     const binding = parseRheaSwapTransactionBinding(bindingValue)
-    const { context, sender } = await this.loadSupportedContext()
+    const { context, sender: mainSender } = await this.loadSupportedContext()
+    let sender = mainSender
+    let signingKind: 'solana-transaction' | 'pea-solana-transaction' = 'solana-transaction'
+    if (binding.sender !== mainSender) {
+      if (!supportsSolanaPrivateExecution(context.keyDomainSource)) {
+        throw new Error('Solana private execution is unavailable')
+      }
+      const pea = await this.options.signer.deriveSolanaPea(
+        context.chainAccount.scope.keyDomainId,
+        context.accountIndex
+      )
+      if (pea.address === mainSender || binding.sender !== pea.address) {
+        throw new Error('RHEA Swap Solana binding does not match its build')
+      }
+      sender = pea.address
+      signingKind = 'pea-solana-transaction'
+    }
     this.assertBinding(plan, binding, sender)
     if (plan.format.toLowerCase() !== 'base64') {
       throw new Error('RHEA Swap Solana transaction format is not supported')
@@ -256,7 +276,7 @@ export class RheaSwapSolanaCoordinator {
       throw new Error('RHEA Swap Solana transaction size does not match its metadata')
     }
     const prepared = await this.options.signer.prepare(context.chainAccount.scope.keyDomainId, {
-      kind: 'solana-transaction',
+      kind: signingKind,
       chainId: context.chainAccount.scope.chainId,
       accountIndex: context.accountIndex,
       transaction: plan.transaction

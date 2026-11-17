@@ -35,6 +35,7 @@ import {
 import type { SolanaSigningPreparePayload } from './signing-adapter-solana'
 import {
   assertExactKeys,
+  parseRawSolanaPeaAccount,
   readBoolean,
   readLiteral,
   readRecord,
@@ -55,6 +56,14 @@ export type SolanaMessageSigningPreparePayload = Extract<
   SolanaSigningPreparePayload,
   { readonly kind: 'solana-message' }
 >
+
+export interface SolanaPeaAccount {
+  readonly address: string
+  readonly publicKey: string
+  readonly curve: 'ed25519'
+  readonly derivationScheme: 'pea_v2'
+  readonly parent: Readonly<{ readonly accountIndex: number }>
+}
 
 export interface SolanaSigningCredentialBindingProvider {
   readonly getCredentialBinding: (
@@ -96,7 +105,10 @@ function parsePreparedSolanaSigning(
   if (record.chainId !== payload.chainId) {
     throw new Error('Prepared Solana signing chain does not match the request')
   }
-  const operation = payload.kind === 'solana-transaction' ? 'transaction' : 'message'
+  const operation =
+    payload.kind === 'solana-transaction' || payload.kind === 'pea-solana-transaction'
+      ? 'transaction'
+      : 'message'
   readLiteral(record.operation, [operation], 'Solana signing operation')
   const fingerprint = readRecord(record.payloadFingerprint, 'Solana signing payload fingerprint')
   assertExactKeys(fingerprint, ['algorithm', 'digestHex'], [], 'Solana signing fingerprint')
@@ -215,6 +227,32 @@ export class SolanaMultichainSigningClient {
     )
   }
 
+  async deriveSolanaPea(
+    keyDomainId: KeyDomainId,
+    accountIndex: number,
+    signal?: AbortSignal
+  ): Promise<SolanaPeaAccount> {
+    const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
+    return this.commandClient.execute(
+      {
+        operation: 'account.derive-public',
+        binding,
+        payload: { family: 'solana-pea', accountIndex },
+        signal
+      },
+      value => {
+        const account = parseRawSolanaPeaAccount(value, accountIndex)
+        return Object.freeze({
+          address: account.address,
+          publicKey: account.publicKey,
+          curve: account.curve,
+          derivationScheme: account.derivationScheme,
+          parent: account.parent
+        })
+      }
+    )
+  }
+
   async prepare(
     keyDomainId: KeyDomainId,
     payload: SolanaSigningPreparePayload,
@@ -314,7 +352,10 @@ export class SolanaMultichainSigningClient {
     }
     const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
     let workerPayload = payload
-    if (payload.kind === 'solana-transaction' && this.options.rpc) {
+    if (
+      (payload.kind === 'solana-transaction' || payload.kind === 'pea-solana-transaction') &&
+      this.options.rpc
+    ) {
       await this.options.rpc.assertExpectedChain(signal)
       const envelope = parseSolanaTransactionEnvelope(payload.transaction)
       const simulationPromise = this.options.rpc

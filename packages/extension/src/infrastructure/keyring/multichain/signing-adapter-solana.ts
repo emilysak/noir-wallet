@@ -58,6 +58,11 @@ export interface SolanaTransactionReviewContext {
   readonly lookupTables: readonly SolanaResolvedAddressLookupTable[]
 }
 
+export interface SolanaPeaSigningBinding {
+  readonly expectedAddress: string
+  readonly mainAddress: string
+}
+
 export type SolanaSigningPreparePayload =
   | Readonly<{
       kind: 'solana-transaction'
@@ -67,7 +72,20 @@ export type SolanaSigningPreparePayload =
       reviewContext?: SolanaTransactionReviewContext
     }>
   | Readonly<{
+      kind: 'pea-solana-transaction'
+      chainId: ChainId
+      accountIndex: number
+      transaction: string
+      reviewContext?: SolanaTransactionReviewContext
+    }>
+  | Readonly<{
       kind: 'solana-message'
+      chainId: ChainId
+      accountIndex: number
+      message: Uint8Array
+    }>
+  | Readonly<{
+      kind: 'pea-solana-message'
       chainId: ChainId
       accountIndex: number
       message: Uint8Array
@@ -172,10 +190,10 @@ export function parseSolanaSigningPreparePayload(value: unknown): SolanaSigningP
   const record = readRecord(value, 'signing.prepare payload')
   const kind = readLiteral(
     record.kind,
-    ['solana-transaction', 'solana-message'],
+    ['solana-transaction', 'pea-solana-transaction', 'solana-message', 'pea-solana-message'],
     'signing.prepare kind'
   )
-  if (kind === 'solana-transaction') {
+  if (kind === 'solana-transaction' || kind === 'pea-solana-transaction') {
     assertExactKeys(
       record,
       ['kind', 'chainId', 'accountIndex', 'transaction'],
@@ -349,12 +367,41 @@ export function interpretSolanaInstruction(
   return Object.freeze({ kind: 'unrecognized' })
 }
 
+function assertPreparedSolanaAccount(
+  account: RawDerivedEd25519Account,
+  chainId: string,
+  accountIndex: number,
+  imported: boolean,
+  pea: SolanaPeaSigningBinding | undefined
+): void {
+  if (!pea) {
+    assertRawEd25519AccountMatches(account, 'solana', chainId, accountIndex, imported)
+    return
+  }
+  // The prepared PEA account is an imported ed25519 key. Parent index is bound by the
+  // derived address, and that address must stay distinct from the main Solana account.
+  if (
+    account.accountId !== `${chainId}:${account.address}` ||
+    account.derivationScheme !== 'imported' ||
+    account.derivationPath !== 'm' ||
+    account.address !== pea.expectedAddress ||
+    account.publicKey !== pea.expectedAddress ||
+    account.address === pea.mainAddress
+  ) {
+    throw new Error('Prepared Solana PEA signer does not match its parent account')
+  }
+}
+
 async function adaptSolanaTransaction(
   raw: unknown,
-  payload: Extract<SolanaSigningPreparePayload, { kind: 'solana-transaction' }>,
+  payload: Extract<
+    SolanaSigningPreparePayload,
+    { kind: 'solana-transaction' | 'pea-solana-transaction' }
+  >,
   commandId: SigningCommandId,
   expiresAt: number,
-  imported: boolean
+  imported: boolean,
+  pea: SolanaPeaSigningBinding | undefined
 ): Promise<AdaptedSolanaPreparedSigning> {
   const prepared = parseRawPreparedValue(raw, 'PreparedSolanaTransaction')
   assertExactKeys(
@@ -364,7 +411,13 @@ async function adaptSolanaTransaction(
     'prepared'
   )
   const account = parseRawEd25519Account(prepared.value.account, 'solana')
-  assertRawEd25519AccountMatches(account, 'solana', payload.chainId, payload.accountIndex, imported)
+  assertPreparedSolanaAccount(
+    account,
+    payload.chainId,
+    payload.accountIndex,
+    imported,
+    payload.kind === 'pea-solana-transaction' ? pea : undefined
+  )
   const rawSummary = readRecord(prepared.value.summary, 'PreparedSolanaTransaction.summary')
   assertExactKeys(
     rawSummary,
@@ -597,15 +650,22 @@ async function adaptSolanaTransaction(
 
 async function adaptSolanaMessage(
   raw: unknown,
-  payload: Extract<SolanaSigningPreparePayload, { kind: 'solana-message' }>,
+  payload: Extract<SolanaSigningPreparePayload, { kind: 'solana-message' | 'pea-solana-message' }>,
   commandId: SigningCommandId,
   expiresAt: number,
-  imported: boolean
+  imported: boolean,
+  pea: SolanaPeaSigningBinding | undefined
 ): Promise<AdaptedSolanaPreparedSigning> {
   const prepared = parseRawPreparedValue(raw, 'PreparedSolanaMessage')
   assertExactKeys(prepared.value, ['requestId', 'account', 'summary'], [], 'prepared')
   const account = parseRawEd25519Account(prepared.value.account, 'solana')
-  assertRawEd25519AccountMatches(account, 'solana', payload.chainId, payload.accountIndex, imported)
+  assertPreparedSolanaAccount(
+    account,
+    payload.chainId,
+    payload.accountIndex,
+    imported,
+    payload.kind === 'pea-solana-message' ? pea : undefined
+  )
   const rawSummary = readRecord(prepared.value.summary, 'PreparedSolanaMessage.summary')
   assertExactKeys(
     rawSummary,
@@ -652,13 +712,22 @@ export async function adaptSolanaPreparedSigning(
   payload: SolanaSigningPreparePayload,
   commandId: SigningCommandId,
   expiresAt: number,
-  imported: boolean
+  imported: boolean,
+  pea?: SolanaPeaSigningBinding
 ): Promise<AdaptedSolanaPreparedSigning> {
+  if (
+    (payload.kind === 'pea-solana-transaction' || payload.kind === 'pea-solana-message') &&
+    !pea
+  ) {
+    throw new Error('Solana PEA signing binding is missing')
+  }
   switch (payload.kind) {
     case 'solana-transaction':
-      return adaptSolanaTransaction(raw, payload, commandId, expiresAt, imported)
+    case 'pea-solana-transaction':
+      return adaptSolanaTransaction(raw, payload, commandId, expiresAt, imported, pea)
     case 'solana-message':
-      return adaptSolanaMessage(raw, payload, commandId, expiresAt, imported)
+    case 'pea-solana-message':
+      return adaptSolanaMessage(raw, payload, commandId, expiresAt, imported, pea)
   }
 }
 
@@ -668,7 +737,8 @@ export function adaptSolanaSignedResult(
   account: RawDerivedEd25519Account
 ): SigningResult {
   switch (kind) {
-    case 'solana-transaction': {
+    case 'solana-transaction':
+    case 'pea-solana-transaction': {
       const signed = parseRawSignedSolanaTransaction(raw)
       return Object.freeze({
         kind: 'signed-payload',
@@ -676,7 +746,8 @@ export function adaptSolanaSignedResult(
         transactionId: signed.signature
       })
     }
-    case 'solana-message': {
+    case 'solana-message':
+    case 'pea-solana-message': {
       const signed = parseRawSignedSolanaMessage(raw)
       if (signed.publicKey !== account.publicKey)
         throw new Error('Solana signed message public key mismatch')

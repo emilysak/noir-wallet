@@ -62,6 +62,7 @@ export function SolanaSendForm({
   priceUsd,
   initialRecipient,
   initialAmount,
+  executionMode = 'main',
   onDraftChange,
   onSubmitted
 }: {
@@ -69,6 +70,7 @@ export function SolanaSendForm({
   readonly priceUsd: string | null
   readonly initialRecipient?: string
   readonly initialAmount?: string
+  readonly executionMode?: 'main' | 'private'
   readonly onDraftChange?: (
     assetId: string,
     draft: Readonly<{ recipient: string; amount: string }>
@@ -87,7 +89,23 @@ export function SolanaSendForm({
   const [approving, setApproving] = useState(false)
   const [review, setReview] = useState<PreparedReview | null>(null)
   const pendingReview = useRef<SolanaTransferReview | null>(null)
-  const asset = selection.asset
+  const sourceAsset = selection.asset
+  const executionRaw =
+    executionMode === 'private'
+      ? (sourceAsset.balance.privateRaw ?? '0')
+      : (sourceAsset.balance.mainRaw ?? sourceAsset.balance.availableRaw)
+  const asset =
+    executionRaw === sourceAsset.balance.availableRaw
+      ? sourceAsset
+      : {
+          ...sourceAsset,
+          balance: {
+            ...sourceAsset.balance,
+            totalRaw: executionRaw,
+            spendableRaw: executionRaw,
+            availableRaw: executionRaw
+          }
+        }
   const chain = selection.chain
   const networkName = formatPortfolioNetworkName(chain)
 
@@ -207,11 +225,14 @@ export function SolanaSendForm({
     }
     let value: SolanaTransferReview | null = null
     try {
-      value = await solanaWalletClient.prepareTransfer({
-        assetId: asset.asset.id,
-        recipient: parsedRecipient,
-        amountRaw
-      })
+      value = await solanaWalletClient.prepareTransfer(
+        {
+          assetId: asset.asset.id,
+          recipient: parsedRecipient,
+          amountRaw
+        },
+        { executionMode }
+      )
       const feeLimit = value.graph.root.intent?.feeLimit
       if (
         feeLimit?.assetId !== `${chain.chain.id}/slip44:501` ||
@@ -223,7 +244,14 @@ export function SolanaSendForm({
     } finally {
       if (value) await solanaWalletClient.rejectTransfer(value.graph.root.id).catch(() => {})
     }
-  }, [amountRaw, amountWithinBalance, asset.asset.id, chain.chain.id, parsedRecipient])
+  }, [
+    amountRaw,
+    amountWithinBalance,
+    asset.asset.id,
+    chain.chain.id,
+    executionMode,
+    parsedRecipient
+  ])
   const feePreview = useTransferFeePreview({
     enabled:
       amountWithinBalance &&
@@ -242,11 +270,14 @@ export function SolanaSendForm({
     setError(null)
     let value: SolanaTransferReview | null = null
     try {
-      value = await solanaWalletClient.prepareTransfer({
-        assetId: asset.asset.id,
-        recipient: parsedRecipient,
-        amountRaw
-      })
+      value = await solanaWalletClient.prepareTransfer(
+        {
+          assetId: asset.asset.id,
+          recipient: parsedRecipient,
+          amountRaw
+        },
+        { executionMode }
+      )
       const summary = value.review.summary
       const nativeTransfer = summary.fields.instructions.find(
         instruction => instruction.interpretation.kind === 'system-transfer'

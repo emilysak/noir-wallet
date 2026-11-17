@@ -246,11 +246,12 @@ export function Home() {
     multichainPortfolioEnabled ? effectiveWalletId : null,
     multichainPortfolioEnabled ? effectiveAccountId : null
   )
-  const supportsEvmDAppExecutionMode =
-    storageV2Account?.networks.some(network => network.chain.family === 'evm') ??
-    Boolean(evmOperationsEnabled && currentAccount)
+  const supportsDAppExecutionMode =
+    storageV2Account?.networks.some(
+      network => network.chain.family === 'evm' || network.chain.family === 'solana'
+    ) ?? Boolean(evmOperationsEnabled && currentAccount)
   const dappExecutionMode = useDAppExecutionMode(
-    Boolean(supportsEvmDAppExecutionMode && effectiveWalletId && effectiveAccountId),
+    Boolean(supportsDAppExecutionMode && effectiveWalletId && effectiveAccountId),
     effectiveWalletId,
     effectiveAccountId,
     currentNetwork
@@ -292,10 +293,8 @@ export function Home() {
   const requestedAssetDomain = resolveHomeAssetDomain(location.search)
   const assetDomain =
     hardwareWallet && requestedAssetDomain === 'private' ? 'all' : requestedAssetDomain
-  const modeKnown =
-    hardwareWallet || !supportsEvmDAppExecutionMode || dappExecutionMode.state !== null
-  const modeActionsReady =
-    hardwareWallet || !supportsEvmDAppExecutionMode || dappExecutionMode.ready
+  const modeKnown = hardwareWallet || !supportsDAppExecutionMode || dappExecutionMode.state !== null
+  const modeActionsReady = hardwareWallet || !supportsDAppExecutionMode || dappExecutionMode.ready
   const privateMode = !hardwareWallet && dappExecutionMode.state?.mode === 'private'
   const actionDomain =
     assetDomain === 'all' ? (modeKnown ? (privateMode ? 'private' : 'public') : null) : assetDomain
@@ -376,6 +375,9 @@ export function Home() {
     }
     if (swapSource.chain.chain.family === 'evm' && effectiveWalletId && effectiveAccountId) {
       query.set('sourceMode', assetDomain === 'private' ? 'private' : 'main')
+    }
+    if (swapSource.chain.chain.family === 'solana' && assetDomain === 'private') {
+      query.set('sourceMode', 'private')
     }
     if (swapSource.chain.chain.family === 'zcash') {
       query.set('fundingSource', 'transparent')

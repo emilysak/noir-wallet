@@ -1056,3 +1056,38 @@ test('Activity details show the outgoing hash before destination settlement', ()
     { id: 'relay', label: 'Relay Hash', hash: differentlyCasedBase58Hash, chainId: null }
   ])
 })
+
+test('projects Solana main and PEA balances into separate execution domains', () => {
+  const chainId = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'
+  const asset = {
+    asset: { id: `${chainId}/slip44:501`, chainId },
+    balance: {
+      totalRaw: '15',
+      mainRaw: '10',
+      privateRaw: '5',
+      availableRaw: '15',
+      spendableRaw: '15',
+      pendingRaw: '0'
+    }
+  }
+  const chain = {
+    chain: {
+      id: chainId,
+      family: 'solana',
+      capabilities: { transaction: { status: 'available' } }
+    },
+    assets: [asset]
+  }
+  const model = { assets: [asset], chains: [chain] }
+  expect(getAssetDomainRaw(asset, 'public')).toBe('10')
+  expect(getAssetDomainRaw(asset, 'private')).toBe('5')
+  expect(getAssetDomainRaw(asset, 'shield')).toBe('0')
+  expect(projectPortfolioForDomain(model, 'private').assets[0].balance.totalRaw).toBe('5')
+  expect(projectPortfolioForDomain(model, 'private').chains.map(item => item.chain.id)).toEqual([
+    chainId
+  ])
+  expect(projectPortfolioForDomain(model, 'shield').chains).toEqual([])
+  expect(selectHomeActionSource(model, 'private', 'send')?.asset.asset.id).toBe(asset.asset.id)
+  expect(selectHomeActionSource(model, 'public', 'swap')).toBeNull()
+  expect(selectHomeActionSource(model, 'private', 'swap')?.asset.asset.id).toBe(asset.asset.id)
+})

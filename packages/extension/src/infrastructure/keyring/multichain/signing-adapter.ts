@@ -55,6 +55,7 @@ import {
   adaptSolanaPreparedSigning,
   adaptSolanaSignedResult,
   parseSolanaSigningPreparePayload,
+  type SolanaPeaSigningBinding,
   type SolanaSigningPreparePayload
 } from './signing-adapter-solana'
 
@@ -292,7 +293,12 @@ function readCanonicalBase64(value: unknown, label: string, maximum: number): st
 
 export function parseSigningPreparePayload(value: unknown): ParsedSigningPreparePayload {
   const record = readRecord(value, 'signing.prepare payload')
-  if (record.kind === 'solana-transaction' || record.kind === 'solana-message') {
+  if (
+    record.kind === 'solana-transaction' ||
+    record.kind === 'pea-solana-transaction' ||
+    record.kind === 'solana-message' ||
+    record.kind === 'pea-solana-message'
+  ) {
     return parseSolanaSigningPreparePayload(record)
   }
   if (record.kind === 'near-transaction' || record.kind === 'near-nep413-message') {
@@ -1109,7 +1115,8 @@ export async function adaptPreparedSigning(
   signingCommandId: SigningCommandId,
   expiresAt: number,
   bitcoinAccount?: RawDerivedBitcoinAccount,
-  imported = false
+  imported = false,
+  solanaPea?: SolanaPeaSigningBinding
 ): Promise<AdaptedPreparedSigning> {
   switch (payload.kind) {
     case 'evm-transaction':
@@ -1127,8 +1134,17 @@ export async function adaptPreparedSigning(
     case 'bitcoin-bip322-message':
       return adaptBitcoinMessage(raw, payload, signingCommandId, expiresAt, imported)
     case 'solana-transaction':
+    case 'pea-solana-transaction':
     case 'solana-message':
-      return adaptSolanaPreparedSigning(raw, payload, signingCommandId, expiresAt, imported)
+    case 'pea-solana-message':
+      return adaptSolanaPreparedSigning(
+        raw,
+        payload,
+        signingCommandId,
+        expiresAt,
+        imported,
+        solanaPea
+      )
     case 'near-transaction':
     case 'near-nep413-message':
       return adaptNearPreparedSigning(raw, payload, signingCommandId, expiresAt, imported)
@@ -1188,7 +1204,9 @@ export function adaptSignedResult(
       })
     }
     case 'solana-transaction':
+    case 'pea-solana-transaction':
     case 'solana-message':
+    case 'pea-solana-message':
       if (account.curve !== 'ed25519') throw new Error('Ed25519 signing account is missing')
       return adaptSolanaSignedResult(kind, raw, account)
     case 'near-transaction':

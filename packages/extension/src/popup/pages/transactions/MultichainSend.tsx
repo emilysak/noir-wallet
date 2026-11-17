@@ -1558,6 +1558,7 @@ export function MultichainSend({
               key={`${sendEntryKey}:${selection.asset.asset.id}`}
               selection={selection}
               priceUsd={availableUsdPrice(selection.asset, assetPrices)}
+              executionMode={searchParams.get('mode') === 'private' ? 'private' : 'main'}
               initialRecipient={returnDraft?.recipient}
               initialAmount={returnDraft?.amount}
               onDraftChange={handleNonEvmDraftChange}

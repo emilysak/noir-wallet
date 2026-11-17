@@ -42,13 +42,25 @@ import {
 } from './solana-transfer-preparer'
 import { createSolanaTransferGraph } from './solana-transaction-graph'
 import { parseSignedSolanaTransaction } from './solana-signed-transaction'
+import { parseSolanaPublicKey } from './solana-rpc-codecs'
+
+type SolanaTransferSigningPreparePayload =
+  | SolanaTransactionSigningPreparePayload
+  | (Omit<SolanaTransactionSigningPreparePayload, 'kind'> & {
+      readonly kind: 'pea-solana-transaction'
+    })
 
 export interface SolanaTransferSigningPort {
   readonly prepare: (
     keyDomainId: ChainAccount['scope']['keyDomainId'],
-    payload: SolanaTransactionSigningPreparePayload,
+    payload: SolanaTransferSigningPreparePayload,
     signal?: AbortSignal
   ) => Promise<PreparedSigningCommand>
+  readonly deriveSolanaPea?: (
+    keyDomainId: ChainAccount['scope']['keyDomainId'],
+    accountIndex: number,
+    signal?: AbortSignal
+  ) => Promise<{ readonly address: string }>
   readonly confirm: (
     keyDomainId: ChainAccount['scope']['keyDomainId'],
     commandId: SigningCommandId,
@@ -84,6 +96,7 @@ interface PrepareSolanaTransferBaseInput {
   readonly chainAccount: ChainAccount
   readonly accountIndex: number
   readonly recipient: string
+  readonly executionMode?: 'main' | 'private'
   readonly signal?: AbortSignal
   readonly nearIntentsBinding?: NearIntentsTransactionBinding
 }
@@ -196,6 +209,24 @@ export class SolanaTransferOrchestrator {
       throw new Error('Solana transfer requires an account-identifier binding')
     }
     const accountIndex = parseAccountIndex(input.accountIndex)
+    const mainSender = parseSolanaPublicKey(input.chainAccount.identity.value)
+    let sender = mainSender
+    let signingKind: SolanaTransferSigningPreparePayload['kind'] = 'solana-transaction'
+    if (input.executionMode === 'private') {
+      if (!this.signer.deriveSolanaPea) {
+        throw new Error('Solana private execution is unavailable')
+      }
+      const pea = await this.signer.deriveSolanaPea(
+        input.chainAccount.scope.keyDomainId,
+        accountIndex,
+        input.signal
+      )
+      if (pea.address === mainSender) {
+        throw new Error('Confidential address must differ from the Solana account')
+      }
+      sender = parseSolanaPublicKey(pea.address)
+      signingKind = 'pea-solana-transaction'
+    }
     const assetId =
       'assetId' in input ? input.assetId : `${input.chainAccount.scope.chainId}/slip44:501`
     const amountRaw = 'amountRaw' in input ? input.amountRaw : input.lamports
@@ -207,7 +238,7 @@ export class SolanaTransferOrchestrator {
       asset.asset.kind === 'native'
         ? await prepareSolanaNativeTransfer({
             chainId: input.chainAccount.scope.chainId,
-            sender: input.chainAccount.identity.value,
+            sender,
             recipient: input.recipient,
             lamports: amountRaw,
             rpc: this.rpc,
@@ -216,7 +247,7 @@ export class SolanaTransferOrchestrator {
         : await prepareSolanaTokenTransfer({
             chainId: input.chainAccount.scope.chainId,
             assetId: asset.asset.id,
-            sender: input.chainAccount.identity.value,
+            sender,
             recipient: input.recipient,
             mint: asset.asset.reference,
             decimals: asset.metadata.decimals,
@@ -227,7 +258,7 @@ export class SolanaTransferOrchestrator {
     const signing = await this.signer.prepare(
       input.chainAccount.scope.keyDomainId,
       Object.freeze({
-        kind: 'solana-transaction' as const,
+        kind: signingKind,
         chainId: input.chainAccount.scope.chainId,
         accountIndex,
         transaction: prepared.transactionBase64
