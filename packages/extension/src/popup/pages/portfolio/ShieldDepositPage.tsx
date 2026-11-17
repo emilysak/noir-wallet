@@ -579,14 +579,17 @@ function ShieldDepositContent() {
           candidate.networks.some(
             network =>
               network.chain.id === viewedRecord.source.chainId &&
-              (network.privateExecutionAddress?.toLowerCase() ===
-                viewedRecord.refundAddress.toLowerCase() ||
-                network.addresses.some(
-                  address =>
-                    address.value === viewedRecord.refundAddress ||
-                    (network.chain.family === 'evm' &&
-                      address.value.toLowerCase() === viewedRecord.refundAddress.toLowerCase())
-                ))
+              (network.chain.family === 'solana'
+                ? network.privateExecutionAddress === viewedRecord.refundAddress ||
+                  network.addresses.some(address => address.value === viewedRecord.refundAddress)
+                : network.privateExecutionAddress?.toLowerCase() ===
+                    viewedRecord.refundAddress.toLowerCase() ||
+                  network.addresses.some(
+                    address =>
+                      address.value === viewedRecord.refundAddress ||
+                      (network.chain.family === 'evm' &&
+                        address.value.toLowerCase() === viewedRecord.refundAddress.toLowerCase())
+                  ))
           )
         )
       : undefined
@@ -595,8 +598,10 @@ function ShieldDepositContent() {
     )
     const refundIsPrivate =
       near &&
-      refundNetwork?.privateExecutionAddress?.toLowerCase() ===
-        viewedRecord.refundAddress.toLowerCase()
+      (refundNetwork?.chain.family === 'solana'
+        ? refundNetwork.privateExecutionAddress === viewedRecord.refundAddress
+        : refundNetwork?.privateExecutionAddress?.toLowerCase() ===
+          viewedRecord.refundAddress.toLowerCase())
     return (
       <>
         <ReceivingAddressLayout

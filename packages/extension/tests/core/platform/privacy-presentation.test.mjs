@@ -1091,3 +1091,39 @@ test('projects Solana main and PEA balances into separate execution domains', ()
   expect(selectHomeActionSource(model, 'public', 'swap')).toBeNull()
   expect(selectHomeActionSource(model, 'private', 'swap')?.asset.asset.id).toBe(asset.asset.id)
 })
+
+test('splits Solana native and token balances into public and private detail rows', () => {
+  const chainId = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'
+  const native = {
+    asset: { id: `${chainId}/slip44:501`, chainId, kind: 'native' },
+    metadata: { decimals: 9, symbol: 'SOL' },
+    balance: { totalRaw: '15', mainRaw: '10', privateRaw: '5' }
+  }
+  const token = {
+    asset: { id: `${chainId}/token:usdc`, chainId, kind: 'token' },
+    metadata: { decimals: 6, symbol: 'USDC' },
+    balance: { totalRaw: '8', mainRaw: '3', privateRaw: '5' }
+  }
+  const model = { assets: [native, token] }
+  const nativeCategories = getAssetDetailCategories(native, model, true)
+  const tokenCategories = getAssetDetailCategories(token, model, true)
+  expect(nativeCategories.domains).toEqual(['all', 'public', 'shield', 'private'])
+  expect(nativeCategories.raw).toMatchObject({ public: '10', shield: '0', private: '5' })
+  expect(tokenCategories.domains).toEqual(['all', 'public', 'shield', 'private'])
+  expect(tokenCategories.raw).toMatchObject({ public: '3', shield: '0', private: '5' })
+
+  const emptyPrivate = {
+    ...native,
+    balance: { totalRaw: '4', mainRaw: '4', privateRaw: '0' }
+  }
+  expect(getAssetDetailCategories(emptyPrivate, { assets: [emptyPrivate] }, false).domains).toEqual([
+    'all',
+    'public'
+  ])
+  expect(getAssetDetailCategories(emptyPrivate, { assets: [emptyPrivate] }, true).domains).toEqual([
+    'all',
+    'public',
+    'shield',
+    'private'
+  ])
+})

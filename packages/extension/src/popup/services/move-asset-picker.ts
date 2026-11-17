@@ -34,13 +34,17 @@ export function listMoveAssetPickerRows(input: {
             input.network
           )
         : null
+    const confidentialRaw =
+      managed && input.shieldBalances
+        ? getConfidentialAvailableForAsset(input.shieldBalances, managed.protocolAssetId)
+        : null
     const sourceRaw =
       input.from === 'shield'
-        ? managed && input.shieldBalances
-          ? getConfidentialAvailableForAsset(input.shieldBalances, managed.protocolAssetId)
-          : null
+        ? (confidentialRaw ??
+          (input.shieldBalances ? (item.asset.balance.confidentialRaw ?? '0') : null))
         : getTransferDomainBalanceRaw(item.asset, input.from)
-    if (sourceRaw === null || BigInt(sourceRaw) === 0n) return []
+    // A resolved zero stays selectable. Dropping it makes the reversed direction look empty.
+    if (sourceRaw === null) return []
 
     const priceUsd =
       findAssetPrice(input.prices, item.asset.asset.id)?.priceUsd ??

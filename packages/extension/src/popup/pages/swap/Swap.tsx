@@ -128,6 +128,10 @@ import { PageHeader } from '../../components/common/PageHeader'
 import { BalanceDomainTabs, type BalanceDomain } from '../../components/account/BalanceDomainTabs'
 import { getPrivateTransferChainIds } from '@/popup/services/private-balance-transfer'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import {
+  isSolanaPrivateExecutionAddress,
+  supportsSolanaPrivateExecution
+} from '@/core/chains/solana'
 import { InlineError } from '../../components/common/InlineError'
 import { ZcashSyncProgress } from '../../components/common/ZcashSyncProgress'
 import { useZcashSyncReadStatus } from '@/popup/hooks/usePersistedExtensionContextSync'
@@ -587,12 +591,23 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const getCurrentBalance = useAccountDataStore(state => state.getCurrentBalance)
   const storeBalance = getCurrentBalance()
 
-  const privateExecutionSupported = Boolean(
+  const evmPrivateExecutionSupported = Boolean(
     supportsEvmPrivateExecution(storageV2Account?.walletSource) &&
     storageV2Account?.networks.some(
       network => network.chain.family === 'evm' && network.privateExecutionAddress
     )
   )
+  const solanaPrivateExecutionSupported = Boolean(
+    supportsSolanaPrivateExecution(storageV2Account?.walletSource) &&
+    storageV2Account?.networks.some(network => {
+      if (network.chain.family !== 'solana') return false
+      const mainAddress =
+        network.addresses.find(address => address.preferredForReceive)?.value ??
+        network.addresses[0]?.value
+      return isSolanaPrivateExecutionAddress(network.privateExecutionAddress, mainAddress)
+    })
+  )
+  const privateExecutionSupported = evmPrivateExecutionSupported || solanaPrivateExecutionSupported
   const confidentialShieldAvailable =
     getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length > 0
   const nativeZecShieldAvailable = resolveShieldNativeZecSwapAvailable({
@@ -711,14 +726,18 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             network.chain.id === useSettingsStore.getState().chainEndpointSettings.activeEvmChainId
         )?.chain.id ?? storageV2Account.networks[0]?.chain.id)
       : undefined
-  const privateSwapChainId = privateExecutionSupported
+  const privateSwapChainId = evmPrivateExecutionSupported
     ? (storageV2Account?.networks.find(
         network => network.chain.id === 'eip155:1' && network.privateExecutionAddress
       )?.chain.id ??
       storageV2Account?.networks.find(
         network => network.chain.family === 'evm' && network.privateExecutionAddress
       )?.chain.id)
-    : undefined
+    : solanaPrivateExecutionSupported
+      ? storageV2Account?.networks.find(
+          network => network.chain.family === 'solana' && network.privateExecutionAddress
+        )?.chain.id
+      : undefined
   const swap = useSwapState(
     lockedAssetFlowRequested || crossChainSendRequested ? null : swapPreferenceScope,
     {
@@ -1549,8 +1568,13 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       if (!portfolio) return false
       const source = resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets)
       const target = resolveWalletQuoteReceiveTarget(token, portfolio, receiveTargets)
-      const privateAddress =
-        target?.kind === 'evm' ? privateExecutionAddresses.get(target.chain.id) : undefined
+      const privateAddress = target ? privateExecutionAddresses.get(target.chain.id) : undefined
+      if (target?.kind === 'solana') {
+        if (!isSolanaPrivateExecutionAddress(privateAddress, target.address)) return false
+        return source
+          ? Boolean(selectWalletOwnedQuoteAssetExecution(source, 'private', privateAddress))
+          : false
+      }
       if (
         target?.kind !== 'evm' ||
         !privateAddress ||

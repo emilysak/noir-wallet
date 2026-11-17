@@ -1,4 +1,4 @@
-import { getEvmNetworkConfigs } from '@/config/networks'
+import { getEvmNetworkConfigs, getSolanaNetworkConfigs } from '@/config/networks'
 import type { Network } from '@/types'
 import type { PortfolioAssetView, PortfolioChainView } from '@/core/portfolio'
 
@@ -8,6 +8,7 @@ const ETHEREUM_CHAIN_IDS = new Set<string>(
     .filter(network => network.displayName.startsWith('Ethereum'))
     .map(network => network.chainId)
 )
+const SOLANA_CHAIN_IDS = new Set<string>(getSolanaNetworkConfigs().map(network => network.chainId))
 
 export function isAssetVisibleInAssetView(
   chain: PortfolioChainView['chain'],
@@ -21,5 +22,6 @@ export function isAssetVisibleInAssetView(
   const symbol = asset.metadata.symbol.toUpperCase()
   if (chain.family === 'zcash' && symbol === 'ZEC') return true
   if (chain.family === 'bitcoin' && symbol === 'BTC') return true
-  return ETHEREUM_CHAIN_IDS.has(chain.id) && symbol === 'ETH'
+  if (ETHEREUM_CHAIN_IDS.has(chain.id) && symbol === 'ETH') return true
+  return SOLANA_CHAIN_IDS.has(chain.id) && symbol === 'SOL'
 }

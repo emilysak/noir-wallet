@@ -48,7 +48,8 @@ import { MultichainActivityDetail } from '../components/transaction/MultichainAc
 import type { ActivityItem } from '@/core/activity'
 import {
   resolveBitcoinFeatureRuntimePolicy,
-  resolveEvmFeatureRuntimePolicy
+  resolveEvmFeatureRuntimePolicy,
+  resolveSolanaFeatureRuntimePolicy
 } from '@/core/chains/feature-runtime-policy'
 import {
   clearHomeActivityAssetFilter,
@@ -89,6 +90,10 @@ import {
 } from '../services/asset-domains'
 import { selectShieldActions, type ShieldAction } from '../services/shield-action-selection'
 import { getPrivateTransferChainIds } from '../services/private-balance-transfer'
+import {
+  isSolanaPrivateExecutionAddress,
+  supportsSolanaPrivateExecution
+} from '@/core/chains/solana'
 import { prewarmInitialSwapCatalog } from '../services/swap-catalog-loading'
 import { createSwapTokenPreferenceScope } from '../services/swap-token-selection'
 import { useSwapPreferences } from '@/store/swap-store'
@@ -97,6 +102,10 @@ import shieldYourFundsTitle from '@/images/figma-shield-your-funds.svg'
 import shieldGuideBackground from '@/images/figma-shield-guide-background.svg'
 
 const evmOperationsEnabled = resolveEvmFeatureRuntimePolicy(
+  __ENABLED_CHAIN_FEATURE_FLAGS__
+).newOperationsEnabled
+
+const solanaOperationsEnabled = resolveSolanaFeatureRuntimePolicy(
   __ENABLED_CHAIN_FEATURE_FLAGS__
 ).newOperationsEnabled
 
@@ -319,10 +328,21 @@ export function Home() {
   const canMoveEvm =
     multichainPortfolioEnabled &&
     getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length > 0
+  const canMoveSolana =
+    solanaOperationsEnabled &&
+    supportsSolanaPrivateExecution(storageV2Account?.walletSource) &&
+    (storageV2Account?.networks.some(network => {
+      if (network.chain.family !== 'solana') return false
+      const mainAddress =
+        network.addresses.find(address => address.preferredForReceive)?.value ??
+        network.addresses[0]?.value
+      return isSolanaPrivateExecutionAddress(network.privateExecutionAddress, mainAddress)
+    }) ??
+      false)
   const showMove =
     assetDomain === 'all'
-      ? privateMode && multichainPortfolioEnabled
-      : (assetDomain === 'public' || assetDomain === 'private') && canMoveEvm
+      ? privateMode && (multichainPortfolioEnabled || canMoveSolana)
+      : (assetDomain === 'public' || assetDomain === 'private') && (canMoveEvm || canMoveSolana)
   const openSend = () => {
     if (!modeActionsReady) return
     const sendPath =

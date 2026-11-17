@@ -5,6 +5,11 @@ import { Icon } from '@iconify/react'
 import Big from '@/lib/big'
 import type { PortfolioReadModel } from '@/core/portfolio'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import { resolveSolanaFeatureRuntimePolicy } from '@/core/chains/feature-runtime-policy'
+import {
+  isSolanaPrivateExecutionAddress,
+  supportsSolanaPrivateExecution
+} from '@/core/chains/solana'
 import type { ActivityItem } from '@/core/activity'
 import {
   findAssetPrice,
@@ -74,6 +79,10 @@ import { BitcoinAccountTypeSelector } from '@/popup/components/bitcoin/BitcoinAc
 import { resolveEffectiveActiveAccountIdentity } from '@/popup/lib/effective-active-account'
 import { getFundingSourceUnavailableReason } from '@/core/wallet/funding-source'
 import type { KeySource } from '@/types/wallet'
+
+const solanaOperationsEnabled = resolveSolanaFeatureRuntimePolicy(
+  __ENABLED_CHAIN_FEATURE_FLAGS__
+).newOperationsEnabled
 
 export function AssetDetail() {
   const location = useLocation()
@@ -264,12 +273,27 @@ export function AssetDetail() {
     evmAccountNetwork?.privateExecutionAddress &&
     evmMainAddress
   )
+  const solanaAccountNetwork = storageV2Account?.networks.find(
+    network => network.chain.id === chain?.chain.id && network.chain.family === 'solana'
+  )
+  const solanaMainAddress =
+    solanaAccountNetwork?.addresses.find(address => address.preferredForReceive)?.value ??
+    solanaAccountNetwork?.addresses[0]?.value
+  const solanaPrivateEligible = isSolanaPrivateExecutionAddress(
+    solanaAccountNetwork?.privateExecutionAddress,
+    solanaMainAddress
+  )
+  const solanaPrivateActions = Boolean(
+    solanaOperationsEnabled &&
+    supportsSolanaPrivateExecution(storageV2Account?.walletSource) &&
+    solanaPrivateEligible
+  )
   const categories =
     asset && visibleModel
       ? getAssetDetailCategories(
           asset,
           visibleModel,
-          privateTransferEligible,
+          chain?.chain.family === 'solana' ? solanaPrivateEligible : privateTransferEligible,
           findAssetPrice(prices, asset.asset.id)?.priceUsd
         )
       : null
@@ -282,11 +306,16 @@ export function AssetDetail() {
         assetId: asset.asset.id
       })
     : null
+  const privateExecutionChain = chain?.chain.family === 'evm' || chain?.chain.family === 'solana'
+  const privateMoveReady =
+    chain?.chain.family === 'solana'
+      ? solanaPrivateActions && currentNetwork === 'mainnet'
+      : privateTransferEligible
   const actionDomain =
-    searchParams.get('mode') === 'private' &&
-    (chain?.chain.family !== 'evm' || privateTransferEligible)
+    searchParams.get('mode') === 'private' && (privateExecutionChain ? privateMoveReady : true)
       ? 'private'
       : 'public'
+  const showPrivateMove = actionDomain === 'private' && privateExecutionChain
   const activityFilterDomain = searchParams.get('history') === 'shield' ? 'shield' : undefined
   useEffect(() => {
     if (!privateTransferEligible || !effectiveWalletId || !effectiveAccountId) return
@@ -310,14 +339,13 @@ export function AssetDetail() {
   }, [privateTransferEligible, effectiveWalletId, effectiveAccountId, currentNetwork])
 
   const handleMove = (from: 'public' | 'private' = actionDomain) => {
-    if (!asset) return
+    if (!asset || !privateMoveReady) return
     const moveAssetHint = {
       scope: `${currentNetwork}:${effectiveWalletId ?? ''}:${effectiveAccountId ?? ''}:${chainEndpointRuntimeKey}`,
       assetId: asset.asset.id,
       symbol: asset.metadata.symbol,
       iconUrl: asset.metadata.iconUrl
     }
-    if (!privateTransferEligible) return
     navigate(
       `/transfer?${new URLSearchParams({
         assetId: asset.asset.id,
@@ -372,22 +400,25 @@ export function AssetDetail() {
     chain?.chain.family === 'zcash'
       ? getFundingSourceUnavailableReason(zcashKeySource, zcashFundingSource)
       : undefined
+  const operableFamilies = [
+    'zcash',
+    'evm',
+    'bitcoin',
+    ...(solanaOperationsEnabled ? ['solana'] : [])
+  ]
   const canSend = Boolean(
     chain &&
     !fundingUnavailableReason &&
     chain.chain.capabilities.transaction.status === 'available' &&
-    ['zcash', 'evm', 'bitcoin'].includes(chain.chain.family)
+    operableFamilies.includes(chain.chain.family)
   )
   const canReceive = Boolean(
     chain &&
     chain.chain.capabilities.address.status === 'available' &&
-    ['zcash', 'evm', 'bitcoin'].includes(chain.chain.family)
+    operableFamilies.includes(chain.chain.family)
   )
   const canSwap = Boolean(
-    asset &&
-    chain &&
-    !fundingUnavailableReason &&
-    ['zcash', 'evm', 'bitcoin'].includes(chain.chain.family)
+    asset && chain && !fundingUnavailableReason && operableFamilies.includes(chain.chain.family)
   )
   const display = useMemo(() => {
     if (!asset) return null
@@ -460,7 +491,7 @@ export function AssetDetail() {
 
   const handleSend = (domain: 'public' | 'private' = actionDomain) => {
     if (!asset || !chain || !canSend) return
-    if (chain.chain.family === 'evm' && domain === 'private') {
+    if ((chain.chain.family === 'evm' || chain.chain.family === 'solana') && domain === 'private') {
       handleMove(domain)
       return
     }
@@ -555,7 +586,8 @@ export function AssetDetail() {
   const confidentialActions = () => {
     if (
       !asset ||
-      getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length === 0
+      (chain?.chain.family !== 'solana' &&
+        getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length === 0)
     )
       return []
     const query = new URLSearchParams({ provider: 'near-confidential', assetId: asset.asset.id })
@@ -603,13 +635,13 @@ export function AssetDetail() {
           }
         ]
       : []),
-    ...(privateTransferEligible
+    ...(privateMoveReady
       ? [{ action: 'move' as const, label: 'Move', onClick: () => handleMove(domain) }]
       : []),
     {
       action: 'swap' as const,
       label: 'Swap',
-      disabled: !canSwap || (domain === 'private' && !privateTransferEligible),
+      disabled: !canSwap || (domain === 'private' && !privateMoveReady),
       onClick: () => handleSwap(domain)
     }
   ]
@@ -1024,24 +1056,13 @@ export function AssetDetail() {
 
         <div className="flex justify-center gap-2 pb-3">
           <WalletActionButton
-            icon={
-              <WalletActionIcon
-                action={
-                  actionDomain === 'private' && chain.chain.family === 'evm' ? 'move' : 'send'
-                }
-              />
-            }
-            label={actionDomain === 'private' && chain.chain.family === 'evm' ? 'Move' : 'Send'}
-            disabled={
-              !canSend ||
-              (actionDomain === 'private' &&
-                chain.chain.family === 'evm' &&
-                !privateTransferEligible)
-            }
+            icon={<WalletActionIcon action={showPrivateMove ? 'move' : 'send'} />}
+            label={showPrivateMove ? 'Move' : 'Send'}
+            disabled={!canSend || (showPrivateMove && !privateMoveReady)}
             onClick={() => handleSend()}
             title={fundingUnavailableReason}
           />
-          {(actionDomain !== 'private' || chain.chain.family !== 'evm') && (
+          {!showPrivateMove && (
             <WalletActionButton
               icon={<WalletActionIcon action="receive" />}
               label="Receive"
@@ -1052,16 +1073,11 @@ export function AssetDetail() {
           <WalletActionButton
             icon={<WalletActionIcon action="swap" />}
             label="Swap"
-            disabled={
-              !canSwap ||
-              (chain.chain.family === 'evm' &&
-                actionDomain === 'private' &&
-                !privateTransferEligible)
-            }
+            disabled={!canSwap || (showPrivateMove && !privateMoveReady)}
             onClick={() => handleSwap()}
             title={fundingUnavailableReason}
           />
-          {(isZcashAsset || privateTransferEligible) && (
+          {(isZcashAsset || privateMoveReady) && (
             <WalletActionButton
               icon={<WalletShieldFundsIcon />}
               label="Shielded"
@@ -1074,14 +1090,12 @@ export function AssetDetail() {
           )}
         </div>
 
-        {chain.chain.family === 'evm' && (
+        {(chain.chain.family === 'evm' || chain.chain.family === 'solana') && (
           <section className="py-2" aria-label="Account balances">
             {categories?.domains
               .filter(
                 (domain): domain is 'public' | 'private' | 'shield' =>
-                  domain !== 'all' &&
-                  (domain === 'public' ||
-                    supportsEvmPrivateExecution(storageV2Account?.walletSource))
+                  domain === 'public' || domain === 'private' || domain === 'shield'
               )
               .map(domain => {
                 const raw = categories.raw[domain]

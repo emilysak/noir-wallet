@@ -318,6 +318,11 @@ export function resolveWalletSwapSourceAvailableRaw(
   source: WalletOwnedQuoteAsset,
   evmExecutionMode: 'main' | 'private'
 ): string | undefined {
+  if (source.family === 'solana') {
+    return evmExecutionMode === 'private'
+      ? source.asset.balance.privateRaw
+      : source.asset.balance.availableRaw
+  }
   if (source.family !== 'evm') return source.asset.balance.availableRaw
   if (
     evmExecutionMode === 'private' &&
