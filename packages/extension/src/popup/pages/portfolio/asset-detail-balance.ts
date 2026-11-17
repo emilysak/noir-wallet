@@ -34,16 +34,17 @@ export function getAssetDetailCategories(
     asset = model.assets.find(candidate => candidate.asset.id === asset.asset.id) ?? asset
   }
   const evm = asset.asset.chainId.startsWith('eip155:')
+  const solana = asset.asset.chainId.startsWith('solana:')
   const zcash = getAssetShieldProvider(asset) === 'zcash-shield'
   const raw: Record<AssetDomain, string | null> = {
     all: asset.balance.totalRaw,
     public: getAssetDomainRaw(asset, 'public'),
     shield: zcash ? getAssetDomainRaw(asset, 'shield') : null,
-    private: evm ? getAssetDomainRaw(asset, 'private') : null
+    private: evm || solana ? getAssetDomainRaw(asset, 'private') : null
   }
   let shieldPriceUsd: string | undefined
 
-  if (evm && model.confidential?.status === 'ready') {
+  if ((evm || solana) && model.confidential?.status === 'ready') {
     const candidates = model.confidential.assets.filter(entry => entry.assetId === asset.asset.id)
     if (
       candidates.length === 1 &&
@@ -60,17 +61,21 @@ export function getAssetDetailCategories(
       ) {
         shieldPriceUsd = candidatePrice
       }
-    } else if (candidates.length === 0 && asset.balance.confidentialRaw === '0') {
+    } else if (
+      candidates.length === 0 &&
+      (asset.balance.confidentialRaw === '0' || (solana && privateEligible))
+    ) {
       raw.shield = '0'
     }
   }
+  if (solana && privateEligible && raw.shield === null) raw.shield = '0'
 
   const domains: AssetDomain[] = ['all', 'public']
   if (zcash) domains.push('shield')
-  if (evm && (privateEligible || (raw.shield !== null && BigInt(raw.shield) > 0n))) {
+  if ((evm || solana) && (privateEligible || (raw.shield !== null && BigInt(raw.shield) > 0n))) {
     domains.push('shield')
   }
-  if (evm && (privateEligible || (raw.private !== null && BigInt(raw.private) > 0n))) {
+  if ((evm || solana) && (privateEligible || (raw.private !== null && BigInt(raw.private) > 0n))) {
     domains.push('private')
   }
 

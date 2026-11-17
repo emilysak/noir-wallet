@@ -21,7 +21,9 @@ import {
   type ExternalShieldDepositFailureStage
 } from '@/core/services/confidential-funding/confidential-external-deposit'
 import { isAddress } from 'viem'
-import { getEvmNetworkConfig } from '@/config/networks'
+import { getEvmNetworkConfig, getSolanaNetworkConfig } from '@/config/networks'
+import { parseSolanaPublicKey } from '@/core/chains/solana'
+import { resolveIntentsWalletAsset } from '@/core/services/intents-wallet-assets'
 import { parseZcashAddress } from '@/core/address-book/address-book'
 import { isValidExternalRecipient } from './confidential-funding-recipient'
 import type { PortfolioReadModel } from '@/core/portfolio'
@@ -711,8 +713,11 @@ export class ConfidentialFundingCoordinator {
 
   hasExternalDepositAsset(source: CreateExternalShieldDepositInput['source']): boolean {
     const asset = this.options.assets.get(source.assetId)
-    if (!asset) return false
     const catalog = this.options.getProtocolTokens?.() ?? this.options.protocolTokens
+    if (source.chainId.startsWith('solana:')) {
+      return this.solanaDepositCatalogMatches(source, catalog, asset?.metadata.decimals)
+    }
+    if (!asset) return false
     if (catalog && asset.asset.namespace === 'erc20') {
       // A contract may have multiple protocol representations. Bind the selected one
       // independently of the portfolio's single default mapping for that contract.
@@ -729,6 +734,46 @@ export class ConfidentialFundingCoordinator {
       mapping =>
         mapping.assetId === source.assetId && mapping.protocolAssetId === source.protocolAssetId
     )
+  }
+
+  private solanaDepositCatalogMatches(
+    source: CreateExternalShieldDepositInput['source'],
+    catalog: readonly SwapToken[] | null | undefined,
+    registeredDecimals: number | undefined
+  ): boolean {
+    if (
+      this.options.network !== 'mainnet' ||
+      source.chainId !== getSolanaNetworkConfig('mainnet').chainId
+    ) {
+      return false
+    }
+    if (!catalog || catalog.length === 0) {
+      return (
+        registeredDecimals !== undefined &&
+        this.options.assetMappings.some(
+          mapping =>
+            mapping.assetId === source.assetId && mapping.protocolAssetId === source.protocolAssetId
+        )
+      )
+    }
+    return this.solanaDepositCatalogAsset(source, catalog, registeredDecimals) !== null
+  }
+
+  private solanaDepositCatalogAsset(
+    source: CreateExternalShieldDepositInput['source'],
+    catalog: readonly SwapToken[] | null | undefined,
+    registeredDecimals: number | undefined
+  ): Readonly<{ metadata: { readonly symbol: string; readonly decimals: number } }> | null {
+    const token = catalog?.find(item => item.assetId === source.protocolAssetId)
+    if (!token) return null
+    const resolved = resolveIntentsWalletAsset(token, this.options.network)
+    if (!resolved || resolved.assetId !== source.assetId || resolved.chainId !== source.chainId) {
+      return null
+    }
+    if (registeredDecimals !== undefined && registeredDecimals !== token.decimals) return null
+    return Object.freeze({
+      metadata: Object.freeze({ symbol: token.symbol, decimals: token.decimals })
+    })
   }
 
   hasCurrentFundingAssets(input: PrepareConfidentialFundingInput): boolean {
@@ -756,10 +801,17 @@ export class ConfidentialFundingCoordinator {
   ): Promise<ExternalShieldDeposit> {
     const chain = parseChainId(input.source.chainId)
     const isZcash = chain.id === getZcashChainId(this.options.network)
-    const asset = this.options.assets.get(input.source.assetId)
+    const isSolana =
+      this.options.network === 'mainnet' && chain.id === getSolanaNetworkConfig('mainnet').chainId
+    const registered = this.options.assets.get(input.source.assetId)
+    const catalog = this.options.getProtocolTokens?.() ?? this.options.protocolTokens
+    const solanaCatalog = isSolana
+      ? this.solanaDepositCatalogAsset(input.source, catalog, registered?.metadata.decimals)
+      : null
+    const asset = registered ?? solanaCatalog
     if (
       input.network !== this.options.network ||
-      (!isZcash && chain.namespace !== 'eip155') ||
+      (!isZcash && !isSolana && chain.namespace !== 'eip155') ||
       parseAssetId(input.source.assetId).chainId !== chain.id ||
       !asset ||
       !this.hasExternalDepositAsset(input.source) ||
@@ -770,13 +822,15 @@ export class ConfidentialFundingCoordinator {
       (input.requestId !== undefined && !isBoundedLabel(input.requestId, 160))
     )
       throw new Error('External Shield deposit request is invalid')
-    const catalog = this.options.getProtocolTokens?.() ?? this.options.protocolTokens
     const token = catalog?.find(item => item.assetId === input.source.protocolAssetId)
     if (catalog) {
+      const blockchain = token?.blockchain.trim().toLowerCase()
       const tokenChainId = token
-        ? ['zec', 'zcash'].includes(token.blockchain.trim().toLowerCase())
+        ? blockchain === 'zec' || blockchain === 'zcash'
           ? getZcashChainId(this.options.network)
-          : resolveIntentsEvmChainId(token.blockchain, this.options.evmNetworks)
+          : blockchain === 'sol' || blockchain === 'solana'
+            ? getSolanaNetworkConfig('mainnet').chainId
+            : resolveIntentsEvmChainId(token.blockchain, this.options.evmNetworks)
         : null
       if (tokenChainId !== chain.id || token?.decimals !== asset.metadata.decimals) {
         throw new Error('External Shield deposit asset catalog changed')
@@ -790,11 +844,17 @@ export class ConfidentialFundingCoordinator {
       ) {
         throw new Error('External Shield deposit requires a transparent Zcash refund address')
       }
+    } else if (isSolana) {
+      try {
+        parseSolanaPublicKey(input.refundAddress)
+      } catch {
+        throw new Error('External Shield deposit refund address is invalid')
+      }
     } else if (!isAddress(input.refundAddress) || /^0x0{40}$/i.test(input.refundAddress)) {
       throw new Error('External Shield deposit refund address is invalid')
     }
     setStage('account')
-    const identityChain = isZcash ? this.options.evmNetworks[0]?.chainId : chain.id
+    const identityChain = isZcash || isSolana ? this.options.evmNetworks[0]?.chainId : chain.id
     if (!identityChain) throw new Error('External Shield deposit Account has no EVM identity')
     const identity = await this.options.signer.resolveIdentity(parseChainId(identityChain).id)
     if (
@@ -888,8 +948,17 @@ export class ConfidentialFundingCoordinator {
     if (isZcash && quote.quoteRequest.refundTo !== input.refundAddress) {
       throw new Error('External Shield quote changed its Zcash refund address')
     }
+    if (isSolana && quote.quoteRequest.refundTo !== input.refundAddress) {
+      throw new Error('External Shield quote changed its Solana refund address')
+    }
     if (isZcash) {
       parseZcashAddress(quote.quote.depositAddress, input.network)
+    } else if (isSolana) {
+      try {
+        parseSolanaPublicKey(quote.quote.depositAddress)
+      } catch {
+        throw new Error('External Shield quote has an invalid deposit address')
+      }
     } else if (
       !isAddress(quote.quote.depositAddress) ||
       /^0x0{40}$/i.test(quote.quote.depositAddress)
@@ -901,7 +970,7 @@ export class ConfidentialFundingCoordinator {
         record =>
           record.network === input.network &&
           record.source.chainId === input.source.chainId &&
-          (isZcash
+          (isZcash || isSolana
             ? record.depositAddress === quote.quote.depositAddress
             : record.depositAddress.toLowerCase() === quote.quote.depositAddress.toLowerCase()) &&
           record.depositMemo === quote.quote.depositMemo

@@ -1,5 +1,8 @@
 export { parseSolanaPublicKey } from './identifiers'
-export { supportsSolanaPrivateExecution } from './execution-capability'
+export {
+  isSolanaPrivateExecutionAddress,
+  supportsSolanaPrivateExecution
+} from './execution-capability'
 export {
   SOLANA_WALLET_RUNTIME_ERROR_CODES,
   createSolanaWalletRuntimeError,

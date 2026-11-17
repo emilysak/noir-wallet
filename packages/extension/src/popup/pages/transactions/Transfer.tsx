@@ -432,6 +432,7 @@ function TransferForm() {
   const [to, setTo] = useState<TransferDomain>(initialDraft.to)
   const [amount, setAmount] = useState(initialDraft.amount)
   const [method, setMethod] = useState<'cluster' | 'directly'>(initialDraft.method)
+  const [solanaClusterFeeRaw, setSolanaClusterFeeRaw] = useState<string | null>(null)
   const [evmMoveFee, setEvmMoveFee] = useState<EvmFeeSelection>({
     kind: 'tier',
     tier: 'standard'
@@ -973,7 +974,26 @@ function TransferForm() {
   const supportedPair =
     (from === 'public' && to === 'private') || (from === 'private' && to === 'public')
   const shieldPair = isShieldTransferRoute(from, to) && selected?.chain.chain.family === 'evm'
-  const clusterPair = isClusterTransferRoute(from, to) && selected?.chain.chain.family === 'evm'
+  const managedAsset = useMemo(
+    () =>
+      selected
+        ? resolveShieldManagedAsset(selected.asset, managedAssets, catalogTokens, currentNetwork)
+        : null,
+    [selected?.asset, managedAssets, catalogTokens, currentNetwork]
+  )
+  const solanaClusterPair = Boolean(
+    isClusterTransferRoute(from, to) &&
+    selected?.chain.chain.family === 'solana' &&
+    currentNetwork === 'mainnet' &&
+    solanaChainIds.includes(selected.chain.chain.id) &&
+    managedAsset &&
+    mainAddress &&
+    privateAddress &&
+    mainAddress !== privateAddress
+  )
+  const clusterPair =
+    (isClusterTransferRoute(from, to) && selected?.chain.chain.family === 'evm') ||
+    solanaClusterPair
   const clusterSelected = method === 'cluster' && clusterPair
   const fundingRoute = Boolean(shieldPair || clusterSelected)
   useEffect(() => {
@@ -989,13 +1009,6 @@ function TransferForm() {
       cancelled = true
     }
   }, [scopeKey, supportedPair, fundingRoute])
-  const managedAsset = useMemo(
-    () =>
-      selected
-        ? resolveShieldManagedAsset(selected.asset, managedAssets, catalogTokens, currentNetwork)
-        : null,
-    [selected?.asset, managedAssets, catalogTokens, currentNetwork]
-  )
   const clusterAvailable = Boolean(clusterPair && managedAsset && effective)
   const destinationOptions = useMemo(() => {
     if (from !== 'shield' || !selected || !managedAsset) return []
@@ -1029,9 +1042,15 @@ function TransferForm() {
     currentNetwork,
     eligibleChainIds
   ])
-  const destinationNetworkOptions: ChainSelectorOption[] = [
-    ...new Map(destinationOptions.map(item => [item.chain.chain.id, item])).values()
-  ].map(item => ({
+  const solanaShieldDestination =
+    from === 'shield' && selected?.chain.chain.family === 'solana' ? selected : null
+  const destinationChoices =
+    destinationOptions.length > 0
+      ? [...new Map(destinationOptions.map(item => [item.chain.chain.id, item])).values()]
+      : solanaShieldDestination
+        ? [solanaShieldDestination]
+        : []
+  const destinationNetworkOptions: ChainSelectorOption[] = destinationChoices.map(item => ({
     id: item.chain.chain.id,
     name: item.chain.chain.displayName,
     icon: resolveChainIconAlias(
@@ -1089,7 +1108,7 @@ function TransferForm() {
     to,
     currentShieldBalances
   ])
-  const targetAsset = from === 'shield' ? destination : selected
+  const targetAsset = from === 'shield' ? (destination ?? solanaShieldDestination) : selected
   const targetNetwork = activeAccount?.networks.find(
     item => item.chain.id === targetAsset?.chain.chain.id
   )
@@ -1143,13 +1162,20 @@ function TransferForm() {
           maximumRaw: null
         })
       : null
+  const solanaClusterMaximumRaw = (() => {
+    if (!solanaClusterPair || !sourceRaw) return null
+    if (selected?.asset.asset.kind !== 'native') return sourceRaw
+    if (!solanaClusterFeeRaw || !/^\d+$/.test(solanaClusterFeeRaw)) return null
+    const remaining = BigInt(sourceRaw) - BigInt(solanaClusterFeeRaw)
+    return remaining > 0n ? remaining.toString() : '0'
+  })()
   const shieldAvailable =
     selected && fundingRoute && shieldSourceRaw !== null
       ? resolvePortfolioTransferAvailability({
           balanceRaw: shieldSourceRaw,
           decimals: selected.asset.metadata.decimals,
           isNative: from !== 'shield' && selected.asset.asset.kind === 'native',
-          maximumRaw: null
+          maximumRaw: solanaClusterPair && from !== 'shield' ? solanaClusterMaximumRaw : null
         })
       : null
   const maxAmount =
@@ -1197,13 +1223,12 @@ function TransferForm() {
     draftScope === scopeKey &&
     clusterPair &&
     selected &&
-    eligible &&
-    source &&
     estimateAmountRaw &&
-    !preparedShield
+    !preparedShield &&
+    (solanaClusterPair || (eligible && source))
   )
   const directEstimate = useMoveMethodEstimate({
-    enabled: canEstimateMethods && methodAvailable,
+    enabled: canEstimateMethods && methodAvailable && !solanaClusterPair,
     requestKey: methodEstimateKey,
     estimate: signal =>
       estimateDirectMove({
@@ -1262,6 +1287,10 @@ function TransferForm() {
     clusterEstimate.value && clusterNetworkFee
       ? { ...clusterEstimate.value, sourceNetworkFee: clusterNetworkFee }
       : clusterEstimate.value
+  const quotedSolanaFee = solanaClusterPair
+    ? (clusterEstimate.value?.sourceNetworkFee?.raw ?? null)
+    : null
+  if (quotedSolanaFee !== solanaClusterFeeRaw) setSolanaClusterFeeRaw(quotedSolanaFee)
   const directQuoted = Boolean(canEstimateMethods && methodAvailable && directEstimate.value)
   const selectedEstimate = method === 'cluster' ? clusterEstimate : directEstimate
   const clusterUnavailable = getSwapQuoteFailureMessage(clusterEstimate.errorMessage) === 'no route'
@@ -1304,14 +1333,14 @@ function TransferForm() {
     setMethod('cluster')
   }, [clusterPair, clusterAvailable, clusterUnavailable, method])
   useEffect(() => {
-    if (method === 'cluster' && clusterUnavailable && directQuoted) {
+    if (method === 'cluster' && clusterUnavailable && (directQuoted || solanaClusterPair)) {
       userPickedMethod.current = false
       setMethod('directly')
     } else if (method === 'directly' && directUnavailable && clusterQuoted) {
       userPickedMethod.current = false
       setMethod('cluster')
     }
-  }, [method, clusterUnavailable, directUnavailable, clusterQuoted, directQuoted])
+  }, [method, clusterUnavailable, directUnavailable, clusterQuoted, directQuoted, solanaClusterPair])
   const shieldReviewKeyForFee = (feeSelection: EvmFeeSelection) =>
     `${routeKey}:${method}:${currentAmount}:${shieldAmountState?.amountRaw ?? ''}:${JSON.stringify(feeSelection)}`
   const shieldReviewKey = shieldReviewKeyForFee(evmMoveFee)
@@ -1470,11 +1499,14 @@ function TransferForm() {
     return domain === 'private' ? privateAddress : mainAddress
   }
   const maxDisabled = fundingRoute
-    ? !eligible ||
+    ? (!eligible && !solanaClusterPair) ||
       !managedAsset ||
       shieldConnection !== 'connected' ||
       !shieldAvailable ||
-      BigInt(shieldAvailable.amountRaw) === 0n
+      BigInt(shieldAvailable.amountRaw) === 0n ||
+      (solanaClusterPair &&
+        selected?.asset.asset.kind === 'native' &&
+        solanaClusterMaximumRaw === null)
     : !eligible ||
       !supportedPair ||
       (direction === 'main-to-private' ? publicRaw === null : privateRaw === null) ||
@@ -1548,7 +1580,7 @@ function TransferForm() {
         asset: selected.asset,
         chain: selected.chain,
         managed: managedAsset,
-        ...(from === 'shield' ? {} : { feeSelection }),
+        ...(from === 'shield' || solanaClusterPair ? {} : { feeSelection }),
         ...(from === 'shield' && destination ? { destination } : {}),
         dedupKey
       })
@@ -1991,7 +2023,8 @@ function TransferForm() {
     mainAddress &&
     privateAddress &&
     mainAddress !== privateAddress &&
-    sourceRaw
+    sourceRaw &&
+    !(solanaClusterPair && method === 'cluster')
   ) {
     const solanaAsset = {
       ...selected.asset,
@@ -2139,8 +2172,13 @@ function TransferForm() {
               type="button"
               onClick={() => {
                 userEditedMove.current = true
-                if (from === 'shield' && destination) setSelectedAssetId(destination.asset.asset.id)
-                else if (selected) setSelectedAssetId(selected.asset.asset.id)
+                const reversedAssetId =
+                  from === 'shield' && destination
+                    ? destination.asset.asset.id
+                    : selected?.asset.asset.id
+                if (reversedAssetId && assets.some(item => item.asset.asset.id === reversedAssetId)) {
+                  setSelectedAssetId(reversedAssetId)
+                } else if (selected) setSelectedAssetId(selected.asset.asset.id)
                 setDestinationAssetId(null)
                 setFrom(to)
                 setTo(from)
@@ -2190,15 +2228,15 @@ function TransferForm() {
             {transferError}
           </p>
         )}
-        {selected?.chain.chain.family === 'evm' &&
+        {(selected?.chain.chain.family === 'evm' || solanaClusterPair) &&
           clusterPair &&
-          (clusterAvailable || methodAvailable) && (
+          (clusterAvailable || methodAvailable || solanaClusterPair) && (
             <div
               role="radiogroup"
               aria-label="Transfer method"
               className={cn(
                 'mt-auto grid shrink-0 gap-2.5 pt-4',
-                clusterAvailable && methodAvailable
+                clusterAvailable && (methodAvailable || solanaClusterPair)
                   ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'
                   : 'grid-cols-1'
               )}
@@ -2216,23 +2254,28 @@ function TransferForm() {
                     shieldConnection === 'connected' &&
                     clusterEstimate.loading
                   }
-                  fee={formatMoveMethodFee(clusterEstimateWithFee, selected.asset)}
+                  fee={formatMoveMethodFee(clusterEstimateWithFee, selected?.asset ?? null)}
                   onClick={() => {
                     userPickedMethod.current = true
                     setMethod('cluster')
                   }}
                 />
               )}
-              {methodAvailable && (
+              {(methodAvailable || solanaClusterPair) && (
                 <MethodCard
                   title="Directly"
                   detail="One transaction"
                   recommended={false}
                   selected={method === 'directly'}
-                  disabled={directUnavailable}
-                  estimate={directEstimate.value}
-                  loading={canEstimateMethods && methodAvailable && directEstimate.loading}
-                  fee={formatMoveMethodFee(directEstimate.value, selected.asset)}
+                  disabled={solanaClusterPair ? false : directUnavailable}
+                  estimate={solanaClusterPair ? null : directEstimate.value}
+                  loading={
+                    canEstimateMethods &&
+                    methodAvailable &&
+                    !solanaClusterPair &&
+                    directEstimate.loading
+                  }
+                  fee={formatMoveMethodFee(directEstimate.value, selected?.asset ?? null)}
                   onClick={() => {
                     userPickedMethod.current = true
                     setMethod('directly')
@@ -2452,7 +2495,7 @@ function TransferForm() {
         open={networkPickerOpen}
         onOpenChange={setNetworkPickerOpen}
         options={destinationNetworkOptions}
-        selectedId={destination?.chain.chain.id ?? null}
+        selectedId={targetAsset?.chain.chain.id ?? null}
         label={`Networks for ${symbol}`}
         onSelect={id => {
           const item =

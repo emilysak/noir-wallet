@@ -37,7 +37,10 @@ import { MultichainActivityPanel } from '../components/transaction/MultichainAct
 import { Skeleton } from '../components/ui/skeleton'
 import { MultichainActivityDetail } from '../components/transaction/MultichainActivityDetail'
 import type { ActivityItem } from '@/core/activity'
-import { resolveEvmFeatureRuntimePolicy } from '@/core/chains/feature-runtime-policy'
+import {
+  resolveEvmFeatureRuntimePolicy,
+  resolveSolanaFeatureRuntimePolicy
+} from '@/core/chains/feature-runtime-policy'
 import {
   clearHomeActivityAssetFilter,
   clearHomeTransactionFocus,
@@ -78,6 +81,10 @@ import {
 } from '../services/asset-domains'
 import { selectShieldActions, type ShieldAction } from '../services/shield-action-selection'
 import { getPrivateTransferChainIds } from '../services/private-balance-transfer'
+import {
+  isSolanaPrivateExecutionAddress,
+  supportsSolanaPrivateExecution
+} from '@/core/chains/solana'
 import { prewarmInitialSwapCatalog } from '../services/swap-catalog-loading'
 import { createSwapTokenPreferenceScope } from '../services/swap-token-selection'
 import { useSwapPreferences } from '@/store/swap-store'
@@ -92,6 +99,10 @@ const evmOperationsEnabled = resolveEvmFeatureRuntimePolicy(
   __ENABLED_CHAIN_FEATURE_FLAGS__
 ).newOperationsEnabled
 const canUseSharedPortfolioTotalCache = __ENABLED_CHAIN_FEATURE_FLAGS__.length > 1
+
+const solanaOperationsEnabled = resolveSolanaFeatureRuntimePolicy(
+  __ENABLED_CHAIN_FEATURE_FLAGS__
+).newOperationsEnabled
 
 export function Home() {
   const openResyncZcash = useResyncZcash()
@@ -305,10 +316,21 @@ export function Home() {
   const canMoveEvm =
     evmOperationsEnabled &&
     getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length > 0
+  const canMoveSolana =
+    solanaOperationsEnabled &&
+    supportsSolanaPrivateExecution(storageV2Account?.walletSource) &&
+    (storageV2Account?.networks.some(network => {
+      if (network.chain.family !== 'solana') return false
+      const mainAddress =
+        network.addresses.find(address => address.preferredForReceive)?.value ??
+        network.addresses[0]?.value
+      return isSolanaPrivateExecutionAddress(network.privateExecutionAddress, mainAddress)
+    }) ??
+      false)
   const showMove =
     assetDomain === 'all'
-      ? privateMode && evmOperationsEnabled
-      : (assetDomain === 'public' || assetDomain === 'private') && canMoveEvm
+      ? privateMode && (evmOperationsEnabled || canMoveSolana)
+      : (assetDomain === 'public' || assetDomain === 'private') && (canMoveEvm || canMoveSolana)
   const openSend = () => {
     const sendPath =
       assetDomain === 'public' && publicSendSource

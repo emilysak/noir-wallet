@@ -110,6 +110,7 @@ export function getAssetProtocolSourceMappings(
   if (network !== 'mainnet') return Object.freeze([])
   const zcashChainId = getZcashChainId(network)
   const bitcoinChainId = getBitcoinChainId(network)
+  const solanaChainId = getSolanaNetworkConfig('mainnet').chainId
   const evmNetworks = getEvmNetworkConfigs(network)
 
   return Object.freeze(
@@ -141,6 +142,12 @@ export function getAssetProtocolSourceMappings(
         asset.reference === '0'
       ) {
         protocolAssetId = ASSET_PRICE_SOURCE_ASSETS.btc
+      } else if (
+        asset.chainId === solanaChainId &&
+        asset.namespace === 'slip44' &&
+        asset.reference === '501'
+      ) {
+        protocolAssetId = ASSET_PRICE_SOURCE_ASSETS.sol
       }
       return protocolAssetId === null ? [] : [Object.freeze({ assetId: asset.id, protocolAssetId })]
     })

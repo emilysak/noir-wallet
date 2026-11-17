@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
+import { SOLANA_NETWORKS } from '../../../src/config/networks.ts'
 import { isAssetVisibleInAssetView } from '../../../src/popup/components/portfolio/portfolio-asset-visibility.ts'
 import { applyTokenDisplayPolicy } from '../../../src/core/portfolio/portfolio-visibility.ts'
 
@@ -60,6 +61,18 @@ test.describe('Portfolio asset-mode visibility', () => {
     expect(
       isAssetVisibleInAssetView(chain('eip155:42161', 'evm', 'Arbitrum'), asset({ symbol: 'ETH' }))
     ).toBe(false)
+    expect(
+      isAssetVisibleInAssetView(
+        chain(SOLANA_NETWORKS.mainnet.chainId, 'solana', 'Solana'),
+        asset({ symbol: 'SOL' })
+      )
+    ).toBe(true)
+    expect(
+      isAssetVisibleInAssetView(
+        chain(SOLANA_NETWORKS.devnet.chainId, 'solana', 'Solana Devnet'),
+        asset({ symbol: 'SOL' })
+      )
+    ).toBe(true)
     expect(
       isAssetVisibleInAssetView(
         chain('solana:mainnet', 'solana', 'Solana'),

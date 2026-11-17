@@ -1,3 +1,5 @@
+import { getSolanaNetworkConfig } from '@/config/networks'
+import { parseSolanaPublicKey } from '@/core/chains/solana'
 import { getActiveChainEndpointSettings } from '@/core/chains/chain-endpoint-settings'
 import { resolveEvmNetworkCatalog } from '@/core/chains/evm-runtime-config'
 import {
@@ -53,6 +55,8 @@ export function depositSourceAssetId(token: SwapToken, network: ChainDefinition)
 export function depositTokenChainId(token: SwapToken): string | null {
   const blockchain = token.blockchain.trim().toLowerCase()
   if (blockchain === 'zec' || blockchain === 'zcash') return getZcashChainId('mainnet')
+  if (blockchain === 'sol' || blockchain === 'solana')
+    return getSolanaNetworkConfig('mainnet').chainId
   return resolveIntentsEvmChainId(
     blockchain,
     resolveEvmNetworkCatalog('mainnet', getActiveChainEndpointSettings())
@@ -66,7 +70,9 @@ export function depositSourceNetworks(): readonly ChainDefinition[] {
   )
   return createBuildAddressGatedChainRegistry(createInitialProductChainRegistry('mainnet', custom))
     .list()
-    .filter(chain => chain.family === 'evm' || chain.family === 'zcash')
+    .filter(
+      chain => chain.family === 'evm' || chain.family === 'zcash' || chain.family === 'solana'
+    )
 }
 
 export function availableDepositTokens(
@@ -143,6 +149,20 @@ export function defaultDepositRefundAddress(
   const accountNetwork = accountNetworks.find(item => item.chain.id === network?.id)
   if (network?.family === 'evm' && accountNetwork?.privateExecutionAddress)
     return accountNetwork.privateExecutionAddress
+  if (network?.family === 'solana') {
+    const mainAddress =
+      accountNetwork?.addresses.find(address => address.preferredForReceive)?.value ??
+      accountNetwork?.addresses[0]?.value
+    const privateAddress = accountNetwork?.privateExecutionAddress
+    if (privateAddress && mainAddress && privateAddress !== mainAddress) {
+      try {
+        return parseSolanaPublicKey(privateAddress)
+      } catch {
+        return mainAddress
+      }
+    }
+    return mainAddress ?? ''
+  }
   return accountNetwork?.addresses.find(address => address.privacy === 'transparent')?.value ?? ''
 }
 
@@ -157,6 +177,14 @@ export function depositRefundAddressError(
     return isAddress(value) && value.toLowerCase() !== zeroAddress
       ? null
       : 'Enter a valid EVM address'
+  }
+  if (network.family === 'solana') {
+    try {
+      parseSolanaPublicKey(value)
+      return null
+    } catch {
+      return 'Enter a valid Solana address'
+    }
   }
   if (network.family === 'zcash') {
     try {

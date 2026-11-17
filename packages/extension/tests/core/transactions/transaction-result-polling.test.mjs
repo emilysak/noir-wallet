@@ -95,6 +95,24 @@ test('keeps the canonical available balance for non-EVM swap sources', () => {
   }
 
   expect(resolveWalletSwapSourceAvailableRaw(source, 'private')).toBe('42')
+  expect(
+    resolveWalletSwapSourceAvailableRaw(
+      {
+        family: 'solana',
+        asset: { balance: { availableRaw: '15', mainRaw: '10', privateRaw: '5' } }
+      },
+      'private'
+    )
+  ).toBe('5')
+  expect(
+    resolveWalletSwapSourceAvailableRaw(
+      {
+        family: 'solana',
+        asset: { balance: { availableRaw: '15', mainRaw: '10', privateRaw: '5' } }
+      },
+      'main'
+    )
+  ).toBe('15')
 })
 
 test('applies Private execution only to an EVM source that has a Private account', () => {
