@@ -104,6 +104,23 @@ test('sends an exact intent and accepts only a graph-bound NEAR review', async (
     }
   ])
 
+  messages.length = 0
+  await client.prepareTransfer(
+    { assetId: `${chainId}/slip44:397`, recipient, amountRaw },
+    { executionMode: 'private' }
+  )
+  expect(messages).toEqual([
+    {
+      type: 'PREPARE_NEAR_TRANSFER',
+      intent: {
+        assetId: `${chainId}/slip44:397`,
+        recipient,
+        amountRaw,
+        executionMode: 'private'
+      }
+    }
+  ])
+
   const forged = createNearWalletClient(async () => ({ result: review('mallory.testnet') }))
   await expect(
     forged.prepareTransfer({ assetId: `${chainId}/slip44:397`, recipient, amountRaw })
@@ -134,6 +151,135 @@ test('rejects malformed input and non-canonical runtime errors before UI use', a
   await expect(
     forgedError.prepareTransfer({ assetId: `${chainId}/slip44:397`, recipient, amountRaw })
   ).rejects.toMatchObject({ code: 'invalid-response' })
+})
+
+function functionCall(methodName, args, depositYocto) {
+  const value = Buffer.from(JSON.stringify(args)).toString('base64')
+  return {
+    kind: 'function-call',
+    methodName,
+    args: {
+      encoding: 'base64',
+      value,
+      byteLength: Buffer.from(value, 'base64').byteLength,
+      sha256: 'a'.repeat(64)
+    },
+    gas: '30000000000000',
+    depositYocto
+  }
+}
+
+function tokenReview(actions, amount = '1500000') {
+  const tokenGraph = structuredClone(graph)
+  tokenGraph.root.intent.primaryAmount = {
+    assetId: `${chainId}/nep141:token.testnet`,
+    amountRaw: amount
+  }
+  tokenGraph.root.intent.feeLimit = {
+    ...tokenGraph.root.intent.feeLimit,
+    amountRaw: '30000000000000000000000'
+  }
+  return {
+    graph: tokenGraph,
+    debit: {
+      maximumFeeRaw: '30000000000000000000000',
+      storageReserveRaw: '1000000000000000000000'
+    },
+    review: {
+      chainId,
+      operation: 'transaction',
+      summary: {
+        schema: 'near.transaction.v1',
+        chainId,
+        operation: 'transaction',
+        review: { level: 'standard', issues: [] },
+        fields: {
+          signerId,
+          publicKey,
+          nonce: '42',
+          receiverId: 'token.testnet',
+          blockHash,
+          actions
+        }
+      },
+      payloadFingerprint: { algorithm: 'sha256', digestHex: 'b'.repeat(64) },
+      expiresAt: 5_000
+    }
+  }
+}
+
+test('accepts an ft_transfer with one leading bounded storage_deposit', async () => {
+  const tokenAmount = '1500000'
+  const storageDeposit = '1250000000000000000000'
+  const ftTransfer = functionCall(
+    'ft_transfer',
+    { receiver_id: recipient, amount: tokenAmount },
+    '1'
+  )
+  const storage = functionCall(
+    'storage_deposit',
+    { account_id: recipient, registration_only: true },
+    storageDeposit
+  )
+  const intent = {
+    assetId: `${chainId}/nep141:token.testnet`,
+    recipient,
+    amountRaw: tokenAmount
+  }
+  const registered = createNearWalletClient(async () => ({
+    result: tokenReview([ftTransfer], tokenAmount)
+  }))
+  await expect(registered.prepareTransfer(intent)).resolves.toMatchObject({
+    review: { summary: { fields: { actions: [{ methodName: 'ft_transfer' }] } } }
+  })
+
+  const unregistered = createNearWalletClient(async () => ({
+    result: tokenReview([storage, ftTransfer], tokenAmount)
+  }))
+  await expect(unregistered.prepareTransfer(intent)).resolves.toMatchObject({
+    review: {
+      summary: {
+        fields: {
+          receiverId: 'token.testnet',
+          actions: [{ methodName: 'storage_deposit' }, { methodName: 'ft_transfer' }]
+        }
+      }
+    }
+  })
+
+  const wrongDeposit = createNearWalletClient(async () => ({
+    result: tokenReview(
+      [
+        functionCall(
+          'storage_deposit',
+          { account_id: recipient, registration_only: true },
+          '9990000000000000000000000'
+        ),
+        ftTransfer
+      ],
+      tokenAmount
+    )
+  }))
+  await expect(wrongDeposit.prepareTransfer(intent)).rejects.toMatchObject({
+    code: 'invalid-response'
+  })
+
+  const openRegistration = createNearWalletClient(async () => ({
+    result: tokenReview(
+      [
+        functionCall(
+          'storage_deposit',
+          { account_id: recipient, registration_only: false },
+          storageDeposit
+        ),
+        ftTransfer
+      ],
+      tokenAmount
+    )
+  }))
+  await expect(openRegistration.prepareTransfer(intent)).rejects.toMatchObject({
+    code: 'invalid-response'
+  })
 })
 
 test('accepts a finalized NEAR activity item with a canonical Base58 transaction hash', async () => {

@@ -5,6 +5,7 @@ export {
   parseNearBase58,
   parseNearPublicKey
 } from './identifiers'
+export { supportsNearPrivateExecution } from './execution-capability'
 export {
   NEAR_WALLET_RUNTIME_ERROR_CODES,
   createNearWalletRuntimeError,

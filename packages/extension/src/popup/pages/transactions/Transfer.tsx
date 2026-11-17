@@ -94,6 +94,7 @@ import {
 } from '@/popup/services/shield-transfer'
 import { TransactionReviewView } from '@/popup/components/transaction/TransactionReviewView'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
+import { NearSendForm } from './NearSendForm'
 import { SolanaSendForm } from './SolanaSendForm'
 import { openConfidentialActivity } from '@/popup/components/transaction/ConfidentialActivitySheet'
 import {
@@ -103,6 +104,7 @@ import {
 } from '@/popup/services/transfer-maximum'
 import {
   normalizePrivateBalanceTransferInput,
+  getNearMoveChainIds,
   getPrivateTransferChainIds,
   getTransferDomainBalanceRaw,
   resolvePrivateBalanceTransferAmount,
@@ -112,8 +114,8 @@ import {
   type TransferDomain
 } from '@/popup/services/private-balance-transfer'
 import {
-  buildAddToPrivateEvmPath,
-  buildMoveToMainEvmPath,
+  buildAddToPrivateMovePath,
+  buildMoveToMainMovePath,
   getEvmTokenFeeBalanceError
 } from './evm-send-validation'
 import { initialMoveDraft, readMoveAssetHint, readMoveDraft } from './move-draft'
@@ -658,6 +660,10 @@ function TransferForm() {
         : [],
     [activeAccount]
   )
+  const nearChainIds = useMemo(
+    () => getNearMoveChainIds(activeAccount, currentNetwork === 'mainnet'),
+    [activeAccount, currentNetwork]
+  )
   const currentShieldBalances = useMemo(
     () => shieldBalances ?? shieldPortfolioBalances(portfolio),
     [shieldBalances, portfolio]
@@ -670,7 +676,8 @@ function TransferForm() {
       return chain &&
         chain.chain.capabilities.transaction.status === 'available' &&
         ((chain.chain.family === 'evm' && eligibleChainIds.includes(chain.chain.id)) ||
-          (chain.chain.family === 'solana' && solanaChainIds.includes(chain.chain.id)))
+          (chain.chain.family === 'solana' && solanaChainIds.includes(chain.chain.id)) ||
+          (chain.chain.family === 'near' && nearChainIds.includes(chain.chain.id)))
         ? [{ asset, chain }]
         : []
     })
@@ -689,7 +696,10 @@ function TransferForm() {
       ...fallbackAssets
         .filter(
           item =>
-            eligibleChainIds.includes(item.chain.chain.id) && !existing.has(item.asset.asset.id)
+            (eligibleChainIds.includes(item.chain.chain.id) ||
+              nearChainIds.includes(item.chain.chain.id) ||
+              (currentNetwork === 'mainnet' && solanaChainIds.includes(item.chain.chain.id))) &&
+            !existing.has(item.asset.asset.id)
         )
         .map(({ asset, chain }) => ({ asset, chain }))
     ]
@@ -701,6 +711,7 @@ function TransferForm() {
     currentNetwork,
     eligibleChainIds,
     solanaChainIds,
+    nearChainIds,
     shieldEntry
   ])
   const defaultAssetId = useMemo(
@@ -868,7 +879,17 @@ function TransferForm() {
   const mainAddress =
     accountNetwork?.addresses.find(address => address.preferredForReceive)?.value ?? ''
   const privateAddress = accountNetwork?.privateExecutionAddress ?? ''
-  const eligible = Boolean(selected && eligibleChainIds.includes(selected.chain.chain.id))
+  const mainnetConfidentialChain = Boolean(
+    currentNetwork === 'mainnet' &&
+    selected &&
+    (selected.chain.chain.family === 'near' || selected.chain.chain.family === 'solana')
+  )
+  const eligible = Boolean(
+    selected &&
+    (eligibleChainIds.includes(selected.chain.chain.id) ||
+      solanaChainIds.includes(selected.chain.chain.id) ||
+      nearChainIds.includes(selected.chain.chain.id))
+  )
   const direction: PrivateBalanceTransferDirection =
     from === 'private' ? 'private-to-main' : 'main-to-private'
   const publicRaw = selected ? getTransferDomainBalanceRaw(selected.asset, 'public') : null
@@ -900,11 +921,25 @@ function TransferForm() {
           mainAddress,
           privateAddress
         })
-      : null
+      : mainnetConfidentialChain && mainAddress
+        ? {
+            availableRaw: sourceRaw ?? '0',
+            sender: from === 'private' && privateAddress ? privateAddress : mainAddress,
+            recipient: to === 'private' && privateAddress ? privateAddress : mainAddress,
+            executionMode: (from === 'private' && privateAddress ? 'private' : 'main') as
+              | 'main'
+              | 'private',
+            sourceLabel: from === 'private' ? ('Private' as const) : ('Public' as const)
+          }
+        : null
   const supportedPair =
     (from === 'public' && to === 'private') || (from === 'private' && to === 'public')
-  const shieldPair = isShieldTransferRoute(from, to) && selected?.chain.chain.family === 'evm'
-  const clusterPair = isClusterTransferRoute(from, to) && selected?.chain.chain.family === 'evm'
+  const shieldPair =
+    isShieldTransferRoute(from, to) &&
+    (selected?.chain.chain.family === 'evm' || mainnetConfidentialChain)
+  const clusterPair =
+    isClusterTransferRoute(from, to) &&
+    (selected?.chain.chain.family === 'evm' || mainnetConfidentialChain)
   const clusterSelected = method === 'cluster' && clusterPair
   const fundingRoute = Boolean(shieldPair || clusterSelected)
   useEffect(() => {
@@ -1049,7 +1084,18 @@ function TransferForm() {
 
   useEffect(() => {
     let cancelled = false
-    if (!selected || selected.chain.chain.family !== 'evm' || !eligible || !supportedPair) {
+    if (!selected || !eligible || !supportedPair) {
+      setRouteSnapshot({ key: routeKey, status: 'unsupported' })
+      return
+    }
+    if (
+      currentNetwork === 'mainnet' &&
+      (selected.chain.chain.family === 'near' || selected.chain.chain.family === 'solana')
+    ) {
+      setRouteSnapshot({ key: routeKey, status: managedAsset ? 'supported' : 'unsupported' })
+      return
+    }
+    if (selected.chain.chain.family !== 'evm') {
       setRouteSnapshot({ key: routeKey, status: 'unsupported' })
       return
     }
@@ -1101,7 +1147,17 @@ function TransferForm() {
     return () => {
       cancelled = true
     }
-  }, [routeKey, selected?.chain.chain.id, eligible, supportedPair, retry, amount])
+  }, [
+    routeKey,
+    selected?.chain.chain.id,
+    selected?.chain.chain.family,
+    eligible,
+    supportedPair,
+    retry,
+    amount,
+    currentNetwork,
+    managedAsset
+  ])
 
   const nativeMaximumEnabled = Boolean(
     selected &&
@@ -1408,16 +1464,20 @@ function TransferForm() {
       wallet.currentNetwork !== currentNetwork
     )
       return
+    const family = selected.chain.chain.family
+    if (family !== 'evm' && family !== 'near' && family !== 'solana') return
     navigate(
       direction === 'main-to-private'
-        ? buildAddToPrivateEvmPath({
+        ? buildAddToPrivateMovePath({
             assetId: selected.asset.asset.id,
             chainId: selected.chain.chain.id,
+            family,
             amount: currentAmount,
             maximum: maxSelected
           })
-        : buildMoveToMainEvmPath({
+        : buildMoveToMainMovePath({
             assetId: selected.asset.asset.id,
+            family,
             mainAddress,
             amount: currentAmount,
             maximum: maxSelected
@@ -1832,7 +1892,7 @@ function TransferForm() {
             ...(networkFee
               ? [
                   {
-                    label: 'Max network fee',
+                    label: activeShieldReview.sourceEvmFee ? 'Max network fee' : 'Network fee',
                     content: activeShieldReview.sourceEvmFee ? (
                       <NetworkFeeTierPicker
                         chainFamily="evm"
@@ -1944,6 +2004,7 @@ function TransferForm() {
   }
 
   if (
+    currentNetwork !== 'mainnet' &&
     selected?.chain.chain.family === 'solana' &&
     from !== 'shield' &&
     to !== 'shield' &&
@@ -1967,6 +2028,50 @@ function TransferForm() {
         <div className="page-content min-h-0">
           <SolanaSendForm
             selection={{ asset: solanaAsset, chain: selected.chain }}
+            priceUsd={
+              assetPrices
+                ? (findAssetPrice(assetPrices, selected.asset.asset.id)?.priceUsd ?? null)
+                : null
+            }
+            executionMode={from === 'private' ? 'private' : 'main'}
+            initialRecipient={from === 'private' ? mainAddress : privateAddress}
+            initialAmount={amount}
+            onSubmitted={submission =>
+              navigate(
+                `/?tab=activity&transactionId=${encodeURIComponent(submission.graph.root.id)}`
+              )
+            }
+          />
+        </div>
+      </div>
+    )
+  }
+
+  if (
+    currentNetwork !== 'mainnet' &&
+    selected?.chain.chain.family === 'near' &&
+    from !== 'shield' &&
+    to !== 'shield' &&
+    mainAddress &&
+    privateAddress &&
+    mainAddress !== privateAddress &&
+    sourceRaw
+  ) {
+    const nearAsset = {
+      ...selected.asset,
+      balance: {
+        ...selected.asset.balance,
+        totalRaw: sourceRaw,
+        spendableRaw: sourceRaw,
+        availableRaw: sourceRaw
+      }
+    }
+    return (
+      <div className="page-container" data-wallet-mode={walletMode}>
+        <PageHeader title="Move" showBack onBack={goBack} />
+        <div className="page-content min-h-0">
+          <NearSendForm
+            selection={{ asset: nearAsset, chain: selected.chain }}
             priceUsd={
               assetPrices
                 ? (findAssetPrice(assetPrices, selected.asset.asset.id)?.priceUsd ?? null)
@@ -2148,57 +2253,53 @@ function TransferForm() {
             {transferError}
           </p>
         )}
-        {selected?.chain.chain.family === 'evm' &&
-          clusterPair &&
-          (clusterAvailable || methodAvailable) && (
-            <div
-              role="radiogroup"
-              aria-label="Transfer method"
-              className={cn(
-                'mt-auto grid shrink-0 gap-2.5 pt-4',
-                clusterAvailable && methodAvailable
-                  ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'
-                  : 'grid-cols-1'
-              )}
-            >
-              {clusterAvailable && (
-                <MethodCard
-                  title="Cluster"
-                  detail="Multiple transactions"
-                  recommended
-                  selected={method === 'cluster'}
-                  disabled={clusterUnavailable}
-                  estimate={clusterEstimate.value}
-                  loading={
-                    canEstimateMethods &&
-                    shieldConnection === 'connected' &&
-                    clusterEstimate.loading
-                  }
-                  fee={formatMoveMethodFee(clusterEstimate.value, selected.asset)}
-                  onClick={() => {
-                    userPickedMethod.current = true
-                    setMethod('cluster')
-                  }}
-                />
-              )}
-              {methodAvailable && (
-                <MethodCard
-                  title="Directly"
-                  detail="One transaction"
-                  recommended={false}
-                  selected={method === 'directly'}
-                  disabled={directUnavailable}
-                  estimate={directEstimate.value}
-                  loading={canEstimateMethods && methodAvailable && directEstimate.loading}
-                  fee={formatMoveMethodFee(directEstimate.value, selected.asset)}
-                  onClick={() => {
-                    userPickedMethod.current = true
-                    setMethod('directly')
-                  }}
-                />
-              )}
-            </div>
-          )}
+        {selected && clusterPair && (clusterAvailable || methodAvailable) && (
+          <div
+            role="radiogroup"
+            aria-label="Transfer method"
+            className={cn(
+              'mt-auto grid shrink-0 gap-2.5 pt-4',
+              clusterAvailable && methodAvailable
+                ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'
+                : 'grid-cols-1'
+            )}
+          >
+            {clusterAvailable && (
+              <MethodCard
+                title="Cluster"
+                detail="Multiple transactions"
+                recommended
+                selected={method === 'cluster'}
+                disabled={clusterUnavailable}
+                estimate={clusterEstimate.value}
+                loading={
+                  canEstimateMethods && shieldConnection === 'connected' && clusterEstimate.loading
+                }
+                fee={formatMoveMethodFee(clusterEstimate.value, selected.asset)}
+                onClick={() => {
+                  userPickedMethod.current = true
+                  setMethod('cluster')
+                }}
+              />
+            )}
+            {methodAvailable && (
+              <MethodCard
+                title="Directly"
+                detail="One transaction"
+                recommended={false}
+                selected={method === 'directly'}
+                disabled={directUnavailable}
+                estimate={directEstimate.value}
+                loading={canEstimateMethods && methodAvailable && directEstimate.loading}
+                fee={formatMoveMethodFee(directEstimate.value, selected.asset)}
+                onClick={() => {
+                  userPickedMethod.current = true
+                  setMethod('directly')
+                }}
+              />
+            )}
+          </div>
+        )}
         {fundingRoute &&
           selected?.chain.chain.family === 'evm' &&
           from !== 'shield' &&

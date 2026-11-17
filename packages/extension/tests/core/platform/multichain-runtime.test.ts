@@ -58,6 +58,15 @@ const SOLANA_ACCOUNT = Object.freeze({
   addressScheme: 'solana',
   derivationScheme: 'slip10'
 })
+const NEAR_PEA = Object.freeze({
+  address: 'b90b217039eed36162aef24e79ec0be08063210c65eff1a1c3d1af7c11fa8af4',
+  publicKey: 'ed25519:DTLGYm12WdyTMRtPRtYAhrudpDuQYvTJnfrgq3StWJfV',
+  curve: 'ed25519',
+  derivationScheme: 'pea_v2',
+  parent: Object.freeze({ accountIndex: 0 }),
+  family: 'near',
+  addressScheme: 'near'
+})
 const NEAR_ACCOUNT = Object.freeze({
   accountId: `near:testnet:${'11'.repeat(32)}`,
   address: '11'.repeat(32),
@@ -151,7 +160,8 @@ class FakeWalletEngine implements RawWalletEngine {
 
   derivePeaAccount(_sessionId: number, requestJson: string): unknown {
     this.peaRequests.push(requestJson)
-    return GLOBAL_PEA
+    const request = JSON.parse(requestJson) as { family?: string }
+    return request.family === 'near' ? NEAR_PEA : GLOBAL_PEA
   }
 
   deriveSolanaAccount(): unknown {
@@ -454,6 +464,24 @@ test.describe('Multichain Worker runtime boundaries', () => {
     expect(engine.peaRequests).toEqual([
       '{"version":1,"parent":{"addressIndex":0}}',
       '{"version":1,"parent":{"addressIndex":0}}'
+    ])
+  })
+
+  test('derives a global NEAR PEA from the parent account index', async () => {
+    const engine = new FakeWalletEngine()
+    const runtime = createRuntime(engine)
+    expectSuccess(
+      await runtime.execute(command('credential.unlock', { vault: VAULT, password: 'password' }))
+    )
+
+    const pea = expectSuccess(
+      await runtime.execute(
+        command('account.derive-public', { family: 'near-pea', accountIndex: 0 })
+      )
+    )
+    expect(pea).toEqual(NEAR_PEA)
+    expect(engine.peaRequests).toEqual([
+      '{"version":2,"family":"near","parent":{"accountIndex":0}}'
     ])
   })
 

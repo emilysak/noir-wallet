@@ -11,6 +11,7 @@ import {
 } from '../../../src/popup/services/home-asset-breakdown.ts'
 import {
   getAssetDomainRaw,
+  getAssetShieldProvider,
   projectPortfolioForDomain,
   selectHomeActionSource,
   summarizeAssetDomainsUsd,
@@ -1087,7 +1088,73 @@ test('projects Solana main and PEA balances into separate execution domains', ()
     chainId
   ])
   expect(projectPortfolioForDomain(model, 'shield').chains).toEqual([])
+  const shieldedNative = {
+    ...asset,
+    asset: { ...asset.asset, kind: 'native' },
+    balance: { ...asset.balance, confidentialRaw: '7' }
+  }
+  expect(getAssetDomainRaw(shieldedNative, 'shield')).toBe('7')
+  expect(getAssetShieldProvider(shieldedNative)).toBe('near-confidential')
+  expect(
+    projectPortfolioForDomain(
+      { assets: [shieldedNative], chains: [{ ...chain, assets: [shieldedNative] }] },
+      'shield'
+    ).chains.map(item => item.chain.id)
+  ).toEqual([chainId])
   expect(selectHomeActionSource(model, 'private', 'send')?.asset.asset.id).toBe(asset.asset.id)
   expect(selectHomeActionSource(model, 'public', 'swap')).toBeNull()
   expect(selectHomeActionSource(model, 'private', 'swap')?.asset.asset.id).toBe(asset.asset.id)
+})
+
+test('projects NEAR main and PEA balances without folding Shield into private', () => {
+  const chainId = 'near:mainnet'
+  const asset = {
+    asset: { id: `${chainId}/slip44:397`, chainId, kind: 'native' },
+    balance: {
+      totalRaw: '14',
+      mainRaw: '10',
+      privateRaw: '4',
+      confidentialRaw: '7',
+      availableRaw: '14',
+      spendableRaw: '14',
+      pendingRaw: '0'
+    }
+  }
+  const chain = {
+    chain: {
+      id: chainId,
+      family: 'near',
+      capabilities: { transaction: { status: 'available' } }
+    },
+    assets: [asset]
+  }
+  const model = { assets: [asset], chains: [chain] }
+  expect(getAssetDomainRaw(asset, 'public')).toBe('10')
+  expect(getAssetDomainRaw(asset, 'private')).toBe('4')
+  expect(getAssetDomainRaw(asset, 'shield')).toBe('7')
+  expect(getAssetShieldProvider(asset)).toBe('near-confidential')
+  expect(projectPortfolioForDomain(model, 'public').assets[0].balance.totalRaw).toBe('10')
+  expect(projectPortfolioForDomain(model, 'private').assets[0].balance.totalRaw).toBe('4')
+  expect(projectPortfolioForDomain(model, 'private').chains.map(item => item.chain.id)).toEqual([
+    chainId
+  ])
+  expect(projectPortfolioForDomain(model, 'shield').assets[0].balance.totalRaw).toBe('7')
+  expect(projectPortfolioForDomain(model, 'shield').chains.map(item => item.chain.id)).toEqual([
+    chainId
+  ])
+  expect(
+    getAssetDomainRaw({ ...asset, balance: { ...asset.balance, totalRaw: '99' } }, 'private')
+  ).toBeNull()
+  expect(
+    getAssetDomainRaw({ ...asset, balance: { ...asset.balance, totalRaw: '99' } }, 'shield')
+  ).toBe('7')
+  const testnet = {
+    ...asset,
+    asset: { ...asset.asset, id: 'near:testnet/slip44:397', chainId: 'near:testnet' }
+  }
+  expect(getAssetDomainRaw(testnet, 'public')).toBe('10')
+  expect(getAssetDomainRaw(testnet, 'private')).toBe('4')
+  expect(getAssetDomainRaw(testnet, 'shield')).toBe('0')
+  expect(selectHomeActionSource(model, 'private', 'send')?.asset.asset.id).toBe(asset.asset.id)
+  expect(selectHomeActionSource(model, 'private', 'swap')).toBeNull()
 })

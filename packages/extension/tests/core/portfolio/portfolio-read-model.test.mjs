@@ -287,6 +287,53 @@ test.describe('Portfolio read model', () => {
     )
   })
 
+  test('accepts a protocol Shield balance kept outside the on-chain total', () => {
+    const model = buildPortfolioReadModel(
+      scope,
+      [
+        source(ethereumId, 'ready', [
+          balance(`${ethereumId}/slip44:60`, {
+            totalRaw: '1500',
+            spendableRaw: '1500',
+            availableRaw: '1500',
+            pendingRaw: '0',
+            mainRaw: '1000',
+            privateRaw: '500'
+          })
+        ])
+      ],
+      visibleChains,
+      assetRegistry
+    )
+    const stamp = (target, fields) => {
+      Object.assign(target.assets[0].balance, fields)
+      Object.assign(target.chains[0].assets[0].balance, fields)
+    }
+
+    const externalShield = structuredClone(model)
+    stamp(externalShield, { confidentialRaw: '7' })
+    expect(
+      parsePortfolioReadModel(externalShield, visibleChains, assetRegistry).assets[0].balance
+    ).toMatchObject({
+      totalRaw: '1500',
+      mainRaw: '1000',
+      privateRaw: '500',
+      confidentialRaw: '7'
+    })
+
+    const onlyOnchain = structuredClone(model)
+    stamp(onlyOnchain, { privateOnchainRaw: '500' })
+    expect(() => parsePortfolioReadModel(onlyOnchain, visibleChains, assetRegistry)).toThrow(
+      /breakdown/
+    )
+
+    const mismatched = structuredClone(model)
+    stamp(mismatched, { privateOnchainRaw: '400', confidentialRaw: '50' })
+    expect(() => parsePortfolioReadModel(mismatched, visibleChains, assetRegistry)).toThrow(
+      /breakdown/
+    )
+  })
+
   test('rejects spoofed metadata, inconsistent top-level assets, and non-canonical balances', () => {
     const model = buildPortfolioReadModel(
       scope,

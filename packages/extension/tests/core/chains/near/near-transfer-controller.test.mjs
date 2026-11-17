@@ -117,3 +117,41 @@ test('rejects cross-network assets and unsupported hardware signing', async () =
   ).rejects.toThrow(/cannot sign/i)
   expect(hardware.calls).toEqual([])
 })
+
+test('sends private NEAR execution through the orchestrator and excludes hardware', async () => {
+  const { calls, controller } = setup()
+  const intent = {
+    assetId: `${chainId}/slip44:397`,
+    recipient,
+    amountRaw: '1000000000000000000000',
+    executionMode: 'private'
+  }
+  await controller.prepare(intent)
+  expect(calls[0][1]).toMatchObject({
+    accountIndex: 3,
+    publicKey,
+    executionMode: 'private'
+  })
+  await controller.prepare({ ...intent, executionMode: 'main' })
+  expect(calls[1][1]).not.toHaveProperty('executionMode')
+
+  const imported = setup({
+    ...activeContext,
+    accountIndex: 0,
+    keyDomainSource: { kind: 'private-key', chainFamily: 'near' }
+  })
+  await imported.controller.prepare(intent)
+  expect(imported.calls[0][1]).toMatchObject({ accountIndex: 0, executionMode: 'private' })
+
+  const ledger = setup({
+    ...activeContext,
+    keyDomainSource: {
+      kind: 'hardware',
+      vendor: 'ledger',
+      firmwareProfile: 'multi-coin',
+      capabilities: ['near']
+    }
+  })
+  await expect(ledger.controller.prepare(intent)).rejects.toThrow(/private execution is unavailable/i)
+  expect(ledger.calls).toEqual([])
+})

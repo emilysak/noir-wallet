@@ -20,6 +20,7 @@ import {
   readSafeUnsignedInteger,
   readU128
 } from './near-rpc-codecs'
+import { parseNearFungibleTokenMetadata } from './near-ft-metadata'
 import {
   NearRpcError,
   type NearBroadcastRpc,
@@ -36,6 +37,7 @@ export {
   type NearAccountSnapshot,
   type NearFinalBlockSnapshot,
   type NearFungibleTokenBalanceSnapshot,
+  type NearFungibleTokenMetadata,
   type NearGasCostComponents,
   type NearNativeTransferCostConfig,
   type NearReadRpc,
@@ -116,6 +118,39 @@ function containsRpcCause(value: unknown, expected: string, depth = 0): boolean 
   return Object.values(value).some(candidate => containsRpcCause(candidate, expected, depth + 1))
 }
 
+const RPC_CAUSE_LABEL = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
+const RPC_CAUSE_PREFERENCE =
+  /InvalidNonce|Expired|LackBalance|NotEnoughBalance|Timeout|AccountDoesNotExist|InvalidTx|ActionsValidation|REQUEST_VALIDATION|InvalidAccessKey|InvalidSigner|InvalidSignature/i
+
+function readRpcCauseLabel(value: unknown): string | null {
+  const labels: string[] = []
+  const visit = (current: unknown, depth: number): void => {
+    if (depth > 6) return
+    if (typeof current === 'string') {
+      const label = current.trim()
+      if (RPC_CAUSE_LABEL.test(label)) labels.push(label)
+      return
+    }
+    if (!isRecord(current)) return
+    for (const [key, child] of Object.entries(current)) {
+      if (key === 'code' || key === 'message') continue
+      if (
+        key !== 'data' &&
+        key !== 'cause' &&
+        key !== 'info' &&
+        key !== 'name' &&
+        RPC_CAUSE_LABEL.test(key)
+      ) {
+        labels.push(key)
+      }
+      visit(child, depth + 1)
+    }
+  }
+  visit(value, 0)
+  const matches = labels.filter(label => RPC_CAUSE_PREFERENCE.test(label))
+  return matches[matches.length - 1] ?? null
+}
+
 function parseRpcError(value: unknown): NearRpcError {
   if (
     !isRecord(value) ||
@@ -143,9 +178,10 @@ function parseRpcError(value: unknown): NearRpcError {
   if (containsRpcCause(value, 'UNKNOWN_TRANSACTION')) {
     return new NearRpcError('transaction-not-found', 'NEAR transaction was not found')
   }
+  const cause = readRpcCauseLabel(value)
   return new NearRpcError(
     value.code === 429 || value.code === -32_005 ? 'rate-limited' : 'rpc-error',
-    'NEAR RPC request failed'
+    cause ? `NEAR RPC request failed: ${cause}` : 'NEAR RPC request failed'
   )
 }
 
@@ -386,7 +422,7 @@ export function createNearRpcClient(
       ) {
         throw new NearRpcError('invalid-response', 'Invalid NEAR transaction execution status')
       }
-      if (executionStatus !== 'FINAL') {
+      if (!['EXECUTED', 'INCLUDED_FINAL', 'FINAL'].includes(executionStatus)) {
         return Object.freeze({ status: 'confirming' as const })
       }
       if (!isRecord(result.status)) {
@@ -400,7 +436,9 @@ export function createNearRpcClient(
         return Object.freeze({ status: 'failed' as const })
       }
       if (statusKeys[0] === 'SuccessValue' && typeof result.status.SuccessValue === 'string') {
-        return Object.freeze({ status: 'final' as const })
+        return Object.freeze({
+          status: executionStatus === 'FINAL' ? ('final' as const) : ('executed' as const)
+        })
       }
       throw new NearRpcError('invalid-response', 'Invalid finalized NEAR transaction status')
     },
@@ -423,6 +461,21 @@ export function createNearRpcClient(
         signal
       )
       return parseNearFungibleTokenBalance(result, contractId, accountId)
+    },
+    getFungibleTokenMetadata: async (contractIdValue: string, signal?: AbortSignal) => {
+      const contractId = readNearAccountId(contractIdValue, 'NEAR fungible token contract ID')
+      const result = await request(
+        'query',
+        Object.freeze({
+          request_type: 'call_function',
+          finality: 'final',
+          account_id: contractId,
+          method_name: 'ft_metadata',
+          args_base64: encodeNearFunctionArgs(Object.freeze({}))
+        }),
+        signal
+      )
+      return parseNearFungibleTokenMetadata(result, contractId)
     },
     isFungibleTokenAccountRegistered: async (
       contractIdValue: string,

@@ -1,3 +1,4 @@
+import { WNEAR_NEAR_ASSET } from '@/config/intents'
 import { getEvmNetworkConfigs, getNearNetworkConfig } from '@/config/networks'
 import {
   createAssetId,
@@ -51,6 +52,9 @@ export function resolveRheaSwapCanonicalAssetId(
   if (network === 'mainnet' && token) {
     const chainId = resolveIntentsEvmChainId(token[1], getEvmNetworkConfigs(network))
     if (chainId) return createAssetId(parseChainId(chainId).id, 'erc20', token[2].toLowerCase())
+  }
+  if (network === 'mainnet' && protocolAssetId === WNEAR_NEAR_ASSET) {
+    return createAssetId(parseChainId(getNearNetworkConfig(network).chainId).id, 'slip44', '397')
   }
   if (protocolAssetId.startsWith('nep141:')) {
     const contractId = protocolAssetId.slice('nep141:'.length)

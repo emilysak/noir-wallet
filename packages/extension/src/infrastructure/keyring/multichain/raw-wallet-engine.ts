@@ -112,6 +112,8 @@ export interface RawWalletEngine {
     executionChainId: string,
     message: Uint8Array
   ): unknown
+  preparePeaNearTransaction(sessionId: number, peaRequestJson: string, request: unknown): unknown
+  preparePeaNearMessage(sessionId: number, peaRequestJson: string, request: unknown): unknown
   verifySolanaMessage(
     chainId: string,
     address: string,
@@ -426,6 +428,11 @@ export function solanaPeaRequestJson(accountIndex: number): string {
   return JSON.stringify({ version: 2, family: 'solana', parent: { accountIndex } })
 }
 
+/** Global NEAR PEA request. No appId or chainId: those would change the KDF namespace. */
+export function nearPeaRequestJson(accountIndex: number): string {
+  return JSON.stringify({ version: 2, family: 'near', parent: { accountIndex } })
+}
+
 export interface RawDerivedSolanaPeaAccount {
   readonly address: string
   readonly publicKey: string
@@ -472,6 +479,55 @@ export function parseRawSolanaPeaAccount(
     parent: Object.freeze({ accountIndex: parentIndex }),
     family: readLiteral(record.family, ['solana'], `${label}.family`),
     addressScheme: readLiteral(record.addressScheme, ['solana'], `${label}.addressScheme`)
+  })
+}
+
+export interface RawDerivedNearPeaAccount {
+  readonly address: string
+  readonly publicKey: string
+  readonly curve: 'ed25519'
+  readonly derivationScheme: 'pea_v2'
+  readonly parent: Readonly<{ readonly accountIndex: number }>
+  readonly family: 'near'
+  readonly addressScheme: 'near'
+}
+
+export function parseRawNearPeaAccount(
+  value: unknown,
+  accountIndex: number
+): RawDerivedNearPeaAccount {
+  const label = 'DerivedNearPeaAccount'
+  const record = readRecord(value, label)
+  assertExactKeys(
+    record,
+    ['address', 'publicKey', 'curve', 'derivationScheme', 'parent', 'family', 'addressScheme'],
+    [],
+    label
+  )
+  const address = readString(record.address, `${label}.address`, 64)
+  const publicKey = readString(record.publicKey, `${label}.publicKey`, 64)
+  const parent = readRecord(record.parent, `${label}.parent`)
+  assertExactKeys(parent, ['accountIndex'], [], `${label}.parent`)
+  const parentIndex = readSafeInteger(
+    parent.accountIndex,
+    `${label}.parent.accountIndex`,
+    MAX_BIP32_INDEX
+  )
+  if (
+    !/^[0-9a-f]{64}$/.test(address) ||
+    !/^ed25519:[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(publicKey) ||
+    parentIndex !== accountIndex
+  ) {
+    throw new Error('Derived NEAR PEA account is invalid')
+  }
+  return Object.freeze({
+    address,
+    publicKey,
+    curve: readLiteral(record.curve, ['ed25519'], `${label}.curve`),
+    derivationScheme: readLiteral(record.derivationScheme, ['pea_v2'], `${label}.derivationScheme`),
+    parent: Object.freeze({ accountIndex: parentIndex }),
+    family: readLiteral(record.family, ['near'], `${label}.family`),
+    addressScheme: readLiteral(record.addressScheme, ['near'], `${label}.addressScheme`)
   })
 }
 

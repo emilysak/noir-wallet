@@ -43,6 +43,20 @@ export type PrivateQuotePurpose =
   | 'private-dapp-transfer'
   | 'public-private-send'
 
+/** NEAR and Solana private Move senders are not EVM addresses. The route check binds them. */
+function isNonEvmPrivateMoveQuote(purpose: PrivateQuotePurpose, fromChain: string): boolean {
+  return purpose === 'private-transfer' && (fromChain === 'near' || fromChain === 'solana')
+}
+
+export function assertReviewedPrivateQuoteSender(input: {
+  readonly purpose: PrivateQuotePurpose
+  readonly fromChain: string
+  readonly privateSender: boolean
+}): void {
+  if (input.privateSender || isNonEvmPrivateMoveQuote(input.purpose, input.fromChain)) return
+  throw new Error('Private quote needs a reviewed route.')
+}
+
 export function assertPrivateQuoteRoute(
   request: Pick<
     QuoteRequest,
@@ -52,18 +66,27 @@ export function assertPrivateQuoteRoute(
   purpose: PrivateQuotePurpose,
   scope?: Pick<PrivateSwapAccountRoute, 'walletId' | 'accountId'>
 ): void {
+  // Named RHEA ids are not EVM chain numbers. Only Zcash public sends and
+  // NEAR/Solana funding or private Move may pass; later checks bind the route.
+  const nonEvmFromChainAllowed =
+    (purpose === 'public-private-send' && request.fromChain === 'zcash') ||
+    ((purpose === 'confidential-funding' || purpose === 'private-transfer') &&
+      (request.fromChain === 'near' || request.fromChain === 'solana'))
   if (
     !account ||
     (scope && (account.walletId !== scope.walletId || account.accountId !== scope.accountId)) ||
     (purpose !== 'wallet-swap' &&
       purpose !== 'public-cross-chain-send' &&
-      ((!/^[1-9]\d*$/.test(request.fromChain) &&
-        !(purpose === 'public-private-send' && request.fromChain === 'zcash')) ||
+      ((!/^[1-9]\d*$/.test(request.fromChain) && !nonEvmFromChainAllowed) ||
         request.confidentiality !== 'basic'))
   ) {
     throw new Error('Private quote account changed. Get a new quote.')
   }
-  const source = account.networks.find(network => network.chainId === `eip155:${request.fromChain}`)
+  const nonEvmPrivateMove = isNonEvmPrivateMoveQuote(purpose, request.fromChain)
+  const sourceChainId = nonEvmPrivateMove
+    ? rheaQuoteWalletChainId(request.fromChain)
+    : `eip155:${request.fromChain}`
+  const source = account.networks.find(network => network.chainId === sourceChainId)
   if (purpose === 'public-private-send') {
     const zcashSource =
       request.fromChain === 'zcash'
@@ -104,13 +127,7 @@ export function assertPrivateQuoteRoute(
     purpose === 'confidential-funding'
   ) {
     const chains = createInitialProductChainRegistry('mainnet').list()
-    const chainId = (apiChainId: string) => {
-      if (/^[1-9]\d*$/.test(apiChainId)) return `eip155:${apiChainId}`
-      const family = RHEA_SWAP_CHAIN_CATALOG.find(
-        chain => chain.apiChainId === apiChainId
-      )?.walletFamily
-      return chains.find(chain => chain.family === family)?.id
-    }
+    const chainId = (apiChainId: string) => rheaQuoteWalletChainId(apiChainId, chains)
     const sourceNetwork = account.networks.find(
       network => network.chainId === chainId(request.fromChain)
     )
@@ -164,9 +181,13 @@ export function assertPrivateQuoteRoute(
     }
     return
   }
+  if (!source?.privateExecutionAddress) {
+    throw new Error('Private quote source does not match this Account.')
+  }
   if (
-    !source?.privateExecutionAddress ||
-    source.privateExecutionAddress.toLowerCase() !== request.sender.toLowerCase()
+    nonEvmPrivateMove
+      ? source.privateExecutionAddress !== request.sender
+      : source.privateExecutionAddress.toLowerCase() !== request.sender.toLowerCase()
   ) {
     throw new Error('Private quote source does not match this Account.')
   }
@@ -190,10 +211,14 @@ export function assertPrivateQuoteRoute(
   if (purpose === 'private-transfer') {
     if (
       request.fromChain !== request.toChain ||
-      request.tokenIn.address.toLowerCase() !== request.tokenOut.address.toLowerCase() ||
-      !source.addresses?.some(
-        address => address.value.toLowerCase() === request.recipient?.toLowerCase()
-      )
+      (nonEvmPrivateMove
+        ? request.tokenIn.address !== request.tokenOut.address
+        : request.tokenIn.address.toLowerCase() !== request.tokenOut.address.toLowerCase()) ||
+      !(nonEvmPrivateMove
+        ? source.addresses?.some(address => address.value === request.recipient)
+        : source.addresses?.some(
+            address => address.value.toLowerCase() === request.recipient?.toLowerCase()
+          ))
     ) {
       throw new Error('Private Move must stay in this Account and asset.')
     }
@@ -370,6 +395,17 @@ export const RHEA_SWAP_CHAIN_CATALOG: readonly RheaSwapChainDescriptor[] = Objec
   { apiChainId: 'aptos', tokenListChainId: 900012, blockchain: 'aptos', displayName: 'Aptos' }
 ])
 
+function rheaQuoteWalletChainId(
+  apiChainId: string,
+  chains = createInitialProductChainRegistry('mainnet').list()
+) {
+  if (/^[1-9]\d*$/.test(apiChainId)) return `eip155:${apiChainId}`
+  const family = RHEA_SWAP_CHAIN_CATALOG.find(
+    chain => chain.apiChainId === apiChainId
+  )?.walletFamily
+  return chains.find(chain => chain.family === family)?.id
+}
+
 export interface RheaSwapToken extends SwapToken {
   readonly rheaChainId: ChainRef
   readonly tokenListChainId: number
@@ -511,6 +547,7 @@ export interface RheaSwapNearTransactionBatchReview {
   readonly chainId: string
   readonly sender: string
   readonly summaries: readonly SigningSummary[]
+  readonly networkFeeRaw?: string
   readonly payloadFingerprint: string
   readonly expiresAt: number
 }

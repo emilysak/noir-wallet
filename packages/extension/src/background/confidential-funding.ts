@@ -4,23 +4,37 @@ import type { ChainEndpointSettings } from '@/core/chains/chain-endpoint-setting
 import type { EvmNetworkConfig } from '@/config/networks'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import { buildAccountKey } from '@/core/wallet/account-scope'
-import { resolveNearRuntimeNetworkConfig } from '@/core/chains/solana-near-runtime-config'
+import {
+  resolveNearRuntimeNetworkConfig,
+  resolveSolanaRuntimeNetworkConfig
+} from '@/core/chains/solana-near-runtime-config'
 import {
   createAssetRegistry,
   createInitialProductChainRegistry,
   getBundledInitialProductAssetDefinitions,
   parseAssetDisplayMetadata,
+  parseChainId,
   type AssetDefinitionInput
 } from '@/core/chains/registry'
 import { getCachedTokens, type SwapToken } from '@/core/services/intents-api'
 import { resolveIntentsEvmAssets } from '@/core/services/intents-evm-assets'
+import { createIntentsWalletAssetCatalog } from '@/core/services/intents-wallet-assets'
+import type { ConfidentialPortfolioAssetMapping } from '@/core/services/confidential-funding'
+import { addConfidentialWalletChainMappings } from '@/core/services/confidential-funding/native-confidential-protocol-assets'
 import { loadActiveEvmPortfolioContext } from '@/infrastructure/chains/evm'
+import { createConfiguredNearRpcClient } from '@/infrastructure/chains/near'
+import { createConfiguredSolanaRpcClient } from '@/infrastructure/chains/solana'
 import { EvmMultichainSigningClient } from '@/infrastructure/keyring/multichain/evm-signing-client'
+import { NearMultichainSigningClient } from '@/infrastructure/keyring/multichain/near-signing-client'
+import { SolanaMultichainSigningClient } from '@/infrastructure/keyring/multichain/solana-signing-client'
 import {
   IndexedDbStorageV2Repository,
   IndexedDbTransactionRepository
 } from '@/infrastructure/persistence/repositories'
 import { credentialSession } from './credential-session'
+import { nearLedgerSigningBridge, solanaLedgerSigningBridge } from './ledger-signing-bridge'
+import { loadActiveNearTransferContext } from './near-transfer'
+import { loadActiveSolanaTransferContext } from './solana-transfer'
 import { accountContextTransition } from './account-context-transition'
 import { ConfidentialFundingApi } from './confidential-funding-api'
 import {
@@ -30,6 +44,48 @@ import {
 } from './confidential-funding-coordinator'
 import { ConfidentialFundingSigner } from './confidential-funding-signer'
 import { ChromeConfidentialFundingStore } from './confidential-funding-store'
+
+function confidentialWalletChainDefinitions(
+  protocolTokens: readonly SwapToken[],
+  existingAssets: ReturnType<typeof createAssetRegistry>,
+  definitionId: (asset: AssetDefinitionInput) => string
+): readonly AssetDefinitionInput[] {
+  // A conflicting NEAR or Solana catalog must not drop the EVM funding registry.
+  let catalog: ReturnType<typeof createIntentsWalletAssetCatalog>
+  try {
+    catalog = createIntentsWalletAssetCatalog(protocolTokens, 'mainnet')
+  } catch {
+    return []
+  }
+  return catalog.definitions.flatMap(definition => {
+    const assetId = definitionId(definition)
+    let existing: ReturnType<ReturnType<typeof createAssetRegistry>['inspect']>
+    try {
+      existing = existingAssets.inspect(assetId)
+    } catch {
+      return []
+    }
+    if (
+      existing &&
+      !(
+        existing.verification === 'unverified' &&
+        existing.metadata.decimals === definition.metadata.decimals
+      )
+    ) {
+      return []
+    }
+    try {
+      return [
+        Object.freeze({
+          ...definition,
+          metadata: parseAssetDisplayMetadata(definition.metadata)
+        })
+      ]
+    } catch {
+      return []
+    }
+  })
+}
 
 export function createBackgroundConfidentialFundingCoordinator(
   evmNetworks: readonly EvmNetworkConfig[],
@@ -87,23 +143,33 @@ export function createBackgroundConfidentialFundingCoordinator(
         return []
       }
     })
-  const protocolDefinitionIds = new Set(confidentialEvmDefinitions.map(definitionId))
+  const confidentialWalletDefinitions =
+    DEFAULT_NETWORK === 'mainnet'
+      ? confidentialWalletChainDefinitions(protocolTokens, existingAssets, definitionId)
+      : []
+  const protocolDefinitionIds = new Set(
+    [...confidentialEvmDefinitions, ...confidentialWalletDefinitions].map(definitionId)
+  )
   const assets = createAssetRegistry(chains, [
     ...existingDefinitions.filter(asset => !protocolDefinitionIds.has(definitionId(asset))),
-    ...confidentialEvmDefinitions
+    ...confidentialEvmDefinitions,
+    ...confidentialWalletDefinitions
   ])
   const storage = new IndexedDbStorageV2Repository()
   const signerClient = new EvmMultichainSigningClient({ credentials: credentialSession })
   const near = resolveNearRuntimeNetworkConfig(DEFAULT_NETWORK, endpointSettings)
-  const mappings = new Map(
-    [
-      ...getAssetProtocolSourceMappings(DEFAULT_NETWORK, assets),
-      ...confidentialEvmAssets.map(asset => ({
-        assetId: asset.assetId,
-        protocolAssetId: asset.protocolAssetId
-      }))
-    ].map(mapping => [mapping.assetId, Object.freeze(mapping)])
-  )
+  const solana = resolveSolanaRuntimeNetworkConfig(DEFAULT_NETWORK, endpointSettings)
+  const mappings = new Map<string, ConfidentialPortfolioAssetMapping>()
+  for (const mapping of [
+    ...getAssetProtocolSourceMappings(DEFAULT_NETWORK, assets),
+    ...confidentialEvmAssets.map(asset => ({
+      assetId: asset.assetId,
+      protocolAssetId: asset.protocolAssetId
+    }))
+  ]) {
+    mappings.set(mapping.assetId, Object.freeze(mapping))
+  }
+  addConfidentialWalletChainMappings(mappings, assets, protocolTokens, DEFAULT_NETWORK)
   return new ConfidentialFundingCoordinator({
     network: DEFAULT_NETWORK,
     api: new ConfidentialFundingApi(config, near.rpcUrl, __RHEA_SWAP_ACCESS_TOKEN__),
@@ -111,7 +177,49 @@ export function createBackgroundConfidentialFundingCoordinator(
     signer: new ConfidentialFundingSigner(
       signerClient,
       chainId => loadActiveEvmPortfolioContext(storage, chainId),
-      operation => accountContextTransition.runActiveOperation(operation)
+      operation => accountContextTransition.runActiveOperation(operation),
+      {
+        near: {
+          client: new NearMultichainSigningClient({
+            credentials: credentialSession,
+            ledger: nearLedgerSigningBridge
+          }),
+          rpc: createConfiguredNearRpcClient({ chainId: near.chainId, rpcUrl: near.rpcUrl }),
+          rpcUrl: near.rpcUrl,
+          chainId: parseChainId(near.chainId).id,
+          loadContext: async chainId => {
+            const context = await loadActiveNearTransferContext(storage, chainId)
+            const pointer = await storage.getActivePointer()
+            if (!context || !pointer) return null
+            return Object.freeze({
+              generationId: pointer.generationId,
+              chainAccount: context.chainAccount,
+              keyDomainSource: context.keyDomainSource,
+              accountIndex: context.accountIndex,
+              publicKey: context.publicKey
+            })
+          }
+        },
+        solana: {
+          client: new SolanaMultichainSigningClient({
+            credentials: credentialSession,
+            ledger: solanaLedgerSigningBridge
+          }),
+          rpc: createConfiguredSolanaRpcClient({ chainId: solana.chainId, rpcUrl: solana.rpcUrl }),
+          chainId: parseChainId(solana.chainId).id,
+          loadContext: async chainId => {
+            const context = await loadActiveSolanaTransferContext(storage, chainId)
+            const pointer = await storage.getActivePointer()
+            if (!context || !pointer) return null
+            return Object.freeze({
+              generationId: pointer.generationId,
+              chainAccount: context.chainAccount,
+              keyDomainSource: context.keyDomainSource,
+              accountIndex: context.accountIndex
+            })
+          }
+        }
+      }
     ),
     repository: new IndexedDbTransactionRepository(),
     assets,

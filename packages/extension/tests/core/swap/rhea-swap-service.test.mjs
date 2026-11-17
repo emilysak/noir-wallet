@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 import { normalizeQuote, serializeQuoteRequest } from '@rhea-finance/cross-chain-aggregation-dex'
+import { getNearNetworkConfig, getSolanaNetworkConfig } from '../../../src/config/networks.ts'
 import { getZcashChainId } from '../../../src/core/chains/registry/index.ts'
 import { parseTrustedExtensionRuntimeMessage } from '../../../src/lib/runtime-message-security.ts'
 import { readRheaDestinationHash } from '../../../src/core/services/rhea-swap/rhea-order-status.ts'
@@ -10,6 +11,7 @@ import {
   RHEA_SWAP_CHAIN_CATALOG,
   RheaSwapService,
   assertPrivateQuoteRoute,
+  assertReviewedPrivateQuoteSender,
   parseRheaSwapQuoteRequest,
   toSdkQuoteRequest,
   toRheaSwapToken
@@ -542,6 +544,178 @@ test('Private Swap quote remains bound to the same Account and its managed desti
       account
     )
   ).toThrow(/account changed/)
+
+  const nearPublicAddress = 'alice.near'
+  const nearPrivateExecutionAddress = 'ab'.repeat(32)
+  const nearAccount = {
+    walletId: 'wallet-1',
+    accountId: 'account-1',
+    networks: [
+      {
+        chainId: getNearNetworkConfig('mainnet').chainId,
+        privateExecutionAddress: nearPrivateExecutionAddress,
+        addresses: [{ value: nearPublicAddress }]
+      }
+    ]
+  }
+  const nearToken = { address: 'wrap.near' }
+  const nearFunding = {
+    fromChain: 'near',
+    toChain: 'near',
+    sender: nearPublicAddress,
+    recipient: nearPrivateExecutionAddress,
+    confidentiality: 'basic',
+    tokenIn: nearToken,
+    tokenOut: nearToken
+  }
+  expect(() =>
+    assertPrivateQuoteRoute(nearFunding, nearAccount, 'confidential-funding')
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearFunding, recipient: 'bob.near' },
+      nearAccount,
+      'confidential-funding'
+    )
+  ).toThrow(/funding/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearFunding, recipient: 'AB'.repeat(32) },
+      nearAccount,
+      'confidential-funding'
+    )
+  ).toThrow(/Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearFunding, sender: 'Alice.near' },
+      nearAccount,
+      'confidential-funding'
+    )
+  ).toThrow(/funding/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearFunding, confidentiality: undefined },
+      nearAccount,
+      'confidential-funding'
+    )
+  ).toThrow(/account changed/)
+  expect(() => assertPrivateQuoteRoute(nearFunding, null, 'confidential-funding')).toThrow(
+    /account changed/
+  )
+  expect(() =>
+    assertPrivateQuoteRoute(nearFunding, nearAccount, 'confidential-funding', {
+      ...nearAccount,
+      accountId: 'account-2'
+    })
+  ).toThrow(/account changed/)
+  const solanaToken = { address: 'So11111111111111111111111111111111111111112' }
+  const solanaAccount = {
+    walletId: 'wallet-1',
+    accountId: 'account-1',
+    networks: [
+      {
+        chainId: getSolanaNetworkConfig('mainnet').chainId,
+        privateExecutionAddress: 'SysvarRent111111111111111111111111111111111',
+        addresses: [{ value: 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk' }]
+      }
+    ]
+  }
+  expect(() =>
+    assertPrivateQuoteRoute(
+      {
+        fromChain: 'solana',
+        toChain: 'solana',
+        sender: 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk',
+        recipient: 'SysvarRent111111111111111111111111111111111',
+        confidentiality: 'basic',
+        tokenIn: solanaToken,
+        tokenOut: solanaToken
+      },
+      solanaAccount,
+      'confidential-funding'
+    )
+  ).not.toThrow()
+  const nearMove = {
+    fromChain: 'near',
+    toChain: 'near',
+    sender: nearPrivateExecutionAddress,
+    recipient: nearPublicAddress,
+    confidentiality: 'basic',
+    tokenIn: nearToken,
+    tokenOut: nearToken
+  }
+  expect(() => assertPrivateQuoteRoute(nearMove, nearAccount, 'private-transfer')).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute({ ...nearMove, recipient: 'bob.near' }, nearAccount, 'private-transfer')
+  ).toThrow(/must stay in this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearMove, recipient: 'Alice.near' },
+      nearAccount,
+      'private-transfer'
+    )
+  ).toThrow(/must stay in this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearMove, sender: 'AB'.repeat(32) },
+      nearAccount,
+      'private-transfer'
+    )
+  ).toThrow(/source does not match/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearMove, tokenOut: { address: 'Wrap.near' } },
+      nearAccount,
+      'private-transfer'
+    )
+  ).toThrow(/asset/)
+  for (const purpose of ['private-swap', 'private-cross-chain-send', 'private-dapp-transfer']) {
+    expect(() => assertPrivateQuoteRoute(nearMove, nearAccount, purpose)).toThrow(
+      /account changed/
+    )
+  }
+})
+
+test('NEAR and Solana private Move quotes do not need an EVM confidential sender', () => {
+  for (const fromChain of ['near', 'solana']) {
+    expect(() =>
+      assertReviewedPrivateQuoteSender({
+        purpose: 'private-transfer',
+        fromChain,
+        privateSender: false
+      })
+    ).not.toThrow()
+    expect(() =>
+      assertReviewedPrivateQuoteSender({
+        purpose: 'private-swap',
+        fromChain,
+        privateSender: false
+      })
+    ).toThrow(/reviewed route/)
+  }
+  for (const purpose of ['private-cross-chain-send', 'private-dapp-transfer']) {
+    expect(() =>
+      assertReviewedPrivateQuoteSender({
+        purpose,
+        fromChain: 'near',
+        privateSender: false
+      })
+    ).toThrow(/reviewed route/)
+  }
+  expect(() =>
+    assertReviewedPrivateQuoteSender({
+      purpose: 'private-transfer',
+      fromChain: '1',
+      privateSender: false
+    })
+  ).toThrow(/reviewed route/)
+  expect(() =>
+    assertReviewedPrivateQuoteSender({
+      purpose: 'private-transfer',
+      fromChain: '1',
+      privateSender: true
+    })
+  ).not.toThrow()
 })
 
 test('RHEA Swap quote sends the Noir Swap referral', () => {

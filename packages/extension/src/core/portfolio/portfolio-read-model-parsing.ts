@@ -261,16 +261,18 @@ function parseBalanceView(value: unknown): PortfolioBalanceView {
     record.confidentialRaw === undefined
       ? undefined
       : readRawAmount(record.confidentialRaw, 'Portfolio Confidential balance')
+  // confidentialRaw alone is a protocol balance outside the on-chain total.
+  // privateOnchainRaw is only valid with confidentialRaw, and that pair must equal privateRaw.
   if (
     (mainRaw === undefined) !== (privateRaw === undefined) ||
     (mainRaw !== undefined &&
       privateRaw !== undefined &&
       BigInt(mainRaw) + BigInt(privateRaw) !== BigInt(totalRaw)) ||
-    (privateOnchainRaw === undefined) !== (confidentialRaw === undefined) ||
+    (privateOnchainRaw !== undefined && confidentialRaw === undefined) ||
     (privateOnchainRaw !== undefined &&
       confidentialRaw !== undefined &&
-      privateRaw !== undefined &&
-      BigInt(privateOnchainRaw) + BigInt(confidentialRaw) !== BigInt(privateRaw))
+      (privateRaw === undefined ||
+        BigInt(privateOnchainRaw) + BigInt(confidentialRaw) !== BigInt(privateRaw)))
   ) {
     throw new Error('Portfolio account balance breakdown is inconsistent')
   }

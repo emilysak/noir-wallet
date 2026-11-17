@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
+import { resolveRheaPrivateTransferToken } from '../../../src/core/services/rhea-swap/rhea-private-transfer.ts'
 import {
   buildInitialSwapCatalogPlan,
   findSwapTokenInCatalog,
@@ -152,6 +153,38 @@ test('excludes deprecated routes from cached and live Swap catalogs', async () =
   )
   expect(published).toEqual([current])
   expect(loaded).toEqual([current])
+})
+
+test('resolves a native NEAR confidential transfer to the wNEAR catalog row', () => {
+  const contracted = {
+    assetId: 'nep141:wrap.near',
+    blockchain: 'near',
+    contractAddress: 'wrap.near',
+    isNative: false
+  }
+  const native = { ...contracted, isNative: true, contractAddress: null }
+  expect(resolveRheaPrivateTransferToken([contracted], null)).toBe(contracted)
+  expect(resolveRheaPrivateTransferToken([native, contracted], null)).toBe(native)
+})
+
+test('keeps one NEAR row and prefers the wrap.near quote', () => {
+  const alias = {
+    assetId: 'nep141:wrap.near',
+    blockchain: 'near',
+    rheaChainId: 'near',
+    rheaAddress: 'near',
+    isNative: true,
+    sources: []
+  }
+  const quote = {
+    ...alias,
+    rheaAddress: 'wrap.near',
+    contractAddress: 'wrap.near',
+    isNative: false,
+    sources: ['nearintents']
+  }
+  expect(mergeTokenCatalogs([alias, quote])).toEqual([quote])
+  expect(mergeTokenCatalogs([quote, alias])).toEqual([quote])
 })
 
 test('distinguishes a selected token from an asset on another chain', () => {

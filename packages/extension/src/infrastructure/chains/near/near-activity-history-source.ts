@@ -196,6 +196,8 @@ export function createNearActivityHistorySource(
   config: NearActivityHistorySourceConfig
 ): NearActivityHistorySource {
   const chain = parseChainId(config.chainId)
+  // FastNear documents the transfers API as mainnet-only (testnet base URL is null).
+  // https://transfers.testnet.fastnear.com does not serve that API.
   if (chain.namespace !== 'near' || chain.reference !== 'mainnet') {
     throw new Error('FastNear transfer history supports NEAR mainnet only')
   }

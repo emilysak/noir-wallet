@@ -238,6 +238,27 @@ test('does not sign twice when a Solana broadcast is recovered after quote expir
   expect(harness.calls.filter(call => call === 'read-plan')).toHaveLength(2)
 })
 
+test('rejects a failed Solana execution when broadcast throws', async () => {
+  const harness = createHarness({
+    rpc: {
+      async broadcastSignedTransaction() {
+        harness.calls.push('broadcast')
+        throw new Error('rpc unavailable')
+      },
+      async getSignatureStatus() {
+        harness.calls.push('status')
+        return { status: 'failed' }
+      }
+    }
+  })
+  await harness.coordinator.prepare(binding().quoteHandle, binding())
+  await expect(harness.coordinator.confirm(binding().quoteHandle, fingerprint)).rejects.toThrow(
+    /Solana transaction execution failed/
+  )
+  expect(harness.calls.some(call => call.startsWith('record:'))).toBe(false)
+  expect(harness.calls).not.toContain('report')
+})
+
 test('rejects metadata that is not bound to the serialized Solana transaction', async () => {
   const harness = createHarness({
     service: {

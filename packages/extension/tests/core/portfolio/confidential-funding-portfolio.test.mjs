@@ -8,7 +8,8 @@ import {
   confidentialPrivateTokenId,
   filterConfidentialPortfolioMappings,
   getConfidentialAvailableForAsset,
-  mergeConfidentialBalancesIntoPortfolio
+  mergeConfidentialBalancesIntoPortfolio,
+  mergeConfidentialSignerBalances
 } from '../../../src/core/services/confidential-funding/confidential-funding-portfolio.ts'
 import { getBitcoinChainId } from '../../../src/core/chains/registry/index.ts'
 
@@ -105,6 +106,57 @@ test('projects Shield-only holdings independently of Public assets and preserves
       'testnet'
     )
   ).toEqual([])
+})
+
+test('keeps NEAR and Solana Shield mappings and does not fold them into on-chain balances', () => {
+  const nearAssetId = 'near:mainnet/slip44:397'
+  const solanaAssetId = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501'
+  const bitcoinAssetId = `${getBitcoinChainId('mainnet')}/slip44:0`
+  const mappings = filterConfidentialPortfolioMappings(
+    [
+      { assetId: nearAssetId, protocolAssetId: 'nep141:wrap.near' },
+      { assetId: solanaAssetId, protocolAssetId: 'solana:nep141:sol.omft.near' },
+      { assetId: 'eip155:1/slip44:60', protocolAssetId: 'nep141:eth.omft.near' },
+      { assetId: bitcoinAssetId, protocolAssetId: 'nep141:btc.omft.near' }
+    ],
+    'mainnet'
+  )
+  expect(mappings.map(mapping => mapping.assetId)).toEqual([
+    nearAssetId,
+    solanaAssetId,
+    'eip155:1/slip44:60'
+  ])
+  const nearAsset = {
+    asset: { id: nearAssetId },
+    balance: {
+      totalRaw: '14',
+      mainRaw: '10',
+      privateRaw: '4',
+      spendableRaw: '14',
+      availableRaw: '14'
+    }
+  }
+  const solanaAsset = {
+    asset: { id: solanaAssetId },
+    balance: {
+      totalRaw: '9',
+      mainRaw: '6',
+      privateRaw: '3',
+      spendableRaw: '9',
+      availableRaw: '9'
+    }
+  }
+  const merged = mergeConfidentialBalancesIntoPortfolio(
+    { assets: [nearAsset, solanaAsset], chains: [{ assets: [nearAsset] }, { assets: [solanaAsset] }] },
+    mappings,
+    [
+      { tokenId: 'nep141:wrap.near', available: '7' },
+      { tokenId: 'solana:nep141:sol.omft.near', available: '2' }
+    ]
+  )
+  expect(merged.assets[0].balance).toEqual({ ...nearAsset.balance, confidentialRaw: '7' })
+  expect(merged.assets[1].balance).toEqual({ ...solanaAsset.balance, confidentialRaw: '2' })
+  expect(merged.chains[0].assets[0].balance.confidentialRaw).toBe('7')
 })
 
 test('only counts the verified treasury token as Shield balance', () => {
@@ -346,4 +398,247 @@ test('only projects Confidential zero after a confirmed empty balance read', asy
     confidentialRaw: '0'
   })
   expect(knownZero.confidential).toEqual({ status: 'ready', assets: [] })
+})
+
+test('merges NEAR and Solana signer balances without copying them into the EVM cache', async () => {
+  const near = 'alice.near'
+  const solana = '11111111111111111111111111111111'
+  const evm = '0x1111111111111111111111111111111111111111'
+  const nearBalances = [
+    { tokenId: 'nep141:wrap.near', available: '500000000000000000000', source: 'private' },
+    { tokenId: 'nep141:usdt.tether-token.near', available: '50000', source: 'private' }
+  ]
+  const solanaBalances = [{ tokenId: 'nep141:sol.omft.near', available: '7', source: 'private' }]
+  const writes = []
+  const now = 1_700_000_000_000
+  const sessionFor = signerId => ({
+    accessToken: signerId,
+    refreshToken: `${signerId}-refresh`,
+    expiresAt: now + 3_600_000,
+    refreshExpiresAt: now + 86_400_000,
+    signerId
+  })
+  const asset = {
+    asset: { id: 'eip155:1/erc20:0x1111111111111111111111111111111111111111' },
+    metadata: { decimals: 6, symbol: 'USDC' },
+    balance: { totalRaw: '150', mainRaw: '100', privateRaw: '50' }
+  }
+  const model = {
+    scope: { keyDomainId: 'wallet:one', accountId: 'account:one' },
+    assets: [asset],
+    chains: [{ chain: { id: 'eip155:1' }, assets: [asset] }]
+  }
+  const coordinator = new ConfidentialFundingCoordinator({
+    network: 'mainnet',
+    now: () => now,
+    store: {
+      getBalanceSnapshot: async () => ({ fresh: true, balances: [] }),
+      getSession: async (_network, _domain, _account, signerId) =>
+        signerId ? sessionFor(signerId) : sessionFor(evm),
+      putBalances: async (_network, _domain, _account, balances, signerId) => {
+        writes.push({
+          signerId: signerId ?? null,
+          tokenIds: balances.map(row => row.tokenId)
+        })
+      },
+      putSession: async () => {},
+      deleteSession: async () => {},
+      listFreshSignerBalances: async () => [
+        { signerId: null, balances: [] },
+        { signerId: near, balances: nearBalances }
+      ],
+      listNonEvmSessionSignerIds: async () => [near, solana]
+    },
+    api: {
+      getBalances: async accessToken => {
+        if (accessToken === near) return nearBalances
+        if (accessToken === solana) return solanaBalances
+        return []
+      }
+    },
+    signer: {
+      resolveIdentity: async chainId => ({
+        address: String(chainId).startsWith('near:') ? near : evm,
+        context: {
+          chainAccount: {
+            scope: {
+              keyDomainId: 'wallet:one',
+              accountId: 'account:one',
+              chainId
+            }
+          }
+        }
+      })
+    },
+    repository: {},
+    assets: { get: () => undefined, list: () => [] },
+    evmNetworks: [{ chainId: 'eip155:1', rpcUrl: 'https://rpc.example.test' }],
+    assetMappings: [{ assetId: asset.asset.id, protocolAssetId: 'nep141:usdc.omft.near' }],
+    protocolTokens: []
+  })
+
+  const cached = await coordinator.enrichPortfolio(model, false)
+  expect(cached.confidential.status).toBe('ready')
+  expect(cached.confidential.assets.map(item => item.protocolAssetId).sort()).toEqual([
+    'nep141:usdt.tether-token.near',
+    'nep141:wrap.near'
+  ])
+  expect(writes).toEqual([])
+
+  const balances = await coordinator.refreshBalances(
+    { network: 'mainnet', keyDomainId: 'wallet:one', accountId: 'account:one' },
+    false
+  )
+  expect(getConfidentialAvailableForAsset(balances, 'nep141:wrap.near')).toBe(
+    '500000000000000000000'
+  )
+  expect(getConfidentialAvailableForAsset(balances, 'nep141:usdt.tether-token.near')).toBe('50000')
+  expect(getConfidentialAvailableForAsset(balances, 'nep141:sol.omft.near')).toBe('7')
+  expect(writes).toEqual([
+    { signerId: evm, tokenIds: [] },
+    { signerId: near, tokenIds: nearBalances.map(row => row.tokenId) },
+    { signerId: solana, tokenIds: ['nep141:sol.omft.near'] }
+  ])
+  expect(
+    writes.some(
+      write =>
+        (write.signerId === null || write.signerId === evm) &&
+        write.tokenIds.some(id => id.includes('wrap.near') || id.includes('usdt'))
+    )
+  ).toBe(false)
+})
+
+test('authenticates a missing NEAR session and keeps the other signer balances', async () => {
+  const near = 'alice.near'
+  const evm = '0x1111111111111111111111111111111111111111'
+  const solana = '11111111111111111111111111111111'
+  const now = 1_700_000_000_000
+  const nearBalances = [
+    { tokenId: 'nep141:wrap.near', available: '500000000000000000000', source: 'private' },
+    { tokenId: 'nep141:usdt.tether-token.near', available: '50000', source: 'private' }
+  ]
+  const solanaBalances = [{ tokenId: 'nep141:sol.omft.near', available: '7', source: 'private' }]
+  let nearSignatures = 0
+  const session = signerId => ({
+    accessToken: signerId,
+    refreshToken: `${signerId}-refresh`,
+    expiresAt: now + 3_600_000,
+    refreshExpiresAt: now + 86_400_000,
+    signerId
+  })
+  const coordinator = new ConfidentialFundingCoordinator({
+    network: 'mainnet',
+    now: () => now,
+    store: {
+      getSession: async (_network, _domain, _account, signerId) => {
+        if (signerId === near) return null
+        if (signerId === solana) return session(solana)
+        return session(evm)
+      },
+      putBalances: async () => {},
+      putSession: async () => {},
+      deleteSession: async () => {},
+      listFreshSignerBalances: async () => [],
+      listNonEvmSessionSignerIds: async () => [solana]
+    },
+    api: {
+      getBalances: async accessToken => {
+        if (accessToken === 'near-auth') return nearBalances
+        if (accessToken === solana) return solanaBalances
+        return []
+      },
+      createAuthPayload: async () => ({ standard: 'nep413', payload: '{"message":"auth"}' }),
+      authenticate: async () => ({
+        accessToken: 'near-auth',
+        refreshToken: 'near-refresh',
+        expiresAt: now + 3_600_000,
+        refreshExpiresAt: now + 86_400_000
+      })
+    },
+    signer: {
+      resolveIdentity: async chainId => ({
+        address: String(chainId).startsWith('near:') ? near : evm,
+        context: {
+          chainAccount: {
+            scope: { keyDomainId: 'wallet:one', accountId: 'account:one', chainId }
+          }
+        }
+      }),
+      signMessage: async () => {
+        nearSignatures += 1
+        return { standard: 'nep413', payload: '{"message":"auth"}', signature: 'sig' }
+      }
+    },
+    repository: {},
+    assets: { get: () => undefined, list: () => [] },
+    evmNetworks: [{ chainId: 'eip155:1', rpcUrl: 'https://rpc.example.test' }],
+    assetMappings: []
+  })
+
+  const balances = await coordinator.refreshBalances(
+    { network: 'mainnet', keyDomainId: 'wallet:one', accountId: 'account:one' },
+    true
+  )
+  expect(nearSignatures).toBe(1)
+  expect(getConfidentialAvailableForAsset(balances, 'nep141:wrap.near')).toBe(
+    '500000000000000000000'
+  )
+  expect(getConfidentialAvailableForAsset(balances, 'nep141:usdt.tether-token.near')).toBe('50000')
+  expect(getConfidentialAvailableForAsset(balances, 'nep141:sol.omft.near')).toBe('7')
+
+  const rejected = new ConfidentialFundingCoordinator({
+    network: 'mainnet',
+    now: () => now,
+    store: {
+      getSession: async (_network, _domain, _account, signerId) =>
+        signerId === near ? null : session(signerId ?? evm),
+      putBalances: async () => {},
+      putSession: async () => {},
+      deleteSession: async () => {},
+      listFreshSignerBalances: async () => [],
+      listNonEvmSessionSignerIds: async () => []
+    },
+    api: {
+      getBalances: async () => [{ tokenId: 'nep141:eth.omft.near', available: '3', source: 'private' }],
+      createAuthPayload: async () => ({ standard: 'nep413', payload: '{"message":"auth"}' })
+    },
+    signer: {
+      resolveIdentity: async chainId => ({
+        address: String(chainId).startsWith('near:') ? near : evm,
+        context: {
+          chainAccount: {
+            scope: { keyDomainId: 'wallet:one', accountId: 'account:one', chainId }
+          }
+        }
+      }),
+      signMessage: async () => {
+        throw new Error('NEAR signature rejected')
+      }
+    },
+    repository: {},
+    assets: { get: () => undefined, list: () => [] },
+    evmNetworks: [{ chainId: 'eip155:1', rpcUrl: 'https://rpc.example.test' }],
+    assetMappings: []
+  })
+  await expect(
+    rejected.refreshBalances(
+      { network: 'mainnet', keyDomainId: 'wallet:one', accountId: 'account:one' },
+      true
+    )
+  ).resolves.toEqual([{ tokenId: 'nep141:eth.omft.near', available: '3', source: 'private' }])
+})
+
+test('sums the same confidential token across signer accounts once', () => {
+  expect(
+    mergeConfidentialSignerBalances([
+      [{ tokenId: 'nep141:wrap.near', available: '2', source: 'evm' }],
+      [
+        { tokenId: 'nep141:wrap.near', available: '3', source: 'near' },
+        { tokenId: 'nep141:usdt.tether-token.near', available: '50000', source: 'near' }
+      ]
+    ])
+  ).toEqual([
+    { tokenId: 'nep141:wrap.near', available: '5', source: 'evm' },
+    { tokenId: 'nep141:usdt.tether-token.near', available: '50000', source: 'near' }
+  ])
 })

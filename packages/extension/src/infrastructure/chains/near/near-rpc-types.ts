@@ -88,9 +88,17 @@ export interface NearFungibleTokenBalanceSnapshot {
   readonly blockHeight: number
 }
 
+export interface NearFungibleTokenMetadata {
+  readonly contractId: string
+  readonly name: string
+  readonly symbol: string
+  readonly decimals: number
+}
+
 export type NearTransactionStatus =
   | { readonly status: 'unknown' }
   | { readonly status: 'confirming' }
+  | { readonly status: 'executed' }
   | { readonly status: 'final' }
   | { readonly status: 'failed' }
 
@@ -120,6 +128,10 @@ export interface NearReadRpc {
     accountId: string,
     signal?: AbortSignal
   ) => Promise<NearFungibleTokenBalanceSnapshot>
+  readonly getFungibleTokenMetadata: (
+    contractId: string,
+    signal?: AbortSignal
+  ) => Promise<NearFungibleTokenMetadata>
   readonly isFungibleTokenAccountRegistered: (
     contractId: string,
     accountId: string,

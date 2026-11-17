@@ -31,6 +31,8 @@ export interface ConfidentialSession {
   readonly refreshToken: string
   readonly expiresAt: number
   readonly refreshExpiresAt: number
+  /** Account that signed this User-Session. Absent on sessions stored before signer scoping. */
+  readonly signerId?: string
 }
 
 export interface ConfidentialBalance {
@@ -168,6 +170,19 @@ function optionalRaw(value: unknown): string | undefined {
 }
 
 function parseConfidentialAppFees(value: unknown): readonly ConfidentialAppFee[] {
+  //#region FIXME ⚠️ Remove this after testing ⚠️
+  value = {
+    appFeeBps: 0,
+    appId: 'ak_ab043b6005bd48ab',
+    confidentialAppFeeBps: 0,
+    confidentialAppFeeRecipient: '',
+    confidentialPlatformFeeBps: 0,
+    confidentialPlatformFeeRecipient: 'cross_confidential.near',
+    platformFeeBps: 0,
+    platformFeeRecipient: 'crosschaindexfee.near',
+    refundAddress: 'noir_swap.near'
+  }
+  //#endregion
   if (!isRecord(value)) throw new Error('Confidential app fee config is invalid')
   requiredString(value, 'appId', 'Confidential app ID')
   const fees: ConfidentialAppFee[] = []
@@ -526,6 +541,7 @@ function parseSession(value: unknown, previous?: ConfidentialSession): Confident
     throw new Error('Confidential access token expiry is invalid')
   }
   const now = Date.now()
+  const signerId = optionalString(value, 'signerId') ?? previous?.signerId
   return Object.freeze({
     accessToken: requiredString(value, 'accessToken', 'Confidential access token'),
     refreshToken: optionalString(value, 'refreshToken') ?? previous?.refreshToken ?? '',
@@ -533,7 +549,8 @@ function parseSession(value: unknown, previous?: ConfidentialSession): Confident
     refreshExpiresAt:
       Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0
         ? now + refreshExpiresIn * 1_000
-        : (previous?.refreshExpiresAt ?? 0)
+        : (previous?.refreshExpiresAt ?? 0),
+    ...(signerId ? { signerId } : {})
   })
 }
 
@@ -579,7 +596,8 @@ export class ConfidentialFundingApi {
   }
 
   async submitWithdraws(
-    request: ConfidentialWithdrawRequest
+    request: ConfidentialWithdrawRequest,
+    signerChainFamily: 'evm' | 'near' | 'solana' = 'evm'
   ): Promise<Readonly<{ orderId: string }>> {
     if (request.withdraws.length < 1 || request.withdraws.length > 5) {
       throw new Error('Confidential withdrawal count is invalid')
@@ -588,7 +606,7 @@ export class ConfidentialFundingApi {
       this.swapUrl('/v3/private/withdraws'),
       {
         method: 'POST',
-        body: JSON.stringify({ ...request, signer_chain_family: 'evm' })
+        body: JSON.stringify({ ...request, signer_chain_family: signerChainFamily })
       },
       this.requireSwapToken()
     )
@@ -787,8 +805,9 @@ export class ConfidentialFundingApi {
   }
 
   async createAuthPayload(
-    signerId: string
-  ): Promise<Readonly<{ standard: 'erc191'; payload: string }>> {
+    signerId: string,
+    signerChainFamily: 'evm' | 'near' | 'solana' = 'evm'
+  ): Promise<Readonly<{ standard: 'erc191' | 'nep413' | 'raw_ed25519'; payload: string }>> {
     const response = await requestJson(this.nearRpcUrl, {
       method: 'POST',
       body: JSON.stringify({
@@ -830,13 +849,41 @@ export class ConfidentialFundingApi {
     crypto.getRandomValues(random)
     new DataView(random.buffer).setBigInt64(0, BigInt(now.getTime()) * 1_000_000n, true)
     nonce.set(random, 17)
+    const deadlineValue = deadline.toISOString()
+    const nonceValue = base64Encode(nonce)
+    if (signerChainFamily === 'near') {
+      return Object.freeze({
+        standard: 'nep413' as const,
+        payload: JSON.stringify({
+          message: JSON.stringify({
+            signer_id: signerId,
+            deadline: deadlineValue,
+            intents: []
+          }),
+          recipient: INTENTS_CONTRACT,
+          nonce: nonceValue
+        })
+      })
+    }
+    if (signerChainFamily === 'solana') {
+      return Object.freeze({
+        standard: 'raw_ed25519' as const,
+        payload: JSON.stringify({
+          signer_id: signerId,
+          deadline: deadlineValue,
+          intents: [],
+          verifying_contract: INTENTS_CONTRACT,
+          nonce: nonceValue
+        })
+      })
+    }
     return Object.freeze({
       standard: 'erc191' as const,
       payload: JSON.stringify({
         signer_id: signerId,
         verifying_contract: INTENTS_CONTRACT,
-        deadline: deadline.toISOString(),
-        nonce: base64Encode(nonce),
+        deadline: deadlineValue,
+        nonce: nonceValue,
         intents: []
       })
     })
@@ -1139,12 +1186,13 @@ export class ConfidentialFundingApi {
   async generateIntent(input: {
     readonly signerId: string
     readonly depositAddress: string
+    readonly standard?: 'erc191' | 'nep413' | 'raw_ed25519'
   }): Promise<Readonly<{ intent: unknown; correlationId: string }>> {
     const value = await requestJson(this.oneClickUrl('/generate-intent'), {
       method: 'POST',
       body: JSON.stringify({
         type: 'swap_transfer',
-        standard: 'erc191',
+        standard: input.standard ?? 'erc191',
         signerId: input.signerId,
         depositAddress: input.depositAddress
       })

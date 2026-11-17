@@ -29,6 +29,7 @@ import { getEvmNetworkConfigs } from '../../../src/config/networks.ts'
 import {
   availableDepositTokens,
   defaultDepositRefundAddress,
+  depositRefundAddressError,
   depositSourceAssetId,
   depositStatusLabel,
   canPayShieldDeposit,
@@ -48,8 +49,13 @@ test('uses the selected EVM private refund address while Zcash retains a transpa
   const publicAddress = '0x1111111111111111111111111111111111111111'
   const privateAddress = '0x2222222222222222222222222222222222222222'
   const zcashAddress = 't1QexampleTransparentAddress'
+  const nearPrivate = 'a'.repeat(64)
+  const nearPublic = 'public.near'
+  const solanaPublic = '11111111111111111111111111111111'
   const evm = { id: 'eip155:56', family: 'evm' }
   const zcash = { id: 'zcash:mainnet', family: 'zcash' }
+  const near = { id: 'near:mainnet', family: 'near' }
+  const solana = { id: 'solana:mainnet', family: 'solana' }
   const networks = [
     {
       chain: evm,
@@ -59,10 +65,183 @@ test('uses the selected EVM private refund address while Zcash retains a transpa
     {
       chain: zcash,
       addresses: [{ value: zcashAddress, privacy: 'transparent' }]
+    },
+    {
+      chain: near,
+      privateExecutionAddress: nearPrivate,
+      addresses: [
+        { value: 'other.near', privacy: 'transparent', preferredForReceive: false },
+        { value: nearPublic, privacy: 'transparent', preferredForReceive: true }
+      ]
+    },
+    {
+      chain: solana,
+      addresses: [
+        { value: 'other-solana', privacy: 'transparent', preferredForReceive: false },
+        { value: solanaPublic, privacy: 'transparent', preferredForReceive: true }
+      ]
     }
   ]
   expect(defaultDepositRefundAddress(evm, networks)).toBe(privateAddress)
   expect(defaultDepositRefundAddress(zcash, networks)).toBe(zcashAddress)
+  expect(defaultDepositRefundAddress(near, networks)).toBe(nearPrivate)
+  expect(
+    defaultDepositRefundAddress(near, [
+      {
+        chain: near,
+        addresses: networks.find(network => network.chain === near).addresses
+      }
+    ])
+  ).toBe(nearPublic)
+  expect(defaultDepositRefundAddress(solana, networks)).toBe(solanaPublic)
+  expect(depositRefundAddressError(nearPrivate, near)).toBeNull()
+  expect(depositRefundAddressError(nearPublic, near)).toBeNull()
+  expect(depositRefundAddressError('NOT AN ACCOUNT', near)).toBe('Enter a valid NEAR account')
+  expect(depositRefundAddressError(solanaPublic, solana)).toBeNull()
+  expect(depositRefundAddressError('not-solana', solana)).toBe('Enter a valid Solana address')
+})
+
+test('NEAR external deposits keep the EVM confidential signer and a NEAR refund address', async () => {
+  const signerId = '0x1111111111111111111111111111111111111111'
+  const refundAddress = 'a'.repeat(64)
+  const depositAddress = 'bridge.near'
+  const protocolAssetId = 'nep141:usdt.tether-token.near'
+  const assetId = 'near:mainnet/nep141:usdt.tether-token.near'
+  const source = {
+    chainId: 'near:mainnet',
+    chainName: 'NEAR',
+    assetId,
+    protocolAssetId,
+    amountRaw: '1000'
+  }
+  const records = new Map()
+  const repository = new InMemoryTransactionRepository()
+  let identityChainId
+  let depositAddressOverride
+  const coordinator = new ConfidentialFundingCoordinator({
+    network: 'mainnet',
+    api: {
+      async quote(request) {
+        return {
+          correlationId: 'near-external-quote',
+          quoteRequest: {
+            swapType: 'EXACT_INPUT',
+            confidentiality: 'basic',
+            originAsset: request.originAsset,
+            destinationAsset: request.destinationAsset,
+            amount: request.amountRaw,
+            refundTo: request.refundTo,
+            depositType: request.depositType,
+            refundType: request.refundType,
+            recipient: request.recipient,
+            recipientType: request.recipientType,
+            slippageTolerance: request.slippageBps
+          },
+          quote: {
+            amountIn: request.amountRaw,
+            amountOut: request.amountRaw,
+            minAmountOut: request.amountRaw,
+            depositAddress: depositAddressOverride ?? depositAddress,
+            deadline: new Date(60_000).toISOString()
+          }
+        }
+      }
+    },
+    store: {
+      async getExternalDeposit(id) {
+        return records.get(id) ?? null
+      },
+      async listExternalDeposits() {
+        return [...records.values()]
+      },
+      async listPlans() {
+        return []
+      },
+      async putExternalDeposit(record) {
+        records.set(record.depositId, record)
+      },
+      async withExternalDepositScope(_scope, operation) {
+        return operation()
+      },
+      async getSession() {
+        return { accessToken: 'synthetic', expiresAt: 1_000_000 }
+      }
+    },
+    signer: {
+      async resolveIdentity(chainId) {
+        identityChainId = chainId
+        return {
+          address: signerId,
+          addressIndex: 0,
+          peaAddress: signerId,
+          context: {
+            chainAccount: {
+              scope: {
+                keyDomainId: 'wallet:one',
+                accountId: 'account:one',
+                chainId
+              }
+            }
+          }
+        }
+      }
+    },
+    repository,
+    assets: {
+      get: id =>
+        id === assetId
+          ? { asset: { namespace: 'nep141' }, metadata: { symbol: 'USDT', decimals: 6 } }
+          : undefined
+    },
+    protocolTokens: [
+      {
+        assetId: protocolAssetId,
+        blockchain: 'near',
+        contractAddress: 'usdt.tether-token.near',
+        decimals: 6,
+        symbol: 'USDT'
+      }
+    ],
+    evmNetworks: getEvmNetworkConfigs('mainnet'),
+    assetMappings: [{ assetId, protocolAssetId }],
+    now: () => 1_000,
+    createId: () => 'near-external-one',
+    scheduleMonitoring: async () => {}
+  })
+  const created = await coordinator.createExternalDeposit({
+    network: 'mainnet',
+    keyDomainId: 'wallet:one',
+    accountId: 'account:one',
+    source,
+    refundAddress,
+    requestId: 'near-create'
+  })
+  expect(created.signerId).toBe(signerId)
+  expect(created.refundAddress).toBe(refundAddress)
+  expect(created.depositAddress).toBe(depositAddress)
+  expect(identityChainId.startsWith('eip155:')).toBe(true)
+  await expect(
+    coordinator.createExternalDeposit({
+      network: 'mainnet',
+      keyDomainId: 'wallet:one',
+      accountId: 'account:one',
+      source,
+      refundAddress: 'NOT AN ACCOUNT',
+      requestId: 'near-invalid-refund'
+    })
+  ).rejects.toThrow('refund address is invalid')
+  depositAddressOverride = 'INVALID ADDRESS'
+  await expect(
+    coordinator.createExternalDeposit({
+      network: 'mainnet',
+      keyDomainId: 'wallet:one',
+      accountId: 'account:one',
+      source,
+      refundAddress,
+      requestId: 'near-invalid-deposit'
+    })
+  ).rejects.toThrow('invalid deposit address')
+  expect(records.size).toBe(1)
 })
 
 test('offers current BNB deposits without exposing the deprecated protocol token', () => {
@@ -230,6 +409,57 @@ test.describe('confidential funding safety rules', () => {
     }
     catalog = [legacy]
     expect(coordinator.hasExternalDepositAsset(source)).toBe(false)
+  })
+
+  test('registers NEAR and Solana catalog assets for external deposits', t => {
+    for (const key of ['__CONFIDENTIAL_ONE_CLICK_API_URL__', '__RHEA_SWAP_ACCESS_TOKEN__']) {
+      const previous = Object.getOwnPropertyDescriptor(globalThis, key)
+      Object.defineProperty(globalThis, key, { value: '', configurable: true })
+      t.after(() => {
+        if (previous) Object.defineProperty(globalThis, key, previous)
+        else delete globalThis[key]
+      })
+    }
+    const nearToken = {
+      assetId: 'nep141:usdt.tether-token.near',
+      blockchain: 'near',
+      contractAddress: 'usdt.tether-token.near',
+      decimals: 6,
+      symbol: 'USDT',
+      price: 1,
+      priceUpdatedAt: '2020-01-01T00:00:00.000Z'
+    }
+    const solanaToken = {
+      assetId: 'nep141:sol.omft.near',
+      blockchain: 'sol',
+      decimals: 9,
+      symbol: 'SOL',
+      price: 1,
+      priceUpdatedAt: '2020-01-01T00:00:00.000Z'
+    }
+    const coordinator = createBackgroundConfidentialFundingCoordinator(
+      getEvmNetworkConfigs('mainnet'),
+      [],
+      [],
+      [],
+      [nearToken, solanaToken],
+      getActiveChainEndpointSettings(),
+      async () => {}
+    )
+    expect(
+      coordinator.hasExternalDepositAsset({
+        chainId: 'near:mainnet',
+        assetId: 'near:mainnet/nep141:usdt.tether-token.near',
+        protocolAssetId: nearToken.assetId
+      })
+    ).toBe(true)
+    expect(
+      coordinator.hasExternalDepositAsset({
+        chainId: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+        assetId: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501',
+        protocolAssetId: solanaToken.assetId
+      })
+    ).toBe(true)
   })
 
   test('external Shield deposit is account-bound, idempotent and recovers from status without local signing', async () => {
@@ -1293,6 +1523,35 @@ test.describe('confidential funding safety rules', () => {
         destinationAddress
       })
     expect(check(payload).standard).toBe('erc191')
+    const nep413 = assertDirectConfidentialWithdrawIntentBinding({
+      intent: {
+        standard: 'nep413',
+        payload: {
+          message: JSON.stringify(payload),
+          recipient: 'intents.near',
+          nonce: payload.nonce
+        }
+      },
+      quote,
+      signerId,
+      sourceAsset,
+      sourceAmountRaw: '1000',
+      destinationAsset,
+      destinationAddress
+    })
+    expect(nep413.standard).toBe('nep413')
+    expect(JSON.parse(nep413.payload).message).toBe(JSON.stringify(payload))
+    expect(
+      assertDirectConfidentialWithdrawIntentBinding({
+        intent: { standard: 'raw_ed25519', payload: JSON.stringify(payload) },
+        quote,
+        signerId,
+        sourceAsset,
+        sourceAmountRaw: '1000',
+        destinationAsset,
+        destinationAddress
+      }).standard
+    ).toBe('raw_ed25519')
     const action = payload.intents[0]
     for (const changed of [
       { ...payload, verifying_contract: 'intents.near' },
@@ -1311,6 +1570,190 @@ test.describe('confidential funding safety rules', () => {
       { ...payload, intents: [{ ...action, extra: 'value' }] }
     ])
       expect(() => check(changed)).toThrow('Shield withdraw intent')
+  })
+
+  test('binds a 1Click message that keeps its nonce on the NEP-413 envelope', () => {
+    const instant = Math.floor((Date.now() + 60_000) / 1000) * 1000
+    const quoteDeadline = new Date(instant).toISOString()
+    const messageDeadline = quoteDeadline.replace('.000Z', 'Z')
+    const sourceAsset = 'nep141:wrap.near'
+    const destinationAsset = 'nep141:wrap.near'
+    const signerId = '90b10ce55cb9e2661d50ffcaf6345473401155f9fb5bda4394dd00f712084f9b'
+    const destinationAddress = '332366a1a19ec2ef8299f041bd19197dc674a13de4f54e26f1910e05b9c7d1cbb49cc7'
+    const depositAddress = 'a1a19ec2ef8299f041bd19197dc674a13de4f54e26f1910e05b9c7d1cbb49cc7'
+    const quote = {
+      quoteRequest: { originAsset: sourceAsset, destinationAsset, recipient: destinationAddress },
+      quote: { amountIn: '1000', depositAddress, deadline: quoteDeadline }
+    }
+    const message = JSON.stringify({
+      deadline: messageDeadline,
+      intents: [
+        {
+          intent: 'transfer',
+          receiver_id: depositAddress,
+          tokens: { [confidentialPrivateTokenId(sourceAsset)]: '1000' }
+        }
+      ],
+      signer_id: signerId
+    })
+    const nonce = btoa(String.fromCharCode(...new Uint8Array(32).map((_, index) => index + 1)))
+    const bind = standard =>
+      assertDirectConfidentialWithdrawIntentBinding({
+        intent:
+          standard === 'nep413'
+            ? {
+                standard,
+                payload: { message, recipient: 'intents.far', nonce }
+              }
+            : { standard, payload: message },
+        quote,
+        signerId,
+        sourceAsset,
+        sourceAmountRaw: '1000',
+        destinationAsset,
+        destinationAddress
+      })
+    for (const standard of ['nep413', 'raw_ed25519', 'erc191']) {
+      const bound = bind(standard)
+      expect(bound.standard).toBe(standard)
+      expect(JSON.parse(bound.payload).message ?? bound.payload).toBe(message)
+    }
+    expect(() =>
+      assertDirectConfidentialWithdrawIntentBinding({
+        intent: {
+          standard: 'nep413',
+          payload: {
+            message: JSON.stringify({ ...JSON.parse(message), extra: 'value' }),
+            recipient: 'intents.far',
+            nonce
+          }
+        },
+        quote,
+        signerId,
+        sourceAsset,
+        sourceAmountRaw: '1000',
+        destinationAsset,
+        destinationAddress
+      })
+    ).toThrow('Shield withdraw intent')
+    expect(() =>
+      assertDirectConfidentialWithdrawIntentBinding({
+        intent: {
+          standard: 'nep413',
+          payload: { message, recipient: 'intents.near', nonce }
+        },
+        quote,
+        signerId,
+        sourceAsset,
+        sourceAmountRaw: '1000',
+        destinationAsset,
+        destinationAddress
+      })
+    ).toThrow('Shield withdraw intent verifying_contract is invalid')
+  })
+
+  test('accepts a 32-byte NEP-413 nonce array as the same base64 envelope', () => {
+    const deadline = new Date(Date.now() + 60_000).toISOString()
+    const sourceAsset = 'nep141:eth.omft.near'
+    const destinationAsset = 'nep141:usdc.omft.near'
+    const signerId = '0x1111111111111111111111111111111111111111'
+    const destinationAddress = '0x2222222222222222222222222222222222222222'
+    const quote = {
+      quoteRequest: { originAsset: sourceAsset, destinationAsset, recipient: destinationAddress },
+      quote: { amountIn: '1000', depositAddress: 'deposit.near', deadline }
+    }
+    const message = JSON.stringify({
+      verifying_contract: 'intents.far',
+      signer_id: signerId,
+      deadline,
+      nonce: btoa(String.fromCharCode(...new Uint8Array(32))),
+      intents: [
+        {
+          intent: 'transfer',
+          receiver_id: 'deposit.near',
+          tokens: { [confidentialPrivateTokenId(sourceAsset)]: '1000' }
+        }
+      ]
+    })
+    const nonceBytes = Array.from({ length: 32 }, (_, index) => index + 1)
+    const envelopeNonce = btoa(String.fromCharCode(...nonceBytes))
+    const bind = nonce =>
+      assertDirectConfidentialWithdrawIntentBinding({
+        intent: {
+          standard: 'nep413',
+          payload: { message, recipient: 'intents.near', nonce }
+        },
+        quote,
+        signerId,
+        sourceAsset,
+        sourceAmountRaw: '1000',
+        destinationAsset,
+        destinationAddress
+      })
+    expect(bind(nonceBytes)).toEqual(bind(envelopeNonce))
+    expect(JSON.parse(bind(nonceBytes).payload)).toEqual({
+      message,
+      recipient: 'intents.near',
+      nonce: envelopeNonce
+    })
+    expect(() =>
+      assertDirectConfidentialWithdrawIntentBinding({
+        intent: {
+          standard: 'nep413',
+          payload: {
+            message: { signer_id: signerId },
+            recipient: 'intents.near',
+            nonce: envelopeNonce
+          }
+        },
+        quote,
+        signerId,
+        sourceAsset,
+        sourceAmountRaw: '1000',
+        destinationAsset,
+        destinationAddress
+      })
+    ).toThrow('Shield withdraw intent payload message is invalid')
+    const farRecipient = assertDirectConfidentialWithdrawIntentBinding({
+      intent: {
+        standard: 'nep413',
+        payload: { message, recipient: 'intents.far', nonce: envelopeNonce }
+      },
+      quote,
+      signerId,
+      sourceAsset,
+      sourceAmountRaw: '1000',
+      destinationAsset,
+      destinationAddress
+    })
+    expect(JSON.parse(farRecipient.payload).recipient).toBe('intents.far')
+    const derivedRecipient = assertDirectConfidentialWithdrawIntentBinding({
+      intent: {
+        standard: 'nep413',
+        payload: { message, nonce: envelopeNonce }
+      },
+      quote,
+      signerId,
+      sourceAsset,
+      sourceAmountRaw: '1000',
+      destinationAsset,
+      destinationAddress
+    })
+    expect(JSON.parse(derivedRecipient.payload).recipient).toBe('intents.far')
+    expect(() =>
+      assertDirectConfidentialWithdrawIntentBinding({
+        intent: {
+          standard: 'nep413',
+          payload: { message, recipient: 'other.near', nonce: envelopeNonce }
+        },
+        quote,
+        signerId,
+        sourceAsset,
+        sourceAmountRaw: '1000',
+        destinationAsset,
+        destinationAddress
+      })
+    ).toThrow('Shield withdraw intent payload recipient is invalid')
   })
 
   test('fingerprints the exact frozen request so a re-quote cannot be replayed as the same batch', async () => {
@@ -1382,6 +1825,30 @@ test.describe('confidential funding safety rules', () => {
         signer_chain_family: 'evm',
         withdraws: [{ sequence: 0 }]
       })
+      await api.submitWithdraws(
+        {
+          from_amount: '10',
+          from_chain: 'near',
+          from_token: 'nep141:wrap.near',
+          mode: 'TRANSFER',
+          signer_id: 'alice.near',
+          withdraws: [row(0)]
+        },
+        'near'
+      )
+      expect(JSON.parse(calls[2].init.body).signer_chain_family).toBe('near')
+      await api.submitWithdraws(
+        {
+          from_amount: '10',
+          from_chain: 'solana',
+          from_token: 'nep141:sol.omft.near',
+          mode: 'TRANSFER',
+          signer_id: 'alice.near',
+          withdraws: [row(0)]
+        },
+        'solana'
+      )
+      expect(JSON.parse(calls[3].init.body).signer_chain_family).toBe('solana')
     } finally {
       globalThis.fetch = originalFetch
     }

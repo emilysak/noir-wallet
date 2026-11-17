@@ -125,3 +125,57 @@ test('rejects a prepared response bound to another chain', async () => {
   })
   await client.destroy()
 })
+
+const peaAddress = 'b90b217039eed36162aef24e79ec0be08063210c65eff1a1c3d1af7c11fa8af4'
+const peaPublicKey = 'ed25519:DTLGYm12WdyTMRtPRtYAhrudpDuQYvTJnfrgq3StWJfV'
+
+test('derives a NEAR PEA and prepares the private transaction through the worker', async () => {
+  const calls = []
+  const client = new NearMultichainSigningClient({
+    credentials: { getCredentialBinding: async () => binding },
+    ledger: {
+      resolveAccount: async () => {
+        throw new Error('NEAR private execution cannot use a hardware signer')
+      }
+    },
+    now: () => 1_000,
+    createCommandId: () => 'keyring-command:near-pea',
+    forward: async (_method, forwardedPayload) => {
+      const command = parseKeyringCommand(decodeChromeRuntimeCommand(forwardedPayload.command))
+      calls.push([command.operation, command.payload])
+      if (command.operation === 'account.derive-public') {
+        return createKeyringCommandSuccess(command.commandId, {
+          address: peaAddress,
+          publicKey: peaPublicKey,
+          curve: 'ed25519',
+          derivationScheme: 'pea_v2',
+          parent: { accountIndex: 0 },
+          family: 'near',
+          addressScheme: 'near'
+        })
+      }
+      return createKeyringCommandSuccess(
+        command.commandId,
+        preparedValue('signing-command:near:pea')
+      )
+    }
+  })
+
+  await expect(client.deriveNearPea(keyDomainId, 0)).resolves.toEqual({
+    address: peaAddress,
+    publicKey: peaPublicKey,
+    curve: 'ed25519',
+    derivationScheme: 'pea_v2',
+    parent: { accountIndex: 0 }
+  })
+  const peaPayload = { ...payload, kind: 'pea-near-transaction' }
+  await expect(client.prepare(keyDomainId, peaPayload)).resolves.toMatchObject({
+    operation: 'transaction',
+    summary: { schema: 'near.transaction.v1' }
+  })
+  expect(calls).toEqual([
+    ['account.derive-public', { family: 'near-pea', accountIndex: 0 }],
+    ['signing.prepare', { kind: 'pea-near-transaction', chainId, accountIndex: 0, transaction }]
+  ])
+  await client.destroy()
+})

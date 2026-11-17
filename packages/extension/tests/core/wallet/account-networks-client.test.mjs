@@ -227,4 +227,34 @@ test.describe('Account networks Popup client', () => {
       createAccountNetworksClient(async () => result(), zcashOnly).getCatalog()
     ).rejects.toMatchObject({ code: 'invalid-response' })
   })
+
+  test('accepts a 64-hex NEAR confidential address and rejects a named or colliding one', async () => {
+    const confidential = 'b90b217039eed36162aef24e79ec0be08063210c65eff1a1c3d1af7c11fa8af4'
+    const withNearPrivate = value => {
+      const account = result().result.accounts[0]
+      return result({
+        accounts: [
+          {
+            ...account,
+            networks: account.networks.map(network =>
+              network.chainId === 'near:testnet'
+                ? { ...network, privateExecutionAddress: value }
+                : network
+            )
+          }
+        ]
+      })
+    }
+    const catalog = await createAccountNetworksClient(
+      async () => withNearPrivate(confidential),
+      chains
+    ).getCatalog()
+    expect(catalog.accounts[0].networks.find(network => network.chain.family === 'near')).toMatchObject(
+      { privateExecutionAddress: confidential }
+    )
+    for (const value of ['alice.near', confidential.toUpperCase(), nearAddress]) {
+      const client = createAccountNetworksClient(async () => withNearPrivate(value), chains)
+      await expect(client.getCatalog()).rejects.toMatchObject({ code: 'invalid-response' })
+    }
+  })
 })

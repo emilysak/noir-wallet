@@ -303,6 +303,182 @@ test.describe('quote deposit transfer client', () => {
     expect(resolveConfidentialFundingDestinationToken({ ...input, tokens: [legacyEth] })).toBeNull()
   })
 
+  test('accepts mainnet NEAR and Solana wallet assets as confidential funding destinations', () => {
+    const model = portfolio()
+    const nearChain = model.chains.find(chain => chain.chain.family === 'near')
+    nearChain.chain.network = { kind: 'mainnet' }
+    const solanaChainId = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'
+    const solanaAssetId = `${solanaChainId}/slip44:501`
+    model.chains.push({
+      chain: {
+        id: solanaChainId,
+        family: 'solana',
+        network: { kind: 'mainnet' },
+        capabilities: { transaction: { status: 'available' } }
+      }
+    })
+    model.assets.push({
+      asset: { id: solanaAssetId, chainId: solanaChainId, kind: 'native' },
+      metadata: { symbol: 'SOL', decimals: 9 }
+    })
+    const targets = {
+      ...receiveTargets,
+      targets: [
+        ...receiveTargets.targets,
+        {
+          chain: { id: solanaChainId },
+          kind: 'solana',
+          address: 'So11111111111111111111111111111111111111112'
+        }
+      ]
+    }
+    const near = {
+      ...token('nep141:wrap.near', 'near', 24),
+      rheaChainId: 'near',
+      isNative: true,
+      sources: ['nearintents']
+    }
+    const sol = {
+      ...token('nep141:sol.omft.near', 'sol', 9),
+      rheaChainId: 'solana',
+      isNative: true,
+      sources: ['nearintents']
+    }
+    const funding = (tokenRow, destinationChain, destinationAsset, portfolioModel = model) =>
+      resolveConfidentialFundingDestinationToken({
+        tokens: [tokenRow],
+        destinationChain,
+        destinationAsset,
+        portfolio: portfolioModel,
+        receiveTargets: targets
+      })
+    expect(funding(near, 'near', NEAR_ASSET_ID)).toBe(near)
+    expect(funding(near, 'near', near.assetId)).toBe(near)
+    expect(funding(sol, 'solana', solanaAssetId)).toBe(sol)
+    expect(funding(sol, 'solana', sol.assetId)).toBe(sol)
+    const withNetwork = (family, kind) => ({
+      ...model,
+      chains: model.chains.map(chain =>
+        chain.chain.family === family
+          ? { chain: { ...chain.chain, network: { kind } } }
+          : chain
+      )
+    })
+    expect(funding(near, 'near', NEAR_ASSET_ID, withNetwork('near', 'testnet'))).toBeNull()
+    expect(funding(sol, 'solana', solanaAssetId, withNetwork('solana', 'testnet'))).toBeNull()
+    const bitcoin = {
+      ...token('nep141:btc.omft.near', 'btc', 8),
+      rheaChainId: 'btc',
+      isNative: true,
+      sources: ['nearintents']
+    }
+    expect(resolveWalletOwnedQuoteAsset(bitcoin, model, targets, mappings)).toMatchObject({
+      family: 'bitcoin'
+    })
+    expect(funding(bitcoin, 'btc', BITCOIN_ASSET_ID)).toBeNull()
+    expect(funding({ ...near, sources: ['lifi'] }, 'near', NEAR_ASSET_ID)).toBeNull()
+    const contracted = {
+      ...token('nep141:wrap.near', 'near', 24),
+      contractAddress: 'wrap.near',
+      rheaChainId: 'near',
+      rheaAddress: 'wrap.near',
+      isNative: false,
+      sources: ['nearintents']
+    }
+    const alias = {
+      ...contracted,
+      contractAddress: null,
+      rheaAddress: 'near',
+      isNative: true,
+      sources: []
+    }
+    model.assets.push({
+      asset: {
+        id: `${NEAR_CHAIN_ID}/nep141:wrap.near`,
+        chainId: NEAR_CHAIN_ID,
+        kind: 'token'
+      },
+      metadata: { symbol: 'wNEAR', decimals: 24 },
+      balance: { availableRaw: '1', mainRaw: '1' }
+    })
+    expect(resolveWalletOwnedQuoteAsset(contracted, model, targets, mappings)).toMatchObject({
+      family: 'near',
+      sourceAssetId: 'nep141:wrap.near',
+      asset: { asset: { id: NEAR_ASSET_ID, kind: 'native' } }
+    })
+    expect(
+      resolveWalletOwnedQuoteAsset({ ...contracted, decimals: 18 }, model, targets, mappings)
+    ).toBeNull()
+    expect(
+      resolveWalletSwapSourceToken(
+        NEAR_ASSET_ID,
+        [alias, contracted],
+        model,
+        targets,
+        mappings
+      )?.rheaAddress
+    ).toBe('wrap.near')
+    expect(
+      resolveConfidentialFundingDestinationToken({
+        tokens: [contracted],
+        destinationChain: 'near',
+        destinationAsset: NEAR_ASSET_ID,
+        portfolio: model,
+        receiveTargets: targets
+      })
+    ).toBe(contracted)
+    const requested = resolveWalletSwapSourceToken(
+      NEAR_ASSET_ID,
+      [alias, contracted],
+      model,
+      targets,
+      mappings
+    )
+    const walletSources = listWalletSwapSourceTokens([alias, contracted], model, targets, {
+      includeZcash: false,
+      mappings
+    })
+    expect(walletSources.map(token => token.rheaAddress)).toEqual(['wrap.near'])
+    expect(
+      resolveLockedWalletSwapSourceToken({
+        requestedToken: requested,
+        sourceTokens: [alias, contracted],
+        walletSourceTokens: walletSources
+      })?.rheaAddress
+    ).toBe('wrap.near')
+    expect(resolveRheaSwapDestinationIdentity(contracted, model)).toEqual({
+      chainId: NEAR_CHAIN_ID,
+      assetId: NEAR_ASSET_ID
+    })
+    expect(funding({ ...sol, sources: undefined }, 'solana', solanaAssetId)).toBeNull()
+  })
+
+  test('binds a NEAR private move to a distinct private execution account', () => {
+    const source = {
+      family: 'near',
+      refundAddress: 'alice.near',
+      asset: {
+        asset: { id: NEAR_ASSET_ID, kind: 'native' },
+        balance: { availableRaw: '10', mainRaw: '7', privateRaw: '3' }
+      },
+      networkFeeAsset: {
+        asset: { id: NEAR_ASSET_ID, kind: 'native' },
+        metadata: { symbol: 'NEAR', decimals: 24 },
+        balance: { availableRaw: '10', mainRaw: '7', privateRaw: '3' }
+      }
+    }
+    const implicit = 'ab'.repeat(32)
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'main')).toBe(source)
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private', implicit)).toMatchObject({
+      refundAddress: implicit,
+      asset: { balance: { availableRaw: '3' } },
+      networkFeeAsset: { balance: { availableRaw: '3' } }
+    })
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private', 'alice.near')).toBeNull()
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private', '0xabc')).toBeNull()
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private')).toBeNull()
+  })
+
   test('never falls back from a locked BNB transfer to a different wallet asset', () => {
     const bnb = {
       ...token('nep245:v2_1.omni.hot.tg:56_11111111111111111111', 'bsc', 18),
@@ -587,7 +763,21 @@ test.describe('quote deposit transfer client', () => {
     await expect(
       client.estimateMaximum({ source, depositAddress: 'alice.near' })
     ).resolves.toMatchObject({ amountRaw: '280', networkFeeRaw: '700' })
-    expect(rejected).toEqual(['near-max'])
+    const wrapStorage = 1_250_000_000_000_000_000_000n
+    await expect(
+      client.estimateMaximum({
+        source: {
+          ...source,
+          sourceAssetId: 'nep141:wrap.near',
+          asset: {
+            asset: { id: NEAR_ASSET_ID, kind: 'native' },
+            balance: { availableRaw: (wrapStorage + 770n).toString() }
+          }
+        },
+        depositAddress: 'alice.near'
+      })
+    ).resolves.toMatchObject({ amountRaw: '50', networkFeeRaw: '700' })
+    expect(rejected).toEqual(['near-max', 'near-max'])
   })
 
   test('deducts SOL transaction fees and rejects a maximum estimate with missing fee evidence', async () => {

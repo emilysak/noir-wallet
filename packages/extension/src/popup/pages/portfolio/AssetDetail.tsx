@@ -381,7 +381,7 @@ export function AssetDetail() {
   const canReceive = Boolean(
     chain &&
     chain.chain.capabilities.address.status === 'available' &&
-    ['zcash', 'evm', 'bitcoin'].includes(chain.chain.family)
+    ['zcash', 'evm', 'bitcoin', 'near', 'solana'].includes(chain.chain.family)
   )
   const canSwap = Boolean(
     asset &&

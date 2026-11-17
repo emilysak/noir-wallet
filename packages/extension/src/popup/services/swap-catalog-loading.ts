@@ -7,6 +7,7 @@ import { resolveEvmChainIconAlias } from '@/config/icons'
 import { BITCOIN_CHAIN_IDS, ZCASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { isDeprecatedIntentsToken } from '@/core/services/intents-evm-assets'
 import { ASSET_PRICE_SOURCE_ASSETS } from '@/config/asset-market-assets'
+import { WNEAR_NEAR_ASSET } from '@/config/intents'
 import { getEvmNetworkConfigs } from '@/config/networks'
 
 const ETHEREUM_USDC_CONTRACT = getEvmNetworkConfigs('mainnet')
@@ -265,6 +266,26 @@ export const ALL_DESTINATION_CHAIN_IDS = Object.freeze(
   ].map(chain => chain.tokenListChainId)
 )
 
+function swapCatalogKey(token: RheaSwapToken): string {
+  if (token.assetId === WNEAR_NEAR_ASSET && token.blockchain.toLowerCase() === 'near') {
+    return `${token.rheaChainId}:${WNEAR_NEAR_ASSET}`
+  }
+  return `${token.rheaChainId}:${token.rheaAddress}`
+}
+
+function nativeNearCatalogScore(token: RheaSwapToken): number {
+  const sources = token.sources?.map(source => source.toLowerCase()) ?? []
+  return (
+    (token.rheaAddress === 'wrap.near' ? 2 : 0) +
+    (sources.some(source => source === 'nearintents' || source === 'preswap-nearintents') ? 1 : 0)
+  )
+}
+
+function preferSwapCatalogToken(current: RheaSwapToken, next: RheaSwapToken): RheaSwapToken {
+  if (current.assetId !== WNEAR_NEAR_ASSET || next.assetId !== WNEAR_NEAR_ASSET) return next
+  return nativeNearCatalogScore(next) > nativeNearCatalogScore(current) ? next : current
+}
+
 export function mergeTokenCatalogs(
   ...catalogs: readonly (readonly RheaSwapToken[])[]
 ): readonly RheaSwapToken[] {
@@ -272,7 +293,9 @@ export function mergeTokenCatalogs(
   for (const catalog of catalogs) {
     for (const token of catalog) {
       if (isDeprecatedIntentsToken(token)) continue
-      tokens.set(`${token.rheaChainId}:${token.rheaAddress}`, token)
+      const key = swapCatalogKey(token)
+      const existing = tokens.get(key)
+      tokens.set(key, existing ? preferSwapCatalogToken(existing, token) : token)
     }
   }
   const merged = [...tokens.values()]

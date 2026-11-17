@@ -66,6 +66,7 @@ export interface NearWalletClient {
     intent: NearTransferIntent,
     options?: Readonly<{
       nearIntentsBinding?: NearIntentsTransactionBinding
+      executionMode?: 'main' | 'private'
     }>
   ) => Promise<NearTransferReview>
   readonly getPendingTransfer: (transactionId: TransactionId) => Promise<NearTransferReview | null>
@@ -81,6 +82,7 @@ export interface NearWalletClient {
 export type NearRuntimeMessenger = (message: Readonly<Record<string, unknown>>) => Promise<unknown>
 
 const MAXIMUM_U128 = 340_282_366_920_938_463_463_374_607_431_768_211_455n
+const FUNGIBLE_TOKEN_STORAGE_DEPOSIT_YOCTO = '1250000000000000000000'
 const runtimeErrorCodes = new Set<NearWalletRuntimeErrorCode>(NEAR_WALLET_RUNTIME_ERROR_CODES)
 
 function readRecord(value: unknown, label: string): Record<string, unknown> {
@@ -133,6 +135,65 @@ function parseRuntimeResult<T>(value: unknown, parseResult: (result: unknown) =>
     if (error instanceof NearWalletClientError) throw error
     throw new NearWalletClientError('invalid-response', 'Invalid NEAR runtime result')
   }
+}
+
+function decodeFunctionArgs(value: string): Record<string, unknown> | null {
+  try {
+    const decoded = JSON.parse(atob(value)) as unknown
+    if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) return null
+    const prototype = Object.getPrototypeOf(decoded)
+    if (prototype !== Object.prototype && prototype !== null) return null
+    return decoded as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+function nearTokenTransferMatches(
+  summary: NearTransactionSummary,
+  contractId: string,
+  recipient: string,
+  amountRaw: string
+): boolean {
+  const actions = summary.fields.actions
+  const transfer = actions.at(-1)
+  if (
+    summary.fields.receiverId !== contractId ||
+    actions.length < 1 ||
+    actions.length > 2 ||
+    transfer?.kind !== 'function-call' ||
+    transfer.methodName !== 'ft_transfer' ||
+    transfer.args.encoding !== 'base64' ||
+    transfer.depositYocto !== '1'
+  ) {
+    return false
+  }
+  const transferArgs = decodeFunctionArgs(transfer.args.value)
+  if (
+    !transferArgs ||
+    Object.keys(transferArgs).length !== 2 ||
+    transferArgs.receiver_id !== recipient ||
+    transferArgs.amount !== amountRaw
+  ) {
+    return false
+  }
+  if (actions.length === 1) return true
+  const storage = actions[0]
+  if (
+    storage?.kind !== 'function-call' ||
+    storage.methodName !== 'storage_deposit' ||
+    storage.args.encoding !== 'base64' ||
+    storage.depositYocto !== FUNGIBLE_TOKEN_STORAGE_DEPOSIT_YOCTO
+  ) {
+    return false
+  }
+  const storageArgs = decodeFunctionArgs(storage.args.value)
+  return (
+    storageArgs !== null &&
+    Object.keys(storageArgs).length === 2 &&
+    storageArgs.account_id === recipient &&
+    storageArgs.registration_only === true
+  )
 }
 
 function parseTimestamp(value: unknown): number {
@@ -237,29 +298,18 @@ function parseReview(
     summary.fields.receiverId === graph.root.intent?.recipient?.address &&
     action?.kind === 'transfer' &&
     action.depositYocto === graph.root.intent?.primaryAmount?.amountRaw
-  let tokenMatches = false
-  if (
+  const tokenRecipient = graph.root.intent?.recipient?.address
+  const tokenAmount = graph.root.intent?.primaryAmount?.amountRaw
+  const tokenMatches =
     asset?.namespace === 'nep141' &&
-    summary.fields.receiverId === asset.reference.replace(/%5F/gi, '_') &&
-    action?.kind === 'function-call' &&
-    action.methodName === 'ft_transfer' &&
-    action.args.encoding === 'base64' &&
-    action.depositYocto === '1'
-  ) {
-    try {
-      const decoded = JSON.parse(atob(action.args.value)) as unknown
-      tokenMatches =
-        typeof decoded === 'object' &&
-        decoded !== null &&
-        !Array.isArray(decoded) &&
-        Object.keys(decoded).length === 2 &&
-        (decoded as Record<string, unknown>).receiver_id ===
-          graph.root.intent?.recipient?.address &&
-        (decoded as Record<string, unknown>).amount === graph.root.intent?.primaryAmount?.amountRaw
-    } catch {
-      tokenMatches = false
-    }
-  }
+    typeof tokenRecipient === 'string' &&
+    typeof tokenAmount === 'string' &&
+    nearTokenTransferMatches(
+      summary,
+      asset.reference.replace(/%5F/gi, '_'),
+      tokenRecipient,
+      tokenAmount
+    )
   let lendingMatches = false
   if (
     finalAction?.kind === 'function-call' &&
@@ -372,13 +422,17 @@ export function createNearWalletClient(sendMessage: NearRuntimeMessenger): NearW
       intentValue: NearTransferIntent,
       options?: Readonly<{
         nearIntentsBinding?: NearIntentsTransactionBinding
+        executionMode?: 'main' | 'private'
       }>
     ) => {
       const intent = parseClientInput(() => parseIntent(intentValue))
       return send(
         {
           type: 'PREPARE_NEAR_TRANSFER',
-          intent,
+          intent:
+            options?.executionMode === undefined
+              ? intent
+              : { ...intent, executionMode: options.executionMode },
           ...(options?.nearIntentsBinding === undefined
             ? {}
             : { nearIntentsBinding: options.nearIntentsBinding })

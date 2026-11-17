@@ -20,6 +20,7 @@ import {
   type ParsedSigningPreparePayload,
   type PendingSigningKind
 } from './signing-adapter'
+import type { NearPeaSigningBinding } from './signing-adapter-near'
 import type { SolanaPeaSigningBinding } from './signing-adapter-solana'
 import {
   assertExactKeys,
@@ -27,6 +28,7 @@ import {
   assertRawEd25519AccountMatches,
   assertRawEvmAccountMatches,
   globalPeaRequestJson,
+  nearPeaRequestJson,
   solanaPeaRequestJson,
   MAX_BIP32_INDEX,
   MAX_UINT64,
@@ -36,6 +38,7 @@ import {
   parseRawEd25519Account,
   parseRawEvmAccount,
   parseRawGlobalPeaAccount,
+  parseRawNearPeaAccount,
   parseRawSolanaPeaAccount,
   parseRawExportedPrivateKey,
   parseRawSessionInfo,
@@ -232,6 +235,10 @@ function parseAccountDerivation(value: unknown):
       readonly accountIndex: number
     }
   | {
+      readonly family: 'near-pea'
+      readonly accountIndex: number
+    }
+  | {
       readonly family: 'evm'
       readonly chainId: string
       readonly addressIndex: number
@@ -268,7 +275,7 @@ function parseAccountDerivation(value: unknown):
   const record = readRecord(value, 'account.derive-public payload')
   const family = readLiteral(
     record.family,
-    ['evm', 'pea', 'solana-pea', 'bitcoin', 'solana', 'near'],
+    ['evm', 'pea', 'solana-pea', 'near-pea', 'bitcoin', 'solana', 'near'],
     'account family'
   )
   if (family === 'evm') {
@@ -317,7 +324,7 @@ function parseAccountDerivation(value: unknown):
       addressIndex: readSafeInteger(record.addressIndex, 'addressIndex', MAX_BIP32_INDEX)
     })
   }
-  if (family === 'solana-pea') {
+  if (family === 'solana-pea' || family === 'near-pea') {
     assertExactKeys(record, ['family', 'accountIndex'], [], 'derive payload')
     return Object.freeze({
       family,
@@ -913,6 +920,17 @@ export class MultichainWorkerRuntime {
         value => parseRawSolanaPeaAccount(value, derivation.accountIndex)
       )
     }
+    if (derivation.family === 'near-pea') {
+      return callRaw(
+        command,
+        () =>
+          this.engine.derivePeaAccount(
+            session.rawSessionId,
+            nearPeaRequestJson(derivation.accountIndex)
+          ),
+        value => parseRawNearPeaAccount(value, derivation.accountIndex)
+      )
+    }
     if (derivation.batch) {
       const accounts = callRaw(
         command,
@@ -997,6 +1015,7 @@ export class MultichainWorkerRuntime {
     if (!Number.isSafeInteger(expiresAt)) throw new KeyringError('INTERNAL_ERROR')
 
     let solanaPeaBinding: SolanaPeaSigningBinding | undefined
+    let nearPeaBinding: NearPeaSigningBinding | undefined
     if (payload.kind === 'pea-solana-transaction' || payload.kind === 'pea-solana-message') {
       const pea = callRaw(
         command,
@@ -1030,6 +1049,43 @@ export class MultichainWorkerRuntime {
       if (pea.address === main.address) throw new KeyringError('SIGNER_MISMATCH')
       solanaPeaBinding = Object.freeze({
         expectedAddress: pea.address,
+        mainAddress: main.address
+      })
+    }
+    if (payload.kind === 'pea-near-transaction' || payload.kind === 'pea-near-message') {
+      const pea = callRaw(
+        command,
+        () =>
+          this.engine.derivePeaAccount(
+            session.rawSessionId,
+            nearPeaRequestJson(payload.accountIndex)
+          ),
+        value => parseRawNearPeaAccount(value, payload.accountIndex)
+      )
+      const main = callRaw(
+        command,
+        () =>
+          this.engine.deriveNearAccount(
+            session.rawSessionId,
+            payload.chainId,
+            payload.accountIndex
+          ),
+        value => {
+          const account = parseRawEd25519Account(value, 'near')
+          assertRawEd25519AccountMatches(
+            account,
+            'near',
+            payload.chainId,
+            payload.accountIndex,
+            session.kind === 'private_key'
+          )
+          return account
+        }
+      )
+      if (pea.address === main.address) throw new KeyringError('SIGNER_MISMATCH')
+      nearPeaBinding = Object.freeze({
+        expectedAddress: pea.address,
+        expectedPublicKey: pea.publicKey,
         mainAddress: main.address
       })
     }
@@ -1139,6 +1195,18 @@ export class MultichainWorkerRuntime {
           payload.accountIndex,
           payload.message
         )
+      } else if (payload.kind === 'pea-near-transaction') {
+        raw = this.engine.preparePeaNearTransaction(
+          session.rawSessionId,
+          nearPeaRequestJson(payload.accountIndex),
+          payload.transaction
+        )
+      } else if (payload.kind === 'pea-near-message') {
+        raw = this.engine.preparePeaNearMessage(
+          session.rawSessionId,
+          nearPeaRequestJson(payload.accountIndex),
+          payload.request
+        )
       } else if (payload.kind === 'near-transaction') {
         raw = this.engine.prepareNearTransaction(session.rawSessionId, payload.transaction)
       } else if (payload.kind === 'near-nep413-message') {
@@ -1166,7 +1234,8 @@ export class MultichainWorkerRuntime {
         expiresAt,
         bitcoinAccount,
         session.kind === 'private_key',
-        solanaPeaBinding
+        solanaPeaBinding,
+        nearPeaBinding
       )
     } catch {
       this.rejectRawRequest(session.rawSessionId, raw)
@@ -1239,9 +1308,11 @@ export class MultichainWorkerRuntime {
           raw = this.engine.confirmSolanaMessage(pending.rawSessionId, pending.rawRequestId)
           break
         case 'near-transaction':
+        case 'pea-near-transaction':
           raw = this.engine.confirmNearTransaction(pending.rawSessionId, pending.rawRequestId)
           break
         case 'near-nep413-message':
+        case 'pea-near-message':
           raw = this.engine.confirmNearMessage(pending.rawSessionId, pending.rawRequestId)
           break
       }
