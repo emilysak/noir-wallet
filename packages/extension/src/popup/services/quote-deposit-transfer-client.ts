@@ -1,4 +1,5 @@
 import type { PortfolioAssetView, PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
+import { parseSolanaPublicKey } from '@/core/chains/solana'
 import type { EvmFeeEstimate, EvmFeeSelection } from '@/infrastructure/chains/evm'
 import type { NetworkFeeTier, TransactionGraph } from '@/core/transactions/domain'
 import {
@@ -427,12 +428,55 @@ function selectEvmBalance(
   })
 }
 
+function selectSolanaExecutionBalance(asset: PortfolioAssetView): PortfolioAssetView | null {
+  const selectedRaw = asset.balance.privateRaw
+  if (selectedRaw === undefined) return null
+  return Object.freeze({
+    ...asset,
+    balance: Object.freeze({
+      ...asset.balance,
+      totalRaw: selectedRaw,
+      spendableRaw: selectedRaw,
+      availableRaw: selectedRaw
+    })
+  })
+}
+
+function isSolanaExecutionAddress(value: string): boolean {
+  try {
+    parseSolanaPublicKey(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function selectWalletOwnedQuoteAssetExecution(
   source: WalletOwnedQuoteAsset,
   mode: QuoteDepositExecutionMode,
   privateExecutionAddress?: string,
   publicOnly = false
 ): WalletOwnedQuoteAsset | null {
+  if (source.family === 'solana') {
+    if (mode !== 'private') return source
+    const asset = selectSolanaExecutionBalance(source.asset)
+    const networkFeeAsset = selectSolanaExecutionBalance(source.networkFeeAsset)
+    if (
+      !asset ||
+      !networkFeeAsset ||
+      !privateExecutionAddress ||
+      !isSolanaExecutionAddress(privateExecutionAddress) ||
+      privateExecutionAddress === source.refundAddress
+    ) {
+      return null
+    }
+    return Object.freeze({
+      ...source,
+      asset,
+      networkFeeAsset,
+      refundAddress: privateExecutionAddress
+    })
+  }
   if (source.family !== 'evm') return mode === 'main' ? source : null
   const asset = selectEvmBalance(source.asset, mode, publicOnly)
   const networkFeeAsset = selectEvmBalance(source.networkFeeAsset, mode, publicOnly)
@@ -845,7 +889,10 @@ export function createQuoteDepositTransferClient(options: {
             recipient: input.depositAddress,
             amountRaw
           },
-          { nearIntentsBinding }
+          {
+            nearIntentsBinding,
+            ...(input.executionMode === undefined ? {} : { executionMode: input.executionMode })
+          }
         )
         return Object.freeze({ family: 'solana' as const, source: input.source, review })
       }

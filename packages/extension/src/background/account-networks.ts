@@ -12,6 +12,7 @@ import {
 } from '@/core/chains/registry'
 import { BITCOIN_ADDRESS_POLICY } from '@/core/chains/bitcoin'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import type { KeyDomainId } from '@/core/keyring/domain'
 import type { HardwareCredentialMetadata } from '@/core/keyring/domain'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
@@ -86,6 +87,12 @@ export interface AccountNetworksCoordinatorOptions {
       addressIndex: number
     ): Promise<Readonly<{ readonly address: string }>>
   }>
+  readonly solanaPeaDerivation?: Readonly<{
+    deriveSolanaPea(
+      keyDomainId: KeyDomainId,
+      accountIndex: number
+    ): Promise<Readonly<{ readonly address: string }>>
+  }>
 }
 
 export class AccountNetworksCoordinator {
@@ -154,6 +161,7 @@ export class AccountNetworksCoordinator {
         const keyDomain = resolveKeyDomain(snapshot.keyDomains, account.keyDomainId)
         const seenChains = new Set<string>()
         const privateExecutionAddresses = new Map<number, Promise<string>>()
+        const solanaPrivateExecutionAddresses = new Map<number, Promise<string>>()
         const networks = (
           await Promise.all(
             snapshot.chainAccounts
@@ -292,6 +300,32 @@ export class AccountNetworksCoordinator {
                     // Public account metadata stays readable while the credential session is locked.
                   }
                 }
+                const solanaPeaDerivation = this.options.solanaPeaDerivation
+                if (
+                  chain.family === 'solana' &&
+                  supportsSolanaPrivateExecution(keyDomain.source) &&
+                  solanaPeaDerivation &&
+                  deriveMissingAddresses
+                ) {
+                  try {
+                    let derived = solanaPrivateExecutionAddresses.get(account.accountIndex)
+                    if (!derived) {
+                      derived = solanaPeaDerivation
+                        .deriveSolanaPea(account.keyDomainId, account.accountIndex)
+                        .then(result => result.address)
+                      solanaPrivateExecutionAddresses.set(account.accountIndex, derived)
+                    }
+                    privateExecutionAddress = await derived
+                  } catch (error) {
+                    if (
+                      !(error instanceof Error) ||
+                      (error.message !== 'Wallet is locked' &&
+                        error.message !== 'Credential is not unlocked')
+                    ) {
+                      throw error
+                    }
+                  }
+                }
 
                 if (addresses.length === 0) {
                   throw new Error('Enabled ChainAccount has no displayable Address')
@@ -361,7 +395,8 @@ export function createBackgroundAccountNetworksCoordinator(
   customEvmNetworks: readonly EvmNetworkConfig[] = [],
   bitcoinDerivation?: BitcoinAddressDerivationPort,
   evmPeaDerivation?: AccountNetworksCoordinatorOptions['evmPeaDerivation'],
-  getZcashShieldedReceiveAddress?: AccountNetworksCoordinatorOptions['getZcashShieldedReceiveAddress']
+  getZcashShieldedReceiveAddress?: AccountNetworksCoordinatorOptions['getZcashShieldedReceiveAddress'],
+  solanaPeaDerivation?: AccountNetworksCoordinatorOptions['solanaPeaDerivation']
 ): AccountNetworksCoordinator {
   return new AccountNetworksCoordinator({
     repository: new IndexedDbStorageV2Repository(),
@@ -371,6 +406,7 @@ export function createBackgroundAccountNetworksCoordinator(
     bitcoinDerivation,
     evmPeaDerivation,
     getZcashShieldedReceiveAddress,
+    solanaPeaDerivation,
     isNetworkEnabled: (scope, family, chainId) =>
       isStoredAccountNetworkEnabled(
         scope.keyDomainId,

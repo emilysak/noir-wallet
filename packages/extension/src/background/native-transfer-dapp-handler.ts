@@ -63,6 +63,11 @@ export interface BackgroundNativeTransferDAppHandlerOptions {
   readonly hasUnlockSession: () => Promise<boolean>
   readonly runActiveOperation: <T>(operation: () => Promise<T>) => Promise<T>
   readonly parseAddress: (value: string) => string
+  readonly resolveExecutionIdentity?: (input: {
+    readonly context: ActiveNativeTransferContext
+    readonly reference: AccountRef
+    readonly mainAddress: string
+  }) => Promise<{ readonly mode: 'main' | 'private'; readonly address: string }>
 }
 
 export interface NativeTransferDAppRequest {
@@ -80,6 +85,7 @@ interface ActiveDAppAccount {
   readonly context: ActiveNativeTransferContext
   readonly reference: AccountRef
   readonly address: string
+  readonly executionMode: 'main' | 'private'
   readonly publicKey?: string
 }
 
@@ -92,6 +98,7 @@ function activeAccountsEqual(left: ActiveDAppAccount, right: ActiveDAppAccount):
     accountRefsEqual(left.reference, right.reference) &&
     left.context.chainAccount.id === right.context.chainAccount.id &&
     left.address === right.address &&
+    left.executionMode === right.executionMode &&
     left.publicKey === right.publicKey
   )
 }
@@ -224,13 +231,25 @@ export class BackgroundNativeTransferDAppHandler {
         `The active wallet has no ${this.options.familyName} account.`
       )
     }
+    const reference = Object.freeze({
+      walletId: context.chainAccount.scope.keyDomainId,
+      accountId: context.chainAccount.scope.accountId
+    })
+    const mainAddress = this.options.parseAddress(context.chainAccount.identity.value)
+    const identity = this.options.resolveExecutionIdentity
+      ? await this.options.resolveExecutionIdentity({ context, reference, mainAddress })
+      : Object.freeze({ mode: 'main' as const, address: mainAddress })
+    if (identity.mode === 'private' && identity.address === mainAddress) {
+      throw new NativeTransferProviderError(
+        4100,
+        `The active ${this.options.familyName} private account is unavailable.`
+      )
+    }
     return Object.freeze({
       context,
-      reference: Object.freeze({
-        walletId: context.chainAccount.scope.keyDomainId,
-        accountId: context.chainAccount.scope.accountId
-      }),
-      address: this.options.parseAddress(context.chainAccount.identity.value),
+      reference,
+      address: identity.address,
+      executionMode: identity.mode,
       ...(context.publicKey === undefined ? {} : { publicKey: context.publicKey })
     })
   }
@@ -247,14 +266,17 @@ export class BackgroundNativeTransferDAppHandler {
   ): Promise<readonly DAppChainAccountDescriptor[]> {
     const listed = (await this.options.listAccounts?.()) ?? []
     const activeDescriptor = listed.find(item => accountRefsEqual(item.reference, active.reference))
-    const current =
-      activeDescriptor ??
-      Object.freeze({
-        id: JSON.stringify([active.reference.walletId, active.reference.accountId]),
-        label: 'Current account',
-        reference: active.reference,
-        address: active.address
-      })
+    const current = Object.freeze(
+      activeDescriptor
+        ? { ...activeDescriptor, address: active.address }
+        : {
+            id: JSON.stringify([active.reference.walletId, active.reference.accountId]),
+            label: 'Current account',
+            reference: active.reference,
+            address: active.address
+          }
+    )
+    if (active.executionMode === 'private') return Object.freeze([current])
     return Object.freeze([
       current,
       ...listed.filter(item => !accountRefsEqual(item.reference, active.reference))

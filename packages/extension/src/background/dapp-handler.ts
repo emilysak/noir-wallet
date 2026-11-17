@@ -2064,7 +2064,7 @@ export class DAppHandler {
   countPendingApprovalsForContext(
     walletId: string,
     accountId: string,
-    chainId: 'zcash' | 'evm' | 'bitcoin'
+    chainId: 'zcash' | 'evm' | 'bitcoin' | 'solana'
   ): number {
     const actions = APPROVAL_ACTION_PREFIXES[chainId]
     return pendingRequestsManager.countContext(walletId, accountId, action =>
@@ -2075,7 +2075,7 @@ export class DAppHandler {
   cancelPendingApprovalsForContext(
     walletId: string,
     accountId: string,
-    chainId: 'zcash' | 'evm' | 'bitcoin'
+    chainId: 'zcash' | 'evm' | 'bitcoin' | 'solana'
   ): number {
     const actions = APPROVAL_ACTION_PREFIXES[chainId]
     return pendingRequestsManager.cancelContextMatching(walletId, accountId, action =>
@@ -2170,7 +2170,8 @@ export class DAppHandler {
       const executionModeRequestToken =
         capturedWalletId &&
         capturedAccountId &&
-        APPROVAL_ACTION_PREFIXES.evm.some(candidate => candidate === action)
+        (APPROVAL_ACTION_PREFIXES.evm.some(candidate => candidate === action) ||
+          APPROVAL_ACTION_PREFIXES.solana.some(candidate => candidate === action))
           ? dappExecutionModeRequestGate.capture({
               network: DEFAULT_NETWORK,
               keyDomainId: capturedWalletId,

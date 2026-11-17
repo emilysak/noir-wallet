@@ -886,7 +886,10 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
   RESUME_EVM_TRANSFER: { required: { transactionId: isShortString } },
   PREPARE_SOLANA_TRANSFER: {
     required: { intent: isRecord },
-    optional: { nearIntentsBinding: isRecord }
+    optional: {
+      nearIntentsBinding: isRecord,
+      executionMode: value => value === 'main' || value === 'private'
+    }
   },
   GET_PENDING_SOLANA_TRANSFER: { required: { transactionId: isShortString } },
   APPROVE_SOLANA_TRANSFER: {

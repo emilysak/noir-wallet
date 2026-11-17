@@ -268,3 +268,62 @@ test('resolves v0 lookup accounts before interpreting instructions', async () =>
     }
   })
 })
+
+test('binds a Solana PEA transaction to the derived address and rejects the main account', async () => {
+  const mainAddress = 'SysvarRent111111111111111111111111111111111'
+  const prepared = rawPrepared()
+  prepared.account = {
+    ...prepared.account,
+    derivationPath: 'm',
+    derivationScheme: 'imported'
+  }
+  const adapted = await adaptSolanaPreparedSigning(
+    prepared,
+    {
+      kind: 'pea-solana-transaction',
+      chainId,
+      accountIndex: 1,
+      transaction: built.transactionBase64,
+      reviewContext
+    },
+    parseSigningCommandId('signing-command:solana:pea'),
+    Date.now() + 60_000,
+    false,
+    { expectedAddress: sender, mainAddress }
+  )
+  expect(adapted.kind).toBe('pea-solana-transaction')
+  expect(adapted.account.address).toBe(sender)
+
+  await expect(
+    adaptSolanaPreparedSigning(
+      prepared,
+      {
+        kind: 'pea-solana-transaction',
+        chainId,
+        accountIndex: 1,
+        transaction: built.transactionBase64,
+        reviewContext
+      },
+      parseSigningCommandId('signing-command:solana:pea-main'),
+      Date.now() + 60_000,
+      false,
+      { expectedAddress: sender, mainAddress: sender }
+    )
+  ).rejects.toThrow(/parent account/)
+
+  await expect(
+    adaptSolanaPreparedSigning(
+      prepared,
+      {
+        kind: 'pea-solana-transaction',
+        chainId,
+        accountIndex: 1,
+        transaction: built.transactionBase64,
+        reviewContext
+      },
+      parseSigningCommandId('signing-command:solana:pea-missing'),
+      Date.now() + 60_000,
+      false
+    )
+  ).rejects.toThrow(/binding is missing/)
+})

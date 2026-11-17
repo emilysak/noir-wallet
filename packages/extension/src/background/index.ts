@@ -240,6 +240,7 @@ import {
 } from '@/infrastructure/chains/evm'
 import { estimateEvmFirstConfirmation } from './evm-confirmation-estimate'
 import { EvmMultichainSigningClient } from '@/infrastructure/keyring/multichain/evm-signing-client'
+import { SolanaMultichainSigningClient } from '@/infrastructure/keyring/multichain/solana-signing-client'
 import {
   createBackgroundEvmTransferRuntime,
   hasBackgroundEvmTransferCapability,
@@ -675,6 +676,9 @@ const networkSwitchBitcoinDerivation = new BitcoinMultichainDerivationClient({
 const accountNetworksPeaDerivation = new EvmMultichainSigningClient({
   credentials: credentialSession
 })
+const accountNetworksSolanaPeaDerivation = new SolanaMultichainSigningClient({
+  credentials: credentialSession
+})
 const networkSwitchEvmPending = new ChromeSessionEvmPendingTransferStore()
 const networkSwitchBitcoinPending = new ChromeSessionBitcoinPendingTransferStore()
 const networkSwitchSolanaPending = new ChromeSessionSolanaPendingTransferStore()
@@ -835,29 +839,47 @@ async function requireActiveDAppExecutionModeScope(): Promise<DAppExecutionModeS
 
 async function notifyDAppExecutionModeChanged(scope: DAppExecutionModeScope): Promise<void> {
   dappHandler.cancelPendingApprovalsForContext(scope.keyDomainId, scope.accountId, 'evm')
+  dappHandler.cancelPendingApprovalsForContext(scope.keyDomainId, scope.accountId, 'solana')
   await multichainRuntimeReady
   await notifyEvmAccountsChanged()
+  await solanaDAppHandler?.notifyAccountsChanged()
   await multichainSessionDAppHandler?.notifyAllSessionsChanged()
+}
+
+function countDAppExecutionModeApprovals(scope: DAppExecutionModeScope): {
+  readonly evmInMemory: number
+  readonly solanaInMemory: number
+} {
+  const evmInMemory = dappHandler.countPendingApprovalsForContext(
+    scope.keyDomainId,
+    scope.accountId,
+    'evm'
+  )
+  const solanaInMemory = dappHandler.countPendingApprovalsForContext(
+    scope.keyDomainId,
+    scope.accountId,
+    'solana'
+  )
+  return { evmInMemory, solanaInMemory }
+}
+
+function cancelDAppExecutionModeApprovals(scope: DAppExecutionModeScope): number {
+  return (
+    dappHandler.cancelPendingApprovalsForContext(scope.keyDomainId, scope.accountId, 'evm') +
+    dappHandler.cancelPendingApprovalsForContext(scope.keyDomainId, scope.accountId, 'solana')
+  )
 }
 
 const dappExecutionModeTransitionCoordinator = new DAppExecutionModeTransitionCoordinator(
   dappExecutionModeCoordinator,
   {
     count: async scope => {
-      const inMemory = dappHandler.countPendingApprovalsForContext(
-        scope.keyDomainId,
-        scope.accountId,
-        'evm'
-      )
+      const { evmInMemory, solanaInMemory } = countDAppExecutionModeApprovals(scope)
       const persisted = await evmDAppOperationStore.listForScope(scope.keyDomainId, scope.accountId)
-      return Math.max(inMemory, persisted.length)
+      return Math.max(evmInMemory, persisted.length) + solanaInMemory
     },
     cancel: async scope => {
-      const inMemory = dappHandler.cancelPendingApprovalsForContext(
-        scope.keyDomainId,
-        scope.accountId,
-        'evm'
-      )
+      const inMemory = cancelDAppExecutionModeApprovals(scope)
       const persisted = await evmDAppOperationStore.listForScope(scope.keyDomainId, scope.accountId)
       for (const operation of persisted) {
         await evmTransferRouter?.rejectForScope(operation.transactionId, {
@@ -1279,7 +1301,8 @@ async function reloadMultichainRuntime(
         useWalletStore.getState().getAccount(scope.keyDomainId, scope.accountId)
           ?.networkAddresses?.[DEFAULT_NETWORK]?.shielded || null
       )
-    }
+    },
+    accountNetworksSolanaPeaDerivation
   )
   const evmTransferRuntime =
     evmFeatureRuntimePolicy.newOperationsEnabled && hasBackgroundEvmTransferCapability(activeEvm)
@@ -1520,13 +1543,20 @@ async function reloadMultichainRuntime(
   }
   multichainRuntimeKey = nextKey
 
-  await Promise.all([
+  // Solana and NEAR monitor startup re-enters this account-context queue.
+  // Waiting for it here deadlocks the queue and blocks wallet provisioning.
+  void Promise.all([
     evmTransactionMonitor?.init(),
     bitcoinTransactionMonitor?.init(),
     solanaTransactionMonitor?.init(),
     nearTransactionMonitor?.init(),
     portfolioCoordinator?.readCachedActive()
-  ])
+  ]).catch(error => {
+    console.warn(
+      '[Multichain Runtime] Monitor initialization failed:',
+      error instanceof Error ? error.message : 'UnknownError'
+    )
+  })
 }
 
 function scheduleMultichainRuntimeReload(
@@ -4872,7 +4902,11 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
     }
     const operation =
       message.type === 'PREPARE_SOLANA_TRANSFER'
-        ? solanaTransferController.prepare(message.intent, message.nearIntentsBinding)
+        ? solanaTransferController.prepare(
+            message.intent,
+            message.nearIntentsBinding,
+            message.executionMode
+          )
         : message.type === 'GET_PENDING_SOLANA_TRANSFER'
           ? solanaTransferController.getPendingApproval(message.transactionId)
           : message.type === 'APPROVE_SOLANA_TRANSFER'

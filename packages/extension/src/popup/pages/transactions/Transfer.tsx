@@ -99,6 +99,8 @@ import {
   shieldQuoteFeeRaw
 } from '@/popup/services/shield-transfer'
 import { TransactionReviewView } from '@/popup/components/transaction/TransactionReviewView'
+import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
+import { SendTransferForm } from './SendTransferForm'
 import { openConfidentialActivity } from '@/popup/components/transaction/ConfidentialActivitySheet'
 import { resolveNativeRouteMaximum } from '@/popup/services/transfer-maximum'
 import {
@@ -663,6 +665,19 @@ function TransferForm() {
     () => getPrivateTransferChainIds(activeAccount, currentNetwork === 'mainnet'),
     [activeAccount, currentNetwork]
   )
+  const solanaChainIds = useMemo(
+    () =>
+      supportsSolanaPrivateExecution(activeAccount?.walletSource)
+        ? (activeAccount?.networks.flatMap(network =>
+            network.chain.family === 'solana' &&
+            network.privateExecutionAddress &&
+            network.addresses.some(address => address.preferredForReceive)
+              ? [network.chain.id]
+              : []
+          ) ?? [])
+        : [],
+    [activeAccount]
+  )
   const currentShieldBalances = useMemo(
     () => shieldBalances ?? shieldPortfolioBalances(portfolio),
     [shieldBalances, portfolio]
@@ -672,9 +687,10 @@ function TransferForm() {
     const chains = new Map(portfolio.chains.map(chain => [chain.chain.id, chain]))
     const publicAssets = portfolio.assets.flatMap(asset => {
       const chain = chains.get(asset.asset.chainId)
-      return chain?.chain.family === 'evm' &&
-        eligibleChainIds.includes(chain.chain.id) &&
-        chain.chain.capabilities.transaction.status === 'available'
+      return chain &&
+        chain.chain.capabilities.transaction.status === 'available' &&
+        ((chain.chain.family === 'evm' && eligibleChainIds.includes(chain.chain.id)) ||
+          (chain.chain.family === 'solana' && solanaChainIds.includes(chain.chain.id)))
         ? [{ asset, chain }]
         : []
     })
@@ -704,6 +720,7 @@ function TransferForm() {
     catalogTokens,
     currentNetwork,
     eligibleChainIds,
+    solanaChainIds,
     shieldEntry
   ])
   const defaultAssetId = useMemo(
@@ -718,12 +735,13 @@ function TransferForm() {
             network: currentNetwork,
             shieldBalances: currentShieldBalances
           })
-        : selectDefaultTransferAssetId({ assets, from, to, eligibleChainIds }),
+        : selectDefaultTransferAssetId({ assets, from, to, eligibleChainIds, solanaChainIds }),
     [
       assets,
       from,
       to,
       eligibleChainIds,
+      solanaChainIds,
       shieldEntry,
       managedAssets,
       catalogTokens,
@@ -1962,6 +1980,50 @@ function TransferForm() {
           onCancel={() => void cancelShieldReview()}
           onConfirm={() => void confirmShield()}
         />
+      </div>
+    )
+  }
+
+  if (
+    selected?.chain.chain.family === 'solana' &&
+    from !== 'shield' &&
+    to !== 'shield' &&
+    mainAddress &&
+    privateAddress &&
+    mainAddress !== privateAddress &&
+    sourceRaw
+  ) {
+    const solanaAsset = {
+      ...selected.asset,
+      balance: {
+        ...selected.asset.balance,
+        totalRaw: sourceRaw,
+        spendableRaw: sourceRaw,
+        availableRaw: sourceRaw
+      }
+    }
+    return (
+      <div className="page-container" data-wallet-mode={walletMode}>
+        <PageHeader title="Move" showBack onBack={goBack} />
+        <div className="page-content min-h-0">
+          <SendTransferForm
+            family="solana"
+            selection={{ asset: solanaAsset, chain: selected.chain }}
+            priceUsd={
+              assetPrices
+                ? (findAssetPrice(assetPrices, selected.asset.asset.id)?.priceUsd ?? null)
+                : null
+            }
+            executionMode={from === 'private' ? 'private' : 'main'}
+            initialRecipient={from === 'private' ? mainAddress : privateAddress}
+            initialAmount={amount}
+            onSubmitted={submission =>
+              navigate(
+                `/?tab=activity&transactionId=${encodeURIComponent(submission.value.graph.root.id)}`
+              )
+            }
+          />
+        </div>
       </div>
     )
   }

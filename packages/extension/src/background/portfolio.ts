@@ -27,6 +27,7 @@ import {
   readSolanaPortfolioSource
 } from '@/infrastructure/chains/solana'
 import { EvmMultichainSigningClient } from '@/infrastructure/keyring/multichain/evm-signing-client'
+import { SolanaMultichainSigningClient } from '@/infrastructure/keyring/multichain/solana-signing-client'
 import { parseEvmAccountBinding } from '@/infrastructure/chains/evm/evm-account'
 import {
   SingleChainPortfolioCoordinator,
@@ -48,10 +49,12 @@ import { formatLogError } from '@/lib/log-format'
 import { logger } from '@/lib/logger'
 import { useAccountDataStore } from '@/store/account-data-store'
 import { useWalletStore } from '@/store/wallet-store'
+import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import { createBackgroundBitcoinPortfolioCoordinator } from './bitcoin-transfer'
 import { credentialSession } from './credential-session'
 import { markWalletNeedsCatchUp } from './tx-sync'
 import { backgroundZcashWalletRuntime } from './zcash-wallet-runtime'
+import { loadActiveSolanaTransferContext } from './solana-transfer'
 import {
   isStoredAccountNetworkEnabled,
   withUndeletedWalletAccountMetadata
@@ -86,6 +89,7 @@ export function createBackgroundPortfolioCoordinator(
     )
   )
   const peaSigner = new EvmMultichainSigningClient({ credentials: credentialSession })
+  const solanaPeaSigner = new SolanaMultichainSigningClient({ credentials: credentialSession })
   const isNetworkEnabled = (
     scope: { readonly keyDomainId: string; readonly accountId: string },
     family: Parameters<typeof isStoredAccountNetworkEnabled>[3],
@@ -146,7 +150,37 @@ export function createBackgroundPortfolioCoordinator(
         chainId: solanaNetwork.chainId,
         family: 'solana',
         isNetworkEnabled,
-        readSource: input => readSolanaPortfolioSource({ ...input, rpc: solanaRpc })
+        readSource: async input => {
+          const context = await loadActiveSolanaTransferContext(
+            storageRepository,
+            solanaNetwork.chainId
+          )
+          const activePrivateAccount =
+            context !== null &&
+            context.chainAccount.id === input.chainAccount.id &&
+            context.chainAccount.scope.accountId === input.chainAccount.scope.accountId &&
+            supportsSolanaPrivateExecution(context.keyDomainSource)
+          if (!activePrivateAccount || !context) {
+            return readSolanaPortfolioSource({ ...input, rpc: solanaRpc })
+          }
+          if (!(await credentialSession.hasUnlockSession())) {
+            return Object.freeze({
+              chainAccount: input.chainAccount,
+              status: 'error' as const,
+              balances: Object.freeze([]),
+              errorCode: 'unknown' as const
+            })
+          }
+          const pea = await solanaPeaSigner.deriveSolanaPea(
+            context.chainAccount.scope.keyDomainId,
+            context.accountIndex
+          )
+          return readSolanaPortfolioSource({
+            ...input,
+            rpc: solanaRpc,
+            privateAddress: pea.address
+          })
+        }
       })
     : undefined
   const nearNetwork = resolveNearRuntimeNetworkConfig(DEFAULT_NETWORK, endpointSettings)

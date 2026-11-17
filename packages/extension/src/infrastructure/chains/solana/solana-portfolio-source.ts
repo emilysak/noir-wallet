@@ -18,6 +18,7 @@ export interface ReadSolanaPortfolioSourceInput {
     SolanaReadRpc,
     'assertExpectedChain' | 'getBalanceSnapshot' | 'getTokenAccountsByMints'
   >
+  readonly privateAddress?: string
   readonly signal?: AbortSignal
   readonly now?: () => number
 }
@@ -76,26 +77,55 @@ export async function readSolanaPortfolioSource(
           ? [entry.asset.reference]
           : []
       )
-    const balances = await readSolanaBalances({
-      chainId,
-      address,
-      rpc: input.rpc,
-      tokenMints,
-      ...(input.signal === undefined ? {} : { signal: input.signal }),
-      ...(input.now === undefined ? {} : { now: input.now })
-    })
-    const tokenBalances = new Map(balances.tokens.map(token => [token.assetId, token] as const))
+    const privateAddress =
+      input.privateAddress === undefined ? undefined : parseSolanaPublicKey(input.privateAddress)
+    if (privateAddress !== undefined && privateAddress === address) {
+      throw new Error('Solana PEA address matches the main account')
+    }
+    const readBalances = (accountAddress: string) =>
+      readSolanaBalances({
+        chainId,
+        address: accountAddress,
+        rpc: input.rpc,
+        tokenMints,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        ...(input.now === undefined ? {} : { now: input.now })
+      })
+    const mainBalances = await readBalances(address)
+    const privateBalances = privateAddress === undefined ? null : await readBalances(privateAddress)
+    const updatedAt = Math.max(mainBalances.updatedAt, privateBalances?.updatedAt ?? 0)
+    const privateTokens = new Map(
+      (privateBalances?.tokens ?? []).map(token => [token.assetId, token] as const)
+    )
+    const tokenBalances = new Map(mainBalances.tokens.map(token => [token.assetId, token] as const))
+    const balanceFor = (mainRaw: string, privateRaw: string | undefined) => {
+      if (privateRaw === undefined) {
+        return Object.freeze({
+          totalRaw: mainRaw,
+          spendableRaw: mainRaw,
+          availableRaw: mainRaw,
+          pendingRaw: '0',
+          updatedAt
+        })
+      }
+      const totalRaw = (BigInt(mainRaw) + BigInt(privateRaw)).toString()
+      return Object.freeze({
+        totalRaw,
+        mainRaw,
+        privateRaw,
+        spendableRaw: totalRaw,
+        availableRaw: totalRaw,
+        pendingRaw: '0',
+        updatedAt
+      })
+    }
     return Object.freeze({
       chainAccount: input.chainAccount,
       status: 'ready',
       balances: Object.freeze([
         Object.freeze({
           assetId: nativeAssetId,
-          totalRaw: balances.native.amountRaw,
-          spendableRaw: balances.native.amountRaw,
-          availableRaw: balances.native.amountRaw,
-          pendingRaw: '0',
-          updatedAt: balances.updatedAt
+          ...balanceFor(mainBalances.native.amountRaw, privateBalances?.native.amountRaw)
         }),
         ...input.assets.list(chainId).flatMap(asset => {
           if (
@@ -106,15 +136,20 @@ export async function readSolanaPortfolioSource(
             return []
           }
           const token = tokenBalances.get(asset.asset.id)
-          if (token && asset.metadata.decimals !== token.decimals) return []
+          const privateToken = privateTokens.get(asset.asset.id)
+          if (
+            (token && asset.metadata.decimals !== token.decimals) ||
+            (privateToken && asset.metadata.decimals !== privateToken.decimals)
+          ) {
+            return []
+          }
           return [
             Object.freeze({
               assetId: asset.asset.id,
-              totalRaw: token?.amountRaw ?? '0',
-              spendableRaw: token?.amountRaw ?? '0',
-              availableRaw: token?.amountRaw ?? '0',
-              pendingRaw: '0',
-              updatedAt: balances.updatedAt
+              ...balanceFor(
+                token?.amountRaw ?? '0',
+                privateBalances === null ? undefined : (privateToken?.amountRaw ?? '0')
+              )
             })
           ]
         })

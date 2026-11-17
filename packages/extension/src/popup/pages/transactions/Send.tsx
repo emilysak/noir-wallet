@@ -1744,6 +1744,7 @@ function SendAssetFlow({
               family={selection.chain.chain.family}
               selection={selection}
               priceUsd={availableUsdPrice(selection.asset, assetPrices)}
+              executionMode={searchParams.get('mode') === 'private' ? 'private' : 'main'}
               initialRecipient={returnDraft?.recipient}
               initialAmount={returnDraft?.amount}
               onDraftChange={handleNonEvmDraftChange}

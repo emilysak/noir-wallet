@@ -37,6 +37,7 @@ export interface SendTransferConfig<R extends TransferReview, S extends Transfer
   readonly priceUsd: string | null
   readonly initialRecipient?: string
   readonly initialAmount?: string
+  readonly executionMode?: 'main' | 'private'
   readonly onDraftChange?: (
     assetId: string,
     draft: Readonly<{ recipient: string; amount: string }>
@@ -86,7 +87,27 @@ export function useSendTransfer<R extends TransferReview, S extends TransferSubm
     null
   )
   const pendingReview = useRef<R | null>(null)
-  const { asset, chain } = config.selection
+  const chain = config.selection.chain
+  const sourceAsset = config.selection.asset
+  const executionMode = config.executionMode ?? 'main'
+  const executionRaw =
+    config.executionMode === undefined
+      ? sourceAsset.balance.availableRaw
+      : executionMode === 'private'
+        ? (sourceAsset.balance.privateRaw ?? '0')
+        : (sourceAsset.balance.mainRaw ?? sourceAsset.balance.availableRaw)
+  const asset =
+    executionRaw === sourceAsset.balance.availableRaw
+      ? sourceAsset
+      : {
+          ...sourceAsset,
+          balance: {
+            ...sourceAsset.balance,
+            totalRaw: executionRaw,
+            spendableRaw: executionRaw,
+            availableRaw: executionRaw
+          }
+        }
   const networkName = formatPortfolioNetworkName(chain)
 
   useEffect(() => {

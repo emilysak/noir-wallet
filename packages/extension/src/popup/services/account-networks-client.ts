@@ -171,6 +171,15 @@ function parseAddress(value: unknown, chain: ChainDefinition): AccountNetworkAdd
   })
 }
 
+function isSolanaPrivateExecutionAddress(value: string): boolean {
+  try {
+    parseSolanaPublicKey(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function parseNetwork(value: unknown, chains: AddressGatedChainRegistry): AccountNetworkView {
   const network = readRecord(value, 'Account network')
   const hasPrivateExecutionAddress = Object.prototype.hasOwnProperty.call(
@@ -218,17 +227,32 @@ function parseNetwork(value: unknown, chains: AddressGatedChainRegistry): Accoun
   let privateExecutionAddress: string | undefined
   if (hasPrivateExecutionAddress) {
     const rawPrivateExecutionAddress = network.privateExecutionAddress
-    if (
+    const conflictsWithListedAddress =
+      typeof rawPrivateExecutionAddress === 'string' &&
+      addresses.some(address =>
+        chain.family === 'evm'
+          ? address.value.toLowerCase() === rawPrivateExecutionAddress.toLowerCase()
+          : address.value === rawPrivateExecutionAddress
+      )
+    if (chain.family === 'solana') {
+      if (
+        typeof rawPrivateExecutionAddress !== 'string' ||
+        conflictsWithListedAddress ||
+        !isSolanaPrivateExecutionAddress(rawPrivateExecutionAddress)
+      ) {
+        throw new Error('Invalid Confidential address')
+      }
+      privateExecutionAddress = rawPrivateExecutionAddress
+    } else if (
       chain.family !== 'evm' ||
       typeof rawPrivateExecutionAddress !== 'string' ||
       !/^0x[0-9a-fA-F]{40}$/.test(rawPrivateExecutionAddress) ||
-      addresses.some(
-        address => address.value.toLowerCase() === rawPrivateExecutionAddress.toLowerCase()
-      )
+      conflictsWithListedAddress
     ) {
       throw new Error('Invalid Confidential address')
+    } else {
+      privateExecutionAddress = rawPrivateExecutionAddress
     }
-    privateExecutionAddress = rawPrivateExecutionAddress
   }
   return Object.freeze({
     chain,

@@ -110,9 +110,13 @@ export class BackgroundSolanaTransferController {
 
   async prepare(
     intentValue: unknown,
-    nearIntentsBindingValue?: unknown
+    nearIntentsBindingValue?: unknown,
+    executionModeValue: unknown = 'main'
   ): Promise<BackgroundSolanaTransferReview> {
     const intent = parseIntent(intentValue)
+    if (executionModeValue !== 'main' && executionModeValue !== 'private') {
+      throw new Error('Solana transfer execution mode is invalid')
+    }
     const nearIntentsBinding =
       nearIntentsBindingValue === undefined
         ? undefined
@@ -126,6 +130,7 @@ export class BackgroundSolanaTransferController {
         chainAccount: context.chainAccount,
         accountIndex: context.accountIndex,
         recipient: intent.recipient,
+        ...(executionModeValue === 'private' ? { executionMode: 'private' as const } : {}),
         ...(nearIntentsBinding === undefined ? {} : { nearIntentsBinding })
       }
       return toBackgroundReview(

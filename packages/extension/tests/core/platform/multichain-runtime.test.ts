@@ -322,12 +322,18 @@ function expectedVaultPassword(password: string): string {
 test.describe('Multichain Worker runtime boundaries', () => {
   test('accepts only the WASM hex vault representation', () => {
     expect(parseRawEncryptedVault(VAULT)).toEqual(VAULT)
+    expect(
+      parseRawEncryptedVault({
+        ...VAULT,
+        kdfParams: { memoryKib: 64 * 1024, iterations: 3, parallelism: 1 }
+      }).kdfParams
+    ).toEqual({ memoryKib: 64 * 1024, iterations: 3, parallelism: 1 })
     expect(() => parseRawEncryptedVault({ ...VAULT, salt: 'EREREREREREREREREREREQ==' })).toThrow()
     expect(() => parseRawEncryptedVault({ ...VAULT, nonce: 'AA'.repeat(24) })).toThrow()
     expect(() =>
       parseRawEncryptedVault({
         ...VAULT,
-        kdfParams: { ...VAULT.kdfParams, iterations: 3 }
+        kdfParams: { ...VAULT.kdfParams, iterations: 4 }
       })
     ).toThrow()
   })

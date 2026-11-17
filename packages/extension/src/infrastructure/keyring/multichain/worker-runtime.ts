@@ -20,12 +20,14 @@ import {
   type ParsedSigningPreparePayload,
   type PendingSigningKind
 } from './signing-adapter'
+import type { SolanaPeaSigningBinding } from './signing-adapter-solana'
 import {
   assertExactKeys,
   assertRawBitcoinAccountMatches,
   assertRawEd25519AccountMatches,
   assertRawEvmAccountMatches,
   globalPeaRequestJson,
+  solanaPeaRequestJson,
   MAX_BIP32_INDEX,
   MAX_UINT64,
   parseRawBitcoinAccount,
@@ -34,6 +36,7 @@ import {
   parseRawEd25519Account,
   parseRawEvmAccount,
   parseRawGlobalPeaAccount,
+  parseRawSolanaPeaAccount,
   parseRawExportedPrivateKey,
   parseRawSessionInfo,
   RAW_BITCOIN_ADDRESS_TYPES,
@@ -225,6 +228,10 @@ function parseAccountDerivation(value: unknown):
       readonly addressIndex: number
     }
   | {
+      readonly family: 'solana-pea'
+      readonly accountIndex: number
+    }
+  | {
       readonly family: 'evm'
       readonly chainId: string
       readonly addressIndex: number
@@ -261,7 +268,7 @@ function parseAccountDerivation(value: unknown):
   const record = readRecord(value, 'account.derive-public payload')
   const family = readLiteral(
     record.family,
-    ['evm', 'pea', 'bitcoin', 'solana', 'near'],
+    ['evm', 'pea', 'solana-pea', 'bitcoin', 'solana', 'near'],
     'account family'
   )
   if (family === 'evm') {
@@ -308,6 +315,13 @@ function parseAccountDerivation(value: unknown):
     return Object.freeze({
       family,
       addressIndex: readSafeInteger(record.addressIndex, 'addressIndex', MAX_BIP32_INDEX)
+    })
+  }
+  if (family === 'solana-pea') {
+    assertExactKeys(record, ['family', 'accountIndex'], [], 'derive payload')
+    return Object.freeze({
+      family,
+      accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_BIP32_INDEX)
     })
   }
   const batch = !Object.prototype.hasOwnProperty.call(record, 'addressIndex')
@@ -888,6 +902,17 @@ export class MultichainWorkerRuntime {
         value => parseRawGlobalPeaAccount(value, derivation.addressIndex)
       )
     }
+    if (derivation.family === 'solana-pea') {
+      return callRaw(
+        command,
+        () =>
+          this.engine.derivePeaAccount(
+            session.rawSessionId,
+            solanaPeaRequestJson(derivation.accountIndex)
+          ),
+        value => parseRawSolanaPeaAccount(value, derivation.accountIndex)
+      )
+    }
     if (derivation.batch) {
       const accounts = callRaw(
         command,
@@ -971,6 +996,44 @@ export class MultichainWorkerRuntime {
     const expiresAt = this.now() + this.signingTtlMs
     if (!Number.isSafeInteger(expiresAt)) throw new KeyringError('INTERNAL_ERROR')
 
+    let solanaPeaBinding: SolanaPeaSigningBinding | undefined
+    if (payload.kind === 'pea-solana-transaction' || payload.kind === 'pea-solana-message') {
+      const pea = callRaw(
+        command,
+        () =>
+          this.engine.derivePeaAccount(
+            session.rawSessionId,
+            solanaPeaRequestJson(payload.accountIndex)
+          ),
+        value => parseRawSolanaPeaAccount(value, payload.accountIndex)
+      )
+      const main = callRaw(
+        command,
+        () =>
+          this.engine.deriveSolanaAccount(
+            session.rawSessionId,
+            payload.chainId,
+            payload.accountIndex
+          ),
+        value => {
+          const account = parseRawEd25519Account(value, 'solana')
+          assertRawEd25519AccountMatches(
+            account,
+            'solana',
+            payload.chainId,
+            payload.accountIndex,
+            session.kind === 'private_key'
+          )
+          return account
+        }
+      )
+      if (pea.address === main.address) throw new KeyringError('SIGNER_MISMATCH')
+      solanaPeaBinding = Object.freeze({
+        expectedAddress: pea.address,
+        mainAddress: main.address
+      })
+    }
+
     let raw: unknown
     let bitcoinAccount: RawDerivedBitcoinAccount | undefined
     try {
@@ -1048,6 +1111,20 @@ export class MultichainWorkerRuntime {
           payload.accountIndex,
           payload.psbt
         )
+      } else if (payload.kind === 'pea-solana-transaction') {
+        raw = this.engine.preparePeaSolanaTransaction(
+          session.rawSessionId,
+          solanaPeaRequestJson(payload.accountIndex),
+          payload.chainId,
+          payload.transaction
+        )
+      } else if (payload.kind === 'pea-solana-message') {
+        raw = this.engine.preparePeaSolanaMessage(
+          session.rawSessionId,
+          solanaPeaRequestJson(payload.accountIndex),
+          payload.chainId,
+          payload.message
+        )
       } else if (payload.kind === 'solana-transaction') {
         raw = this.engine.prepareSolanaTransaction(
           session.rawSessionId,
@@ -1088,7 +1165,8 @@ export class MultichainWorkerRuntime {
         signingCommandId,
         expiresAt,
         bitcoinAccount,
-        session.kind === 'private_key'
+        session.kind === 'private_key',
+        solanaPeaBinding
       )
     } catch {
       this.rejectRawRequest(session.rawSessionId, raw)
@@ -1153,9 +1231,11 @@ export class MultichainWorkerRuntime {
           raw = this.engine.confirmBitcoinMessage(pending.rawSessionId, pending.rawRequestId)
           break
         case 'solana-transaction':
+        case 'pea-solana-transaction':
           raw = this.engine.confirmSolanaTransaction(pending.rawSessionId, pending.rawRequestId)
           break
         case 'solana-message':
+        case 'pea-solana-message':
           raw = this.engine.confirmSolanaMessage(pending.rawSessionId, pending.rawRequestId)
           break
         case 'near-transaction':

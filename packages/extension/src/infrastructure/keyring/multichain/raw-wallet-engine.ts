@@ -100,6 +100,18 @@ export interface RawWalletEngine {
     message: Uint8Array
   ): unknown
   confirmSolanaMessage(sessionId: number, requestId: number): unknown
+  preparePeaSolanaTransaction(
+    sessionId: number,
+    peaRequestJson: string,
+    executionChainId: string,
+    transactionBase64: string
+  ): unknown
+  preparePeaSolanaMessage(
+    sessionId: number,
+    peaRequestJson: string,
+    executionChainId: string,
+    message: Uint8Array
+  ): unknown
   verifySolanaMessage(
     chainId: string,
     address: string,
@@ -293,7 +305,12 @@ export function parseRawEncryptedVault(value: unknown): RawEncryptedVault {
   const memoryKib = readSafeInteger(params.memoryKib, 'EncryptedVault.kdfParams.memoryKib')
   const iterations = readSafeInteger(params.iterations, 'EncryptedVault.kdfParams.iterations')
   const parallelism = readSafeInteger(params.parallelism, 'EncryptedVault.kdfParams.parallelism')
-  if (memoryKib !== 19 * 1024 || iterations !== 2 || parallelism !== 1) {
+  // wallet-engine-cbd8ffb-v5 writes 64 MiB and 3 iterations. The previous
+  // engine wrote 19 MiB and 2 iterations; those vaults must still unlock.
+  const pinnedKdf =
+    (memoryKib === 64 * 1024 && iterations === 3 && parallelism === 1) ||
+    (memoryKib === 19 * 1024 && iterations === 2 && parallelism === 1)
+  if (!pinnedKdf) {
     throw new Error('EncryptedVault KDF parameters do not match the pinned ABI')
   }
   return Object.freeze({
@@ -403,6 +420,59 @@ export interface RawPeaExecutionAccount extends RawDerivedPeaAccount {
 
 export function globalPeaRequestJson(addressIndex: number): string {
   return JSON.stringify({ version: 1, parent: { addressIndex } })
+}
+
+export function solanaPeaRequestJson(accountIndex: number): string {
+  return JSON.stringify({ version: 2, family: 'solana', parent: { accountIndex } })
+}
+
+export interface RawDerivedSolanaPeaAccount {
+  readonly address: string
+  readonly publicKey: string
+  readonly curve: 'ed25519'
+  readonly derivationScheme: 'pea_v2'
+  readonly parent: Readonly<{ readonly accountIndex: number }>
+  readonly family: 'solana'
+  readonly addressScheme: 'solana'
+}
+
+export function parseRawSolanaPeaAccount(
+  value: unknown,
+  accountIndex: number
+): RawDerivedSolanaPeaAccount {
+  const label = 'DerivedSolanaPeaAccount'
+  const record = readRecord(value, label)
+  assertExactKeys(
+    record,
+    ['address', 'publicKey', 'curve', 'derivationScheme', 'parent', 'family', 'addressScheme'],
+    [],
+    label
+  )
+  const address = readString(record.address, `${label}.address`, 64)
+  const publicKey = readString(record.publicKey, `${label}.publicKey`, 64)
+  const parent = readRecord(record.parent, `${label}.parent`)
+  assertExactKeys(parent, ['accountIndex'], [], `${label}.parent`)
+  const parentIndex = readSafeInteger(
+    parent.accountIndex,
+    `${label}.parent.accountIndex`,
+    MAX_BIP32_INDEX
+  )
+  if (
+    !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address) ||
+    publicKey !== address ||
+    parentIndex !== accountIndex
+  ) {
+    throw new Error('Derived Solana PEA account is invalid')
+  }
+  return Object.freeze({
+    address,
+    publicKey,
+    curve: readLiteral(record.curve, ['ed25519'], `${label}.curve`),
+    derivationScheme: readLiteral(record.derivationScheme, ['pea_v2'], `${label}.derivationScheme`),
+    parent: Object.freeze({ accountIndex: parentIndex }),
+    family: readLiteral(record.family, ['solana'], `${label}.family`),
+    addressScheme: readLiteral(record.addressScheme, ['solana'], `${label}.addressScheme`)
+  })
 }
 
 function parseRawPeaIdentity(

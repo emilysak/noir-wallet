@@ -68,14 +68,17 @@ export function selectDefaultTransferAssetId(input: {
   readonly from: TransferDomain
   readonly to: TransferDomain
   readonly eligibleChainIds: readonly string[]
+  readonly solanaChainIds?: readonly string[]
 }): string | null {
   const funded = (item: (typeof input.assets)[number]) => {
     const raw = getTransferDomainBalanceRaw(item.asset, input.from)
     return raw !== null && BigInt(raw) > 0n
   }
+  const solanaChainIds = input.solanaChainIds ?? []
   const eligible = input.assets.filter(
     item =>
-      item.chain.chain.family === 'evm' && input.eligibleChainIds.includes(item.chain.chain.id)
+      (item.chain.chain.family === 'evm' && input.eligibleChainIds.includes(item.chain.chain.id)) ||
+      (item.chain.chain.family === 'solana' && solanaChainIds.includes(item.chain.chain.id))
   )
   return (eligible.find(funded) ?? eligible[0])?.asset.asset.id ?? null
 }

@@ -47,6 +47,7 @@ interface SendTransferFormProps {
   readonly priceUsd: string | null
   readonly initialRecipient?: string
   readonly initialAmount?: string
+  readonly executionMode?: 'main' | 'private'
   readonly onDraftChange?: (
     assetId: string,
     draft: Readonly<{ recipient: string; amount: string }>
@@ -67,6 +68,7 @@ export function SendTransferForm(
     priceUsd,
     initialRecipient,
     initialAmount,
+    executionMode,
     onDraftChange,
     onSubmitted
   } = props
@@ -84,6 +86,7 @@ export function SendTransferForm(
             priceUsd,
             initialRecipient,
             initialAmount,
+            executionMode: executionMode ?? 'main',
             onDraftChange,
             onSubmitted: value => onSubmitted({ family, value }),
             parseRecipient: parseSolanaPublicKey,
@@ -94,7 +97,10 @@ export function SendTransferForm(
             feeDecimals: 9,
             feeSymbol: 'SOL',
             totalLabel: 'Total',
-            prepare: solanaWalletClient.prepareTransfer,
+            prepare: intent =>
+              solanaWalletClient.prepareTransfer(intent, {
+                executionMode: executionMode ?? 'main'
+              }),
             approve: solanaWalletClient.approveTransfer,
             reject: solanaWalletClient.rejectTransfer,
             estimateFeeRaw: estimateSolanaFee,

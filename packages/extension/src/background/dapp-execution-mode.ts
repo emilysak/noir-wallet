@@ -1,5 +1,7 @@
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
+import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
+import { resolveSolanaRuntimeNetworkConfig } from '@/core/chains/solana-near-runtime-config'
 import { getEvmNetworkConfig } from '@/config/networks'
 import {
   DAppExecutionModeCoordinator,
@@ -9,6 +11,7 @@ import {
 } from '@/core/dapp/dapp-execution-mode'
 import { loadActiveEvmPortfolioContext } from '@/infrastructure/chains/evm'
 import { IndexedDbStorageV2Repository } from '@/infrastructure/persistence/repositories'
+import { loadActiveSolanaTransferContext } from './solana-transfer'
 
 const DAPP_EXECUTION_MODE_STORAGE_KEY = 'dapp_execution_modes_v1'
 
@@ -34,15 +37,27 @@ export const dappExecutionModeCoordinator = new DAppExecutionModeCoordinator(
   {
     isAvailable: async scope => {
       if (scope.network !== DEFAULT_NETWORK) return false
-      const context = await loadActiveEvmPortfolioContext(
+      const evmContext = await loadActiveEvmPortfolioContext(
         storageRepository,
         getEvmNetworkConfig(DEFAULT_NETWORK).chainId
       )
+      if (
+        evmContext !== null &&
+        supportsEvmPrivateExecution(evmContext.keyDomainSource) &&
+        evmContext.chainAccount.scope.keyDomainId === scope.keyDomainId &&
+        evmContext.chainAccount.scope.accountId === scope.accountId
+      ) {
+        return true
+      }
+      const solanaContext = await loadActiveSolanaTransferContext(
+        storageRepository,
+        resolveSolanaRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
+      )
       return (
-        context !== null &&
-        supportsEvmPrivateExecution(context.keyDomainSource) &&
-        context.chainAccount.scope.keyDomainId === scope.keyDomainId &&
-        context.chainAccount.scope.accountId === scope.accountId
+        solanaContext !== null &&
+        supportsSolanaPrivateExecution(solanaContext.keyDomainSource) &&
+        solanaContext.chainAccount.scope.keyDomainId === scope.keyDomainId &&
+        solanaContext.chainAccount.scope.accountId === scope.accountId
       )
     }
   }

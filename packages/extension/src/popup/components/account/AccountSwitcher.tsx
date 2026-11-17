@@ -139,9 +139,20 @@ function AccountAddressPopover({
     (defaultEvmMode === null ? null : evmAddresses.privateAddress ? defaultEvmMode : 'public')
   const otherAddresses = account.networks.flatMap(network => {
     if (network.chain.family === 'zcash' || network.chain.family === 'evm') return []
-    const address =
+    const listed =
       network.addresses.find(candidate => candidate.preferredForReceive) ?? network.addresses[0]
-    return address ? [{ network, address }] : []
+    if (!listed) return []
+    if (evmMode === 'private' && network.privateExecutionAddress) {
+      return [
+        {
+          network,
+          address: { ...listed, value: network.privateExecutionAddress },
+          confidential: true
+        }
+      ]
+    }
+    if (evmMode === 'private' && network.chain.family === 'solana') return []
+    return [{ network, address: listed, confidential: false }]
   })
   const zcashAddresses = [...(zcash?.addresses ?? [])].sort(
     (left, right) => Number(left.privacy === 'shielded') - Number(right.privacy === 'shielded')
@@ -287,9 +298,9 @@ function AccountAddressPopover({
           </div>
         </div>
       )}
-      {otherAddresses.map(({ network, address }) => (
+      {otherAddresses.map(({ network, address, confidential }) => (
         <div
-          key={network.chain.id}
+          key={`${network.chain.id}:${confidential ? 'private' : 'public'}`}
           className="flex min-h-10 items-center gap-2 border-t border-white/10 py-2"
         >
           <ChainIcon
@@ -306,13 +317,20 @@ function AccountAddressPopover({
           </span>
           <button
             type="button"
-            aria-label={`Copy ${network.chain.displayName} address`}
+            aria-label={`Copy ${network.chain.displayName} ${confidential ? 'Private' : 'Public'} address`}
             title="Copy address"
-            onClick={() => onCopy(address.value, `${keyPrefix}-${network.chain.id}`)}
+            onClick={() =>
+              (confidential ? onCopyPrivate : onCopy)(
+                address.value,
+                `${keyPrefix}-${network.chain.id}-${confidential ? 'private' : 'public'}`
+              )
+            }
             className="wallet-interactive flex size-6 shrink-0 items-center justify-center rounded-md text-muted hover:bg-white/8 hover:text-foreground active:bg-white/12 focus-visible:outline-2 focus-visible:outline-primary"
           >
             <CopyFeedbackIcon
-              copied={isCopied(`${keyPrefix}-${network.chain.id}`)}
+              copied={isCopied(
+                `${keyPrefix}-${network.chain.id}-${confidential ? 'private' : 'public'}`
+              )}
               width={14}
               height={14}
             />

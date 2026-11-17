@@ -53,6 +53,14 @@ export function getAssetDomainRaw(asset: PortfolioAssetView, domain: AssetDomain
     if (domain === 'public') return balance.transparentRaw ?? null
     return balance.shieldedRaw ?? null
   }
+  if (asset.asset.chainId.startsWith('solana:')) {
+    if (domain === 'shield') return '0'
+    if (balance.mainRaw !== undefined && balance.privateRaw !== undefined) {
+      if (!completeRawParts(balance.totalRaw, [balance.mainRaw, balance.privateRaw])) return null
+      return domain === 'public' ? balance.mainRaw : balance.privateRaw
+    }
+    return domain === 'public' ? balance.totalRaw : '0'
+  }
   return domain === 'public' ? balance.totalRaw : '0'
 }
 
@@ -64,9 +72,17 @@ export function selectHomeActionSource(
   if (!model) return null
   const candidates = model.assets.flatMap(asset => {
     const chain = model.chains.find(item => item.chain.id === asset.asset.chainId)
-    if (!chain || (domain === 'private' && chain.chain.family !== 'evm')) return []
+    if (!chain || (domain === 'private' && !['evm', 'solana'].includes(chain.chain.family))) {
+      return []
+    }
     if (chain.chain.capabilities.transaction.status !== 'available') return []
-    if (action === 'swap' && !['evm', 'zcash', 'bitcoin'].includes(chain.chain.family)) return []
+    if (
+      action === 'swap' &&
+      !['evm', 'zcash', 'bitcoin'].includes(chain.chain.family) &&
+      !(domain === 'private' && chain.chain.family === 'solana')
+    ) {
+      return []
+    }
     const raw = getAssetDomainRaw(asset, domain)
     return raw === null ? [] : [{ asset, chain, raw }]
   })
@@ -106,6 +122,7 @@ export function projectPortfolioForDomain(
       chain =>
         domain === 'public' ||
         chain.chain.family === 'evm' ||
+        (domain === 'private' && chain.chain.family === 'solana') ||
         (domain === 'shield' && chain.chain.family === 'zcash')
     )
     .map(chain =>
