@@ -327,11 +327,16 @@ export function AssetDetail() {
         assetId: asset.asset.id
       })
     : null
-  const privateExecutionChain = chain?.chain.family === 'evm' || chain?.chain.family === 'solana'
+  const privateExecutionChain =
+    chain?.chain.family === 'evm' ||
+    chain?.chain.family === 'solana' ||
+    chain?.chain.family === 'near'
   const privateMoveReady =
     chain?.chain.family === 'solana'
       ? solanaPrivateActions && currentNetwork === 'mainnet'
-      : privateTransferEligible
+      : chain?.chain.family === 'near'
+        ? nearPrivateSwapReady
+        : privateTransferEligible
   const actionDomain =
     searchParams.get('mode') === 'private' && (privateExecutionChain ? privateMoveReady : true)
       ? 'private'
@@ -518,7 +523,12 @@ export function AssetDetail() {
 
   const handleSend = (domain: 'public' | 'private' = actionDomain) => {
     if (!asset || !chain || !canSend) return
-    if ((chain.chain.family === 'evm' || chain.chain.family === 'solana') && domain === 'private') {
+    if (
+      (chain.chain.family === 'evm' ||
+        chain.chain.family === 'solana' ||
+        chain.chain.family === 'near') &&
+      domain === 'private'
+    ) {
       handleMove(domain)
       return
     }
