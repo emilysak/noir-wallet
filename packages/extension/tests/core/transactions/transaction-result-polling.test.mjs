@@ -113,14 +113,31 @@ test('keeps the canonical available balance for non-EVM swap sources', () => {
       'main'
     )
   ).toBe('15')
+  expect(
+    resolveWalletSwapSourceAvailableRaw(
+      {
+        family: 'solana',
+        asset: { balance: { availableRaw: '15', mainRaw: '15' } }
+      },
+      'private'
+    )
+  ).toBe('0')
 })
 
-test('applies Private execution only to an EVM source that has a Private account', () => {
+test('applies Private execution to an EVM or Solana source that has a Private account', () => {
   expect(
     resolveSwapExecutionSourceMode({
       requestedMode: 'private',
       isPrivateFunding: false,
       sourceFamily: 'evm',
+      privateSourceAvailable: true
+    })
+  ).toBe('private')
+  expect(
+    resolveSwapExecutionSourceMode({
+      requestedMode: 'private',
+      isPrivateFunding: false,
+      sourceFamily: 'solana',
       privateSourceAvailable: true
     })
   ).toBe('private')
@@ -166,4 +183,37 @@ test('binds Private execution confidentiality into the live quote identity', () 
   expect(publicRequest).not.toHaveProperty('confidentiality')
   expect(privateRequest).toMatchObject({ confidentiality: 'basic' })
   expect(privateRequest?.key).not.toBe(publicRequest?.key)
+
+  const solanaToken = Object.freeze({
+    ...quoteToken,
+    assetId: 'nep141:sol.omft.near',
+    rheaChainId: 'solana'
+  })
+  const solanaPrivate = 'SysvarRent111111111111111111111111111111111'
+  expect(
+    buildLiveSwapQuoteRequest({
+      tokenIn: solanaToken,
+      tokenOut: solanaToken,
+      amountIn: '1',
+      slippage: 1,
+      refundAddress: solanaPrivate,
+      recipientAddress: solanaPrivate,
+      privateRecipientAddress: solanaPrivate,
+      confidentiality: 'basic',
+      blocked: false
+    })?.request.recipient
+  ).toBe(solanaPrivate)
+  expect(
+    buildLiveSwapQuoteRequest({
+      tokenIn: solanaToken,
+      tokenOut: solanaToken,
+      amountIn: '1',
+      slippage: 1,
+      refundAddress: solanaPrivate,
+      recipientAddress: solanaPrivate,
+      privateRecipientAddress: solanaPrivate.toLowerCase(),
+      confidentiality: 'basic',
+      blocked: false
+    })
+  ).toBeNull()
 })

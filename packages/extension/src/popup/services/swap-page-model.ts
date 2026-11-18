@@ -6,6 +6,7 @@ import { getEvmNetworkConfigs } from '@/config/networks'
 import { resolveIntentsEvmAssets } from '@/core/services/intents-evm-assets'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import {
+  quoteAddressesMatch,
   RHEA_SWAP_CHAIN_CATALOG,
   type RheaSwapQuoteView,
   type RheaSwapQuoteRequest,
@@ -335,8 +336,10 @@ export function resolveWalletSwapSourceAvailableRaw(
   evmExecutionMode: 'main' | 'private'
 ): string | undefined {
   if (source.family === 'solana') {
+    // Missing privateRaw means the private account has no recorded balance.
+    // Show 0 instead of hiding the row. A recorded amount still wins.
     return evmExecutionMode === 'private'
-      ? source.asset.balance.privateRaw
+      ? (source.asset.balance.privateRaw ?? '0')
       : source.asset.balance.availableRaw
   }
   if (source.family !== 'evm') return source.asset.balance.availableRaw
@@ -383,7 +386,7 @@ export function resolveSwapExecutionSourceMode(input: {
 }): 'main' | 'private' {
   if (input.isPrivateFunding) return 'main'
   return input.requestedMode === 'private' &&
-    input.sourceFamily === 'evm' &&
+    (input.sourceFamily === 'evm' || input.sourceFamily === 'solana') &&
     input.privateSourceAvailable
     ? 'private'
     : 'main'
@@ -620,8 +623,13 @@ export function buildLiveSwapQuoteRequest(input: {
     safeBig(input.amountIn).lte(0) ||
     !input.refundAddress ||
     !input.recipientAddress ||
-    (input.privateRecipientAddress !== undefined &&
-      input.recipientAddress.toLowerCase() !== input.privateRecipientAddress.toLowerCase()) ||
+    (input.tokenOut !== null &&
+      input.privateRecipientAddress !== undefined &&
+      !quoteAddressesMatch(
+        input.recipientAddress,
+        input.privateRecipientAddress,
+        input.tokenOut.rheaChainId
+      )) ||
     input.blocked
   ) {
     return null

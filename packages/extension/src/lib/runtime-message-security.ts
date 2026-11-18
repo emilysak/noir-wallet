@@ -673,7 +673,8 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
   },
   CANCEL_RHEA_SWAP_EVM_SIGNATURE: { required: { quoteHandle: isRheaSwapQuoteHandle } },
   PREPARE_RHEA_SWAP_SOLANA: {
-    required: { quoteHandle: isRheaSwapQuoteHandle, binding: isRheaSwapBinding }
+    required: { quoteHandle: isRheaSwapQuoteHandle, binding: isRheaSwapBinding },
+    optional: { executionMode: value => value === 'main' || value === 'private' }
   },
   CONFIRM_RHEA_SWAP_SOLANA: {
     required: { quoteHandle: isRheaSwapQuoteHandle, payloadFingerprint: isEvmPayloadFingerprint }

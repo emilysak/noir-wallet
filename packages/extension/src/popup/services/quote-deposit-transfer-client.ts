@@ -26,7 +26,7 @@ import {
   type AssetProtocolSourceMapping
 } from '@/core/prices/asset-market-mappings'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
-import { getEvmNetworkConfigs } from '@/config/networks'
+import { getEvmNetworkConfigs, getSolanaNetworkConfig } from '@/config/networks'
 import {
   createAssetId,
   createAssetRegistry,
@@ -454,9 +454,7 @@ function selectEvmBalance(
   })
 }
 
-function selectPrivateAccountBalance(asset: PortfolioAssetView): PortfolioAssetView | null {
-  const selectedRaw = asset.balance.privateRaw
-  if (selectedRaw === undefined) return null
+function projectAccountBalance(asset: PortfolioAssetView, selectedRaw: string): PortfolioAssetView {
   return Object.freeze({
     ...asset,
     balance: Object.freeze({
@@ -466,6 +464,19 @@ function selectPrivateAccountBalance(asset: PortfolioAssetView): PortfolioAssetV
       availableRaw: selectedRaw
     })
   })
+}
+
+function selectPrivateAccountBalance(asset: PortfolioAssetView): PortfolioAssetView | null {
+  const selectedRaw = asset.balance.privateRaw
+  if (selectedRaw === undefined) return null
+  return projectAccountBalance(asset, selectedRaw)
+}
+
+// A Solana portfolio row omits privateRaw until the private account is part of the
+// read. That is an empty private balance, so the selector can show 0. A later read
+// replaces it with the recorded amount; this projection cannot spend more than that.
+function selectDisplayedSolanaPrivateBalance(asset: PortfolioAssetView): PortfolioAssetView {
+  return projectAccountBalance(asset, asset.balance.privateRaw ?? '0')
 }
 
 function isSolanaExecutionAddress(value: string): boolean {
@@ -494,11 +505,7 @@ export function selectWalletOwnedQuoteAssetExecution(
 ): WalletOwnedQuoteAsset | null {
   if (source.family === 'solana') {
     if (mode !== 'private') return source
-    const asset = selectPrivateAccountBalance(source.asset)
-    const networkFeeAsset = selectPrivateAccountBalance(source.networkFeeAsset)
     if (
-      !asset ||
-      !networkFeeAsset ||
       !privateExecutionAddress ||
       !isSolanaExecutionAddress(privateExecutionAddress) ||
       privateExecutionAddress === source.refundAddress
@@ -507,8 +514,8 @@ export function selectWalletOwnedQuoteAssetExecution(
     }
     return Object.freeze({
       ...source,
-      asset,
-      networkFeeAsset,
+      asset: selectDisplayedSolanaPrivateBalance(source.asset),
+      networkFeeAsset: selectDisplayedSolanaPrivateBalance(source.networkFeeAsset),
       refundAddress: privateExecutionAddress
     })
   }
@@ -565,27 +572,37 @@ export function resolveWalletQuoteReceiveTarget(
 
   const mapped = resolveMappedPortfolioAsset(token, portfolio, mappings)
   const protocolAsset = resolveIntentsWalletAsset(token, DEFAULT_NETWORK)
-  const rheaEvmChain =
+  const rheaDescriptor =
     'rheaChainId' in token
-      ? RHEA_SWAP_CHAIN_CATALOG.find(
-          chain => chain.walletFamily === 'evm' && chain.apiChainId === token.rheaChainId
-        )
+      ? RHEA_SWAP_CHAIN_CATALOG.find(chain => chain.apiChainId === token.rheaChainId)
       : undefined
+  const rheaWalletChainId =
+    rheaDescriptor?.walletFamily === 'evm'
+      ? `eip155:${rheaDescriptor.apiChainId}`
+      : rheaDescriptor?.walletFamily === 'solana'
+        ? getSolanaNetworkConfig('mainnet').chainId
+        : null
+  const rheaTargetKind =
+    rheaDescriptor?.walletFamily === 'evm'
+      ? 'evm'
+      : rheaDescriptor?.walletFamily === 'solana'
+        ? 'solana'
+        : null
   const protocolMapping = mappings.find(candidate => candidate.protocolAssetId === token.assetId)
   const mappedChainId =
     mapped?.chain.chain.id ??
     protocolAsset?.chainId ??
     (protocolMapping ? parseAssetId(protocolMapping.assetId).chainId : undefined)
-  const rheaChainId = rheaEvmChain ? `eip155:${rheaEvmChain.apiChainId}` : null
-  if (rheaChainId && mappedChainId && rheaChainId !== mappedChainId) return null
+  if (rheaWalletChainId && mappedChainId && rheaWalletChainId !== mappedChainId) return null
   const chainId =
     mappedChainId ??
-    rheaChainId ??
+    rheaWalletChainId ??
     resolveIntentsEvmChainId(token.blockchain, getEvmNetworkConfigs(DEFAULT_NETWORK))
   if (!chainId) return null
   return (
     receiveTargets.targets.find(
-      target => target.chain.id === chainId && (!rheaChainId || target.kind === 'evm')
+      target =>
+        target.chain.id === chainId && (rheaTargetKind === null || target.kind === rheaTargetKind)
     ) ?? null
   )
 }

@@ -5,6 +5,7 @@ import { RheaSwapSolanaCoordinator } from '../../../src/background/rhea-swap-sol
 import { InMemoryTransactionRepository } from '../../../src/infrastructure/persistence/repositories/in-memory-transaction-repository.ts'
 
 const sender = '11111111111111111111111111111111'
+const pea = 'SysvarRent111111111111111111111111111111111'
 const sourceHash = '1'.repeat(64)
 const fingerprint = 'b'.repeat(64)
 
@@ -120,7 +121,7 @@ function createHarness(overrides = {}) {
     ...overrides.service
   }
   const signer = {
-    async prepare() {
+    async prepare(_keyDomainId, request) {
       calls.push('prepare-signing')
       return {
         commandId: 'command-solana-one',
@@ -129,7 +130,7 @@ function createHarness(overrides = {}) {
         summary: {
           schema: 'solana.transaction.v1',
           fields: {
-            requiredSigners: [sender],
+            requiredSigners: [request?.kind === 'pea-solana-transaction' ? pea : sender],
             recentBlockhash: sourceHash,
             addressTableLookups: []
           }
@@ -151,6 +152,10 @@ function createHarness(overrides = {}) {
     },
     async cancel() {
       calls.push('cancel-signing')
+    },
+    async deriveSolanaPea() {
+      calls.push('derive-pea')
+      return { address: pea }
     },
     ...overrides.signer
   }
@@ -337,4 +342,38 @@ test('Ledger Solana review binds the exact plan and confirms only once', async (
   releaseSigning()
   await expect(first).resolves.toMatchObject({ graph: { root: { status: 'broadcast' } } })
   expect(harness.calls.filter(call => call === 'confirm-signing')).toHaveLength(1)
+})
+
+test('signs a Solana Private Swap with the private execution address', async () => {
+  const harness = createHarness({
+    loadContext: async () => ({
+      ...activeContext(),
+      keyDomainSource: { kind: 'software' }
+    })
+  })
+  const privateBinding = { ...binding(), sender: pea, sourceTarget: pea }
+  const review = await harness.coordinator.prepare(privateBinding.quoteHandle, privateBinding)
+  expect(review.sender).toBe(pea)
+  const result = await harness.coordinator.confirm(privateBinding.quoteHandle, fingerprint)
+  expect(result.graph.root.status).toBe('broadcast')
+  expect(harness.calls).toEqual([
+    'read-plan',
+    'derive-pea',
+    'prepare-signing',
+    'derive-pea',
+    'read-plan',
+    'confirm-signing',
+    'broadcast',
+    `record:${sourceHash}`,
+    'schedule',
+    'report'
+  ])
+})
+
+test('rejects Solana Private Swap signing when private execution is unavailable', async () => {
+  const harness = createHarness({ ledger: true })
+  const privateBinding = { ...binding(), sender: pea, sourceTarget: pea }
+  await expect(
+    harness.coordinator.prepare(privateBinding.quoteHandle, privateBinding)
+  ).rejects.toThrow(/private execution is unavailable/)
 })

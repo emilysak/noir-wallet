@@ -260,10 +260,11 @@ export function createRheaSwapClient(
     },
     prepareSolanaTransaction: async (
       quoteHandle: string,
-      binding: RheaSwapTransactionBinding
+      binding: RheaSwapTransactionBinding,
+      executionMode: 'main' | 'private' = 'main'
     ): Promise<RheaSwapSolanaTransactionReview> =>
       unwrap(
-        await send({ type: 'PREPARE_RHEA_SWAP_SOLANA', quoteHandle, binding }),
+        await send({ type: 'PREPARE_RHEA_SWAP_SOLANA', quoteHandle, binding, executionMode }),
         parseRheaSwapSolanaTransactionReview
       ),
     confirmSolanaTransaction: async (
