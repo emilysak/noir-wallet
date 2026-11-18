@@ -391,10 +391,11 @@ export function createRheaSwapClient(
     },
     prepareNearTransactionBatch: async (
       quoteHandle: string,
-      binding: RheaSwapTransactionBinding
+      binding: RheaSwapTransactionBinding,
+      executionMode: 'main' | 'private' = 'main'
     ): Promise<RheaSwapNearTransactionBatchReview> =>
       unwrap(
-        await send({ type: 'PREPARE_RHEA_SWAP_NEAR', quoteHandle, binding }),
+        await send({ type: 'PREPARE_RHEA_SWAP_NEAR', quoteHandle, binding, executionMode }),
         parseRheaSwapNearTransactionBatchReview
       ),
     confirmNearTransactionBatch: async (

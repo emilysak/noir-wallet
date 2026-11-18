@@ -466,16 +466,16 @@ function projectAccountBalance(asset: PortfolioAssetView, selectedRaw: string): 
   })
 }
 
-function selectPrivateAccountBalance(asset: PortfolioAssetView): PortfolioAssetView | null {
-  const selectedRaw = asset.balance.privateRaw
-  if (selectedRaw === undefined) return null
-  return projectAccountBalance(asset, selectedRaw)
-}
-
 // A Solana portfolio row omits privateRaw until the private account is part of the
 // read. That is an empty private balance, so the selector can show 0. A later read
 // replaces it with the recorded amount; this projection cannot spend more than that.
 function selectDisplayedSolanaPrivateBalance(asset: PortfolioAssetView): PortfolioAssetView {
+  return projectAccountBalance(asset, asset.balance.privateRaw ?? '0')
+}
+
+// A missing NEAR privateRaw is an empty private balance, and this projection
+// cannot spend the public balance.
+function selectDisplayedNearPrivateBalance(asset: PortfolioAssetView): PortfolioAssetView {
   return projectAccountBalance(asset, asset.balance.privateRaw ?? '0')
 }
 
@@ -521,12 +521,9 @@ export function selectWalletOwnedQuoteAssetExecution(
   }
   if (source.family === 'near') {
     if (mode !== 'private') return source
-    const asset = selectPrivateAccountBalance(source.asset)
-    const networkFeeAsset = selectPrivateAccountBalance(source.networkFeeAsset)
     if (
-      !asset ||
-      !networkFeeAsset ||
       !privateExecutionAddress ||
+      !/^[0-9a-f]{64}$/.test(privateExecutionAddress) ||
       !isNearExecutionAddress(privateExecutionAddress) ||
       privateExecutionAddress === source.refundAddress
     ) {
@@ -534,8 +531,8 @@ export function selectWalletOwnedQuoteAssetExecution(
     }
     return Object.freeze({
       ...source,
-      asset,
-      networkFeeAsset,
+      asset: selectDisplayedNearPrivateBalance(source.asset),
+      networkFeeAsset: selectDisplayedNearPrivateBalance(source.networkFeeAsset),
       refundAddress: privateExecutionAddress
     })
   }

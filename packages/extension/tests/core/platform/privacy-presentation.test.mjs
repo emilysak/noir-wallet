@@ -1209,5 +1209,6 @@ test('projects NEAR main and PEA balances without folding Shield into private', 
   expect(getAssetDomainRaw(testnet, 'private')).toBe('4')
   expect(getAssetDomainRaw(testnet, 'shield')).toBe('0')
   expect(selectHomeActionSource(model, 'private', 'send')?.asset.asset.id).toBe(asset.asset.id)
-  expect(selectHomeActionSource(model, 'private', 'swap')).toBeNull()
+  expect(selectHomeActionSource(model, 'public', 'swap')?.asset.asset.id).toBe(asset.asset.id)
+  expect(selectHomeActionSource(model, 'private', 'swap')?.asset.asset.id).toBe(asset.asset.id)
 })

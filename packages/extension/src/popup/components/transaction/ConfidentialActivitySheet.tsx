@@ -10,6 +10,7 @@ import { getOwnExtensionSenderContext } from '@/lib/runtime-message-security'
 import { useWalletStore } from '@/store/wallet-store'
 import { useSettingsStore } from '@/store/settings-store'
 import { useActiveAccountNetworks } from '@/popup/hooks/useActiveAccountNetworks'
+import { useActivityEvmAssets } from '@/popup/hooks/useActivityEvmAssets'
 import { resolveEffectiveActiveAccountIdentity } from '@/popup/lib/effective-active-account'
 import { buildActivityPresentationCatalog } from '@/popup/services/activity-presentation-catalog'
 import { selectActivityObservation } from '@/popup/services/activity-observation'
@@ -75,14 +76,16 @@ export function ConfidentialActivityView({
   const targetRef = useRef('')
   const [stillLoading, setStillLoading] = useState(false)
   const endpointSettings = useSettingsStore(state => state.chainEndpointSettings)
+  const { catalogTokens } = useActivityEvmAssets()
   const catalog = useMemo(
     () =>
       buildActivityPresentationCatalog({
         network: plan.network,
         endpointSettings,
-        userEvmAssets: []
+        userEvmAssets: [],
+        catalogTokens
       }),
-    [plan.network, endpointSettings]
+    [catalogTokens, endpointSettings, plan.network]
   )
   const matchesAccount =
     currentNetwork === plan.network &&

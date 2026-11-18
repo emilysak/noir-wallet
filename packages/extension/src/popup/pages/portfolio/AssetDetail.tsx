@@ -5,7 +5,11 @@ import { Icon } from '@iconify/react'
 import Big from '@/lib/big'
 import { parseAssetId } from '@/core/chains/registry'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
-import { resolveSolanaFeatureRuntimePolicy } from '@/core/chains/feature-runtime-policy'
+import { supportsNearPrivateExecution } from '@/core/chains/near'
+import {
+  resolveNearFeatureRuntimePolicy,
+  resolveSolanaFeatureRuntimePolicy
+} from '@/core/chains/feature-runtime-policy'
 import {
   isSolanaPrivateExecutionAddress,
   supportsSolanaPrivateExecution
@@ -82,6 +86,9 @@ import { getConfidentialZcashMoveRecipients } from '@/popup/services/zcash-self-
 import type { KeySource } from '@/types/wallet'
 
 const solanaOperationsEnabled = resolveSolanaFeatureRuntimePolicy(
+  __ENABLED_CHAIN_FEATURE_FLAGS__
+).newOperationsEnabled
+const nearOperationsEnabled = resolveNearFeatureRuntimePolicy(
   __ENABLED_CHAIN_FEATURE_FLAGS__
 ).newOperationsEnabled
 
@@ -264,9 +271,24 @@ export function AssetDetail() {
     supportsSolanaPrivateExecution(storageV2Account?.walletSource) &&
     solanaPrivateEligible
   )
+  const nearAccountNetwork = storageV2Account?.networks.find(
+    network => network.chain.id === chain?.chain.id && network.chain.family === 'near'
+  )
+  const nearMainAddress =
+    nearAccountNetwork?.addresses.find(address => address.preferredForReceive)?.value ??
+    nearAccountNetwork?.addresses[0]?.value
+  const nearPrivateExecutionAddress = nearAccountNetwork?.privateExecutionAddress
+  const nearPrivateSwapReady = Boolean(
+    currentNetwork === 'mainnet' &&
+    supportsNearPrivateExecution(storageV2Account?.walletSource) &&
+    nearPrivateExecutionAddress &&
+    /^[0-9a-f]{64}$/.test(nearPrivateExecutionAddress) &&
+    nearPrivateExecutionAddress !== nearMainAddress
+  )
   const refreshConfidentialBalances =
     privateTransferEligible ||
     solanaPrivateEligible ||
+    nearPrivateSwapReady ||
     (chain?.chain.family === 'zcash' &&
       getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length > 0)
   const categories =
@@ -397,7 +419,8 @@ export function AssetDetail() {
     'zcash',
     'evm',
     'bitcoin',
-    ...(solanaOperationsEnabled ? ['solana'] : [])
+    ...(solanaOperationsEnabled ? ['solana'] : []),
+    ...(nearOperationsEnabled ? ['near'] : [])
   ]
   const canSend = Boolean(
     chain &&
@@ -411,7 +434,12 @@ export function AssetDetail() {
     (operableFamilies.includes(chain.chain.family) || chain.chain.family === 'near')
   )
   const canSwap = Boolean(
-    asset && chain && !fundingUnavailableReason && operableFamilies.includes(chain.chain.family)
+    asset &&
+    chain &&
+    !fundingUnavailableReason &&
+    operableFamilies.includes(chain.chain.family) &&
+    (chain.chain.family !== 'near' ||
+      (currentNetwork === 'mainnet' && (actionDomain === 'public' || nearPrivateSwapReady)))
   )
   const display = useMemo(() => {
     if (!asset) return null

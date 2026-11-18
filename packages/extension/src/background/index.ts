@@ -4430,18 +4430,22 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
                                 )
                                 .then(() => Object.freeze({ success: true }))
                             : message.type === 'PREPARE_RHEA_SWAP_NEAR'
-                              ? accountContextTransition.runActiveOperation(() =>
-                                  nearCoordinator
-                                    ? nearCoordinator.prepare(
-                                        message.quoteHandle as string,
-                                        message.binding
-                                      )
-                                    : Promise.reject(
-                                        new Error('RHEA Swap NEAR execution is unavailable')
-                                      )
+                              ? runScopedSwap(
+                                  message.quoteHandle as string,
+                                  () =>
+                                    nearCoordinator
+                                      ? nearCoordinator.prepare(
+                                          message.quoteHandle as string,
+                                          message.binding
+                                        )
+                                      : Promise.reject(
+                                          new Error('RHEA Swap NEAR execution is unavailable')
+                                        ),
+                                  message.executionMode as 'main' | 'private' | undefined,
+                                  parseRheaSwapTransactionBinding(message.binding)
                                 )
                               : message.type === 'CONFIRM_RHEA_SWAP_NEAR'
-                                ? accountContextTransition.runActiveOperation(() =>
+                                ? runScopedSwap(message.quoteHandle as string, () =>
                                     nearCoordinator
                                       ? nearCoordinator.confirm(
                                           message.quoteHandle as string,

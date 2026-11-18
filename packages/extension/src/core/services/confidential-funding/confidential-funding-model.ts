@@ -493,9 +493,14 @@ function copyConfidentialSignedPayload(
     })
   }
   if (payload.standard === 'nep413') {
+    // The approval fingerprint is the signed field order. Storage may reorder nested keys.
     return Object.freeze({
       standard: payload.standard,
-      payload: payload.payload,
+      payload: Object.freeze({
+        recipient: payload.payload.recipient,
+        nonce: payload.payload.nonce,
+        message: payload.payload.message
+      }),
       public_key: payload.public_key,
       signature: payload.signature
     })

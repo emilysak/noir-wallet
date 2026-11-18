@@ -49,19 +49,21 @@ function isNonEvmPrivateMoveQuote(purpose: PrivateQuotePurpose, fromChain: strin
   return purpose === 'private-transfer' && (fromChain === 'near' || fromChain === 'solana')
 }
 
-/** Private Swap stays on EVM chain numbers or Solana. NEAR remains a Move-only route. */
+/** Private Swap accepts EVM chain numbers, Solana, and NEAR. */
 export function isPrivateSwapApiChain(apiChainId: string): boolean {
-  return /^[1-9]\d*$/.test(apiChainId) || apiChainId === 'solana'
+  return /^[1-9]\d*$/.test(apiChainId) || apiChainId === 'solana' || apiChainId === 'near'
 }
 
-/** Solana addresses are case-sensitive. Other quote chains keep the existing comparison. */
+/** Solana and NEAR addresses are case-sensitive. Other quote chains keep lowercase comparison. */
 export function quoteAddressesMatch(
   left: string,
   right: string | undefined,
   apiChainId: string
 ): boolean {
   if (right === undefined) return false
-  return apiChainId === 'solana' ? left === right : left.toLowerCase() === right.toLowerCase()
+  return apiChainId === 'solana' || apiChainId === 'near'
+    ? left === right
+    : left.toLowerCase() === right.toLowerCase()
 }
 
 export function isConfidentialQuoteSender(
@@ -74,8 +76,8 @@ export function isConfidentialQuoteSender(
       'confidential'
     )
   }
-  if (request.fromChain !== 'solana') return false
-  const chainId = rheaQuoteWalletChainId('solana')
+  if (request.fromChain !== 'solana' && request.fromChain !== 'near') return false
+  const chainId = rheaQuoteWalletChainId(request.fromChain)
   return (
     chainId !== undefined &&
     (accounts ?? []).some(account =>
@@ -108,13 +110,13 @@ export function assertPrivateQuoteRoute(
   }
 ): void {
   // Named RHEA ids are not EVM chain numbers. Only Zcash public sends,
-  // NEAR/Solana funding or private Move, and Solana Private Swap may pass.
+  // NEAR/Solana funding or private Move, and NEAR or Solana Private Swap may pass.
   const nonEvmFromChainAllowed =
     ((purpose === 'public-private-send' || purpose === 'private-swap') &&
       request.fromChain === 'zcash') ||
     ((purpose === 'confidential-funding' || purpose === 'private-transfer') &&
       (request.fromChain === 'near' || request.fromChain === 'solana')) ||
-    (purpose === 'private-swap' && request.fromChain === 'solana')
+    (purpose === 'private-swap' && (request.fromChain === 'solana' || request.fromChain === 'near'))
   if (
     !account ||
     (scope && (account.walletId !== scope.walletId || account.accountId !== scope.accountId)) ||
@@ -136,9 +138,10 @@ export function assertPrivateQuoteRoute(
     throw new Error('Swap funding source does not match the quoted Zcash account.')
   }
   const nonEvmPrivateMove = isNonEvmPrivateMoveQuote(purpose, request.fromChain)
-  const solanaPrivateSwap = purpose === 'private-swap' && request.fromChain === 'solana'
+  const nonEvmPrivateSwap =
+    purpose === 'private-swap' && (request.fromChain === 'solana' || request.fromChain === 'near')
   const sourceChainId =
-    nonEvmPrivateMove || solanaPrivateSwap
+    nonEvmPrivateMove || nonEvmPrivateSwap
       ? rheaQuoteWalletChainId(request.fromChain)
       : `eip155:${request.fromChain}`
   const source = account.networks.find(network => network.chainId === sourceChainId)
@@ -244,7 +247,7 @@ export function assertPrivateQuoteRoute(
       ?.addresses?.some(
         address => address.value === request.sender && address.value.startsWith('u1')
       )
-  const exactSender = nonEvmPrivateMove || solanaPrivateSwap
+  const exactSender = nonEvmPrivateMove || nonEvmPrivateSwap
   const senderMatches =
     source?.privateExecutionAddress !== undefined &&
     (exactSender

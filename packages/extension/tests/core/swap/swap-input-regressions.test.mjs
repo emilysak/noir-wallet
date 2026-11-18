@@ -135,6 +135,19 @@ test('asset selector balances follow their own side and never claim an unknown p
     ),
     undefined
   )
+  const near = {
+    family: 'near',
+    asset: { balance: { availableRaw: '14', mainRaw: '10', privateRaw: '4' } }
+  }
+  assert.equal(resolveWalletSwapSourceAvailableRaw(near, 'main'), '14')
+  assert.equal(resolveWalletSwapSourceAvailableRaw(near, 'private'), '4')
+  assert.equal(
+    resolveWalletSwapSourceAvailableRaw(
+      { ...near, asset: { balance: { availableRaw: '14', mainRaw: '14' } } },
+      'private'
+    ),
+    '0'
+  )
 })
 
 test('reversal loads the supported destination as a source before changing the pair', async () => {

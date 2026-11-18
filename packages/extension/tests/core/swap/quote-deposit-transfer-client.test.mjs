@@ -472,8 +472,27 @@ test.describe('quote deposit transfer client', () => {
       networkFeeAsset: { balance: { availableRaw: '3' } }
     })
     expect(selectWalletOwnedQuoteAssetExecution(source, 'private', 'alice.near')).toBeNull()
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private', 'bob.near')).toBeNull()
     expect(selectWalletOwnedQuoteAssetExecution(source, 'private', '0xabc')).toBeNull()
     expect(selectWalletOwnedQuoteAssetExecution(source, 'private')).toBeNull()
+    expect(
+      selectWalletOwnedQuoteAssetExecution(
+        {
+          ...source,
+          asset: { ...source.asset, balance: { availableRaw: '10', mainRaw: '10' } },
+          networkFeeAsset: {
+            ...source.networkFeeAsset,
+            balance: { availableRaw: '10', mainRaw: '10' }
+          }
+        },
+        'private',
+        implicit
+      )
+    ).toMatchObject({
+      refundAddress: implicit,
+      asset: { balance: { availableRaw: '0' } },
+      networkFeeAsset: { balance: { availableRaw: '0' } }
+    })
   })
 
   test('never falls back from a locked BNB transfer to a different wallet asset', () => {
