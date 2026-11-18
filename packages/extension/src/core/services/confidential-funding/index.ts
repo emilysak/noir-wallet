@@ -7,6 +7,7 @@ export {
   assertConfidentialQuoteBinding,
   assertFlexibleExternalDepositQuoteBinding,
   canRetryConfidentialSubmission,
+  confidentialIntentsAccountId,
   confidentialNep413Recipient,
   fingerprintConfidentialValue,
   fingerprintDirectConfidentialApproval,

@@ -5,6 +5,7 @@ import {
   type ConfidentialFundingNetworkConfig
 } from '@/config/intents'
 import { parseNearAccountId } from '@/core/chains/near/identifiers'
+import { confidentialIntentsAccountId } from '@/core/chains/solana'
 import { readRheaDestinationHash } from '@/core/services/rhea-swap/rhea-order-status'
 import { DedupPromise } from '@/lib/async-utils'
 import { parseSiweMessage } from 'viem/siwe'
@@ -856,7 +857,7 @@ export class ConfidentialFundingApi {
       return Object.freeze({
         standard: 'raw_ed25519' as const,
         payload: JSON.stringify({
-          signer_id: signerId,
+          signer_id: confidentialIntentsAccountId(signerId),
           deadline: deadlineValue,
           intents: [],
           verifying_contract: INTENTS_CONTRACT,
@@ -954,9 +955,15 @@ export class ConfidentialFundingApi {
       depositType: input.depositType,
       destinationAsset: input.destinationAsset,
       amount: input.amountRaw,
-      refundTo: input.refundTo ?? input.signerId,
+      refundTo:
+        input.refundType === 'CONFIDENTIAL_INTENTS'
+          ? confidentialIntentsAccountId(input.refundTo ?? input.signerId)
+          : (input.refundTo ?? input.signerId),
       refundType: input.refundType,
-      recipient: input.recipient,
+      recipient:
+        input.recipientType === 'CONFIDENTIAL_INTENTS'
+          ? confidentialIntentsAccountId(input.recipient)
+          : input.recipient,
       recipientType: input.recipientType,
       deadline: new Date(Date.now() + 60 * 60_000).toISOString(),
       referral: input.referral,
@@ -1180,7 +1187,7 @@ export class ConfidentialFundingApi {
       body: JSON.stringify({
         type: 'swap_transfer',
         standard: input.standard ?? 'erc191',
-        signerId: input.signerId,
+        signerId: confidentialIntentsAccountId(input.signerId),
         depositAddress: input.depositAddress
       })
     })

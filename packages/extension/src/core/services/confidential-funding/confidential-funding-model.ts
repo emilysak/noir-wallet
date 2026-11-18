@@ -1,5 +1,8 @@
 import type { Network } from '@/types'
+import { confidentialIntentsAccountId } from '@/core/chains/solana'
 import { confidentialPrivateTokenId } from './confidential-funding-portfolio'
+
+export { confidentialIntentsAccountId }
 
 const CONFIDENTIAL_WITHDRAW_MIN_COUNT = 2
 const CONFIDENTIAL_WITHDRAW_MAX_COUNT = 5
@@ -529,6 +532,12 @@ function equalAddress(left: unknown, right: string): boolean {
     : left === right
 }
 
+function sameIntentsAccount(left: unknown, right: string): boolean {
+  if (typeof left !== 'string') return false
+  if (equalAddress(left, right)) return true
+  return confidentialIntentsAccountId(left) === confidentialIntentsAccountId(right)
+}
+
 export function assertConfidentialQuoteBinding(
   quote: ConfidentialQuote,
   expected: ConfidentialQuoteBinding,
@@ -543,10 +552,14 @@ export function assertConfidentialQuoteBinding(
     request.destinationAsset !== expected.destinationAsset ||
     request.amount !== expected.amountRaw ||
     quote.quote.amountIn !== expected.amountRaw ||
-    !equalAddress(request.refundTo, expected.refundTo ?? expected.signerId) ||
+    !(expected.refundType === 'CONFIDENTIAL_INTENTS'
+      ? sameIntentsAccount(request.refundTo, expected.refundTo ?? expected.signerId)
+      : equalAddress(request.refundTo, expected.refundTo ?? expected.signerId)) ||
     request.depositType !== expected.depositType ||
     request.refundType !== expected.refundType ||
-    !equalAddress(request.recipient, expected.recipient) ||
+    !(expected.recipientType === 'CONFIDENTIAL_INTENTS'
+      ? sameIntentsAccount(request.recipient, expected.recipient)
+      : equalAddress(request.recipient, expected.recipient)) ||
     request.recipientType !== expected.recipientType ||
     Number(request.slippageTolerance) !== expected.slippageBps ||
     !Number.isSafeInteger(deadline) ||
@@ -577,7 +590,7 @@ export function assertFlexibleExternalDepositQuoteBinding(
     !equalAddress(request.refundTo, expected.refundTo ?? expected.signerId) ||
     request.depositType !== 'ORIGIN_CHAIN' ||
     request.refundType !== 'ORIGIN_CHAIN' ||
-    !equalAddress(request.recipient, expected.recipient) ||
+    !sameIntentsAccount(request.recipient, expected.recipient) ||
     request.recipientType !== 'CONFIDENTIAL_INTENTS' ||
     Number(request.slippageTolerance) !== expected.slippageBps ||
     !Number.isSafeInteger(deadline) ||
@@ -611,7 +624,7 @@ export function assertConfidentialIntentBinding(input: {
   const scalars: string[] = []
   collectScalarStrings(payload, scalars)
   const lower = new Set(scalars.map(value => value.toLowerCase()))
-  const required = [input.signerId, input.quote.quote.depositAddress]
+  const required = [confidentialIntentsAccountId(input.signerId), input.quote.quote.depositAddress]
   for (const value of required) {
     if (!lower.has(value.toLowerCase())) {
       throw new Error('Confidential intent does not match the approved signer or quote')
@@ -674,7 +687,7 @@ export function assertDirectConfidentialWithdrawIntentBinding(input: {
   if (Object.keys(payload).some(key => !allowedKeys.has(key))) {
     throw new Error('Shield withdraw intent does not match the approved quote')
   }
-  if (!equalAddress(payload.signer_id, input.signerId)) {
+  if (!sameIntentsAccount(payload.signer_id, input.signerId)) {
     throw new Error('Shield withdraw intent signer is invalid')
   }
   if (payload.verifying_contract !== undefined && payload.verifying_contract !== 'intents.far') {

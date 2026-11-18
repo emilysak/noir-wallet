@@ -55,6 +55,7 @@ import {
   assertFlexibleExternalDepositQuoteBinding,
   createConfidentialFundingGraph,
   createExternalShieldDepositGraph,
+  confidentialIntentsAccountId,
   fingerprintConfidentialValue,
   fingerprintDirectConfidentialApproval,
   filterConfidentialPortfolioMappings,
@@ -3560,7 +3561,7 @@ export class ConfidentialFundingCoordinator {
       from_chain: plan.source.chainName,
       from_token: plan.source.protocolAssetId,
       mode: plan.source.protocolAssetId === plan.destination.protocolAssetId ? 'TRANSFER' : 'SWAP',
-      signer_id: plan.signerId,
+      signer_id: confidentialIntentsAccountId(plan.signerId),
       withdraws: Object.freeze(requestRows)
     })
     const requestFingerprint = await fingerprintConfidentialValue(frozenRequest)
@@ -3707,7 +3708,7 @@ export class ConfidentialFundingCoordinator {
       from_chain: plan.source.chainName,
       from_token: plan.source.protocolAssetId,
       mode: 'TRANSFER',
-      signer_id: plan.signerId,
+      signer_id: confidentialIntentsAccountId(plan.signerId),
       withdraws: Object.freeze(
         rows.map(row =>
           Object.freeze({
@@ -3848,7 +3849,7 @@ export class ConfidentialFundingCoordinator {
       from_chain: plan.source.chainName,
       from_token: plan.source.protocolAssetId,
       mode: plan.source.protocolAssetId === plan.destination.protocolAssetId ? 'TRANSFER' : 'SWAP',
-      signer_id: plan.signerId,
+      signer_id: confidentialIntentsAccountId(plan.signerId),
       withdraws: Object.freeze([
         Object.freeze({
           amount: row.amountRaw,
