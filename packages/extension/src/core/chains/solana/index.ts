@@ -1,4 +1,4 @@
-export { parseSolanaPublicKey } from './identifiers'
+export { confidentialIntentsAccountId, parseSolanaPublicKey } from './identifiers'
 export {
   isSolanaPrivateExecutionAddress,
   supportsSolanaPrivateExecution

@@ -2,7 +2,7 @@ import type { Network } from '@/types'
 import { ZEC_ZCASH_ASSET } from '@/config/intents'
 import { getZcashChainId } from '@/core/chains/registry'
 import { parseNearAccountId } from '@/core/chains/near'
-import { parseSolanaPublicKey } from '@/core/chains/solana'
+import { confidentialIntentsAccountId, parseSolanaPublicKey } from '@/core/chains/solana'
 import { externalRecipientsMatch, isValidExternalRecipient } from './confidential-funding-recipient'
 import { withMetadataLock, withUndeletedWalletAccountMetadata } from '@/lib/wallet-metadata-storage'
 import type { ConfidentialFundingPlan } from '@/core/services/confidential-funding'
@@ -329,7 +329,8 @@ function parsePlan(value: unknown): ConfidentialFundingPlan {
     (plan.requestFingerprint !== undefined && !/^[0-9a-f]{64}$/.test(plan.requestFingerprint)) ||
     (plan.frozenRequest !== undefined &&
       (!plan.requestFingerprint ||
-        plan.frozenRequest.signer_id !== plan.signerId ||
+        confidentialIntentsAccountId(plan.frozenRequest.signer_id) !==
+          confidentialIntentsAccountId(plan.signerId) ||
         plan.frozenRequest.from_amount !== plan.source.amountRaw ||
         plan.frozenRequest.from_chain !== plan.source.chainName ||
         plan.frozenRequest.from_token !== plan.source.protocolAssetId ||

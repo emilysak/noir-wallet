@@ -25,6 +25,7 @@ import {
   splitConfidentialFundingAmount
 } from '../../../src/core/services/confidential-funding/confidential-funding-model.ts'
 import { confidentialPrivateTokenId } from '../../../src/core/services/confidential-funding/confidential-funding-portfolio.ts'
+import { confidentialIntentsAccountId } from '../../../src/core/chains/solana/identifiers.ts'
 import { getEvmNetworkConfigs } from '../../../src/config/networks.ts'
 import {
   availableDepositTokens,
@@ -1516,6 +1517,97 @@ test.describe('confidential funding safety rules', () => {
       formalFees = [providerFee]
       formalDestinationAsset = 'nep141:other.omft.near'
       await expect(api.quote(input)).rejects.toThrow('does not match the requested funding route')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('quotes a Solana confidential account as the hex public key', async () => {
+    const solanaAccount = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk'
+    const privateAccount = 'SysvarRent111111111111111111111111111111111'
+    const intentsAccountId = confidentialIntentsAccountId(solanaAccount)
+    expect(intentsAccountId).toMatch(/^[0-9a-f]{64}$/)
+    expect(confidentialIntentsAccountId('11111111111111111111111111111111')).toBe('0'.repeat(64))
+    expect(confidentialIntentsAccountId(intentsAccountId)).toBe(intentsAccountId)
+    const originalFetch = globalThis.fetch
+    const requests = []
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith('/api/swap/confidential-app-fee')) {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              appId: 'ak_test',
+              confidentialAppFeeBps: 0,
+              confidentialAppFeeRecipient: '',
+              confidentialPlatformFeeBps: 0,
+              confidentialPlatformFeeRecipient: ''
+            }
+          }),
+          { status: 200 }
+        )
+      }
+      const request = JSON.parse(init.body)
+      requests.push(request)
+      return new Response(
+        JSON.stringify({
+          correlationId: 'solana-quote',
+          quoteRequest: request,
+          quote: {
+            amountIn: request.amount,
+            amountOut: request.amount,
+            minAmountOut: request.amount,
+            depositAddress: privateAccount,
+            deadline: new Date(Date.now() + 60_000).toISOString()
+          }
+        }),
+        { status: 200 }
+      )
+    }
+    try {
+      const api = new ConfidentialFundingApi(apiConfig, 'https://near.example.test', 'swap-jwt')
+      await api.quote({
+        referral: 'noir_move',
+        originAsset: 'nep141:sol.omft.near',
+        destinationAsset: 'nep141:sol.omft.near',
+        amountRaw: '5000000',
+        signerId: solanaAccount,
+        refundTo: solanaAccount,
+        recipient: solanaAccount,
+        depositType: 'ORIGIN_CHAIN',
+        refundType: 'ORIGIN_CHAIN',
+        recipientType: 'CONFIDENTIAL_INTENTS',
+        slippageBps: 50,
+        dry: true
+      })
+      expect(requests[0]).toMatchObject({
+        recipient: intentsAccountId,
+        refundTo: solanaAccount,
+        recipientType: 'CONFIDENTIAL_INTENTS',
+        refundType: 'ORIGIN_CHAIN'
+      })
+      await api.quote({
+        referral: 'noir_move',
+        originAsset: 'nep141:sol.omft.near',
+        destinationAsset: 'nep141:sol.omft.near',
+        amountRaw: '5000000',
+        signerId: solanaAccount,
+        recipient: privateAccount,
+        depositType: 'CONFIDENTIAL_INTENTS',
+        refundType: 'CONFIDENTIAL_INTENTS',
+        recipientType: 'DESTINATION_CHAIN',
+        slippageBps: 50,
+        dry: true
+      })
+      const withdraw = requests.find(
+        request => request.recipientType === 'DESTINATION_CHAIN' && request.dry === true
+      )
+      expect(withdraw).toMatchObject({
+        recipient: privateAccount,
+        refundTo: intentsAccountId,
+        recipientType: 'DESTINATION_CHAIN',
+        refundType: 'CONFIDENTIAL_INTENTS'
+      })
     } finally {
       globalThis.fetch = originalFetch
     }
