@@ -11,6 +11,7 @@ import {
   resolveRheaSwapDestinationIdentity,
   selectWalletOwnedQuoteAssetExecution
 } from '../../../src/popup/services/quote-deposit-transfer-client.ts'
+import { getSolanaNetworkConfig } from '../../../src/config/networks.ts'
 import { parseAssetId } from '../../../src/core/chains/registry/asset-id.ts'
 import { mergeTokenCatalogs } from '../../../src/popup/services/swap-catalog-loading.ts'
 import { resolvePublicPrivateSendQuotePair } from '../../../src/popup/services/public-private-send-preview.ts'
@@ -362,9 +363,7 @@ test.describe('quote deposit transfer client', () => {
     const withNetwork = (family, kind) => ({
       ...model,
       chains: model.chains.map(chain =>
-        chain.chain.family === family
-          ? { chain: { ...chain.chain, network: { kind } } }
-          : chain
+        chain.chain.family === family ? { chain: { ...chain.chain, network: { kind } } } : chain
       )
     })
     expect(funding(near, 'near', NEAR_ASSET_ID, withNetwork('near', 'testnet'))).toBeNull()
@@ -413,13 +412,8 @@ test.describe('quote deposit transfer client', () => {
       resolveWalletOwnedQuoteAsset({ ...contracted, decimals: 18 }, model, targets, mappings)
     ).toBeNull()
     expect(
-      resolveWalletSwapSourceToken(
-        NEAR_ASSET_ID,
-        [alias, contracted],
-        model,
-        targets,
-        mappings
-      )?.rheaAddress
+      resolveWalletSwapSourceToken(NEAR_ASSET_ID, [alias, contracted], model, targets, mappings)
+        ?.rheaAddress
     ).toBe('wrap.near')
     expect(
       resolveConfidentialFundingDestinationToken({
@@ -1102,6 +1096,50 @@ test.describe('quote deposit transfer client', () => {
     expect(selectWalletOwnedQuoteAssetExecution(source, 'private')).toBeNull()
   })
 
+  test('shows a Solana private balance of 0 when the private account has no recorded balance', () => {
+    const main = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk'
+    const pea = 'SysvarRent111111111111111111111111111111111'
+    const source = {
+      family: 'solana',
+      refundAddress: main,
+      asset: {
+        asset: { id: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501', kind: 'native' },
+        balance: { availableRaw: '15', mainRaw: '15' }
+      },
+      networkFeeAsset: {
+        asset: { id: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501', kind: 'native' },
+        balance: { availableRaw: '15', mainRaw: '15' }
+      }
+    }
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private', pea)).toMatchObject({
+      refundAddress: pea,
+      asset: { balance: { availableRaw: '0' } },
+      networkFeeAsset: { balance: { availableRaw: '0' } }
+    })
+    expect(
+      selectWalletOwnedQuoteAssetExecution(
+        {
+          ...source,
+          asset: {
+            ...source.asset,
+            balance: { availableRaw: '15', mainRaw: '10', privateRaw: '5' }
+          },
+          networkFeeAsset: {
+            ...source.networkFeeAsset,
+            balance: { availableRaw: '15', mainRaw: '10', privateRaw: '5' }
+          }
+        },
+        'private',
+        pea
+      )
+    ).toMatchObject({
+      asset: { balance: { availableRaw: '5' } },
+      networkFeeAsset: { balance: { availableRaw: '5' } }
+    })
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private', main)).toBeNull()
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private')).toBeNull()
+  })
+
   test('lists every wallet-owned Intents source without admitting unsupported chains or assets', () => {
     const tokens = [
       token('nep141:zec.omft.near', 'zec', 8),
@@ -1182,6 +1220,38 @@ test.describe('quote deposit transfer client', () => {
         { ...customToken, assetId: 'nep141:eth.omft.near' },
         portfolio(),
         customTargets,
+        mappings
+      )
+    ).toBeNull()
+
+    const solanaTarget = {
+      chain: { id: getSolanaNetworkConfig('mainnet').chainId },
+      kind: 'solana',
+      address: 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk'
+    }
+    const solanaTargets = {
+      ...receiveTargets,
+      targets: [...receiveTargets.targets, solanaTarget]
+    }
+    expect(
+      resolveWalletQuoteReceiveTarget(
+        {
+          ...token('nep141:sol.omft.near', 'sol', 9),
+          rheaChainId: 'solana'
+        },
+        portfolio(),
+        solanaTargets,
+        mappings
+      )
+    ).toEqual(solanaTarget)
+    expect(
+      resolveWalletQuoteReceiveTarget(
+        {
+          ...token('nep141:sol.omft.near', 'sol', 9),
+          rheaChainId: 'solana'
+        },
+        portfolio(),
+        receiveTargets,
         mappings
       )
     ).toBeNull()

@@ -1,4 +1,5 @@
 import { parseZcashAddress } from '@/core/address-book/address-book'
+import { resolveEvmAddressRole } from '@/core/accounts/evm-address-role'
 import type {
   AssetRef,
   ChainRef,
@@ -48,6 +49,44 @@ function isNonEvmPrivateMoveQuote(purpose: PrivateQuotePurpose, fromChain: strin
   return purpose === 'private-transfer' && (fromChain === 'near' || fromChain === 'solana')
 }
 
+/** Private Swap stays on EVM chain numbers or Solana. NEAR remains a Move-only route. */
+export function isPrivateSwapApiChain(apiChainId: string): boolean {
+  return /^[1-9]\d*$/.test(apiChainId) || apiChainId === 'solana'
+}
+
+/** Solana addresses are case-sensitive. Other quote chains keep the existing comparison. */
+export function quoteAddressesMatch(
+  left: string,
+  right: string | undefined,
+  apiChainId: string
+): boolean {
+  if (right === undefined) return false
+  return apiChainId === 'solana' ? left === right : left.toLowerCase() === right.toLowerCase()
+}
+
+export function isConfidentialQuoteSender(
+  request: { readonly fromChain: string; readonly sender: string },
+  accounts: Parameters<typeof resolveEvmAddressRole>[2] = []
+): boolean {
+  if (/^[1-9]\d*$/.test(request.fromChain)) {
+    return (
+      resolveEvmAddressRole(request.sender, `eip155:${request.fromChain}`, accounts) ===
+      'confidential'
+    )
+  }
+  if (request.fromChain !== 'solana') return false
+  const chainId = rheaQuoteWalletChainId('solana')
+  return (
+    chainId !== undefined &&
+    (accounts ?? []).some(account =>
+      account.networks.some(network => {
+        const id = network.chain?.id ?? network.chainId
+        return id === chainId && network.privateExecutionAddress === request.sender
+      })
+    )
+  )
+}
+
 export function assertReviewedPrivateQuoteSender(input: {
   readonly purpose: PrivateQuotePurpose
   readonly fromChain: string
@@ -68,13 +107,14 @@ export function assertPrivateQuoteRoute(
     readonly zcashFundingSource?: 'transparent' | 'shielded'
   }
 ): void {
-  // Named RHEA ids are not EVM chain numbers. Only Zcash public sends and
-  // NEAR/Solana funding or private Move may pass; later checks bind the route.
+  // Named RHEA ids are not EVM chain numbers. Only Zcash public sends,
+  // NEAR/Solana funding or private Move, and Solana Private Swap may pass.
   const nonEvmFromChainAllowed =
     ((purpose === 'public-private-send' || purpose === 'private-swap') &&
       request.fromChain === 'zcash') ||
     ((purpose === 'confidential-funding' || purpose === 'private-transfer') &&
-      (request.fromChain === 'near' || request.fromChain === 'solana'))
+      (request.fromChain === 'near' || request.fromChain === 'solana')) ||
+    (purpose === 'private-swap' && request.fromChain === 'solana')
   if (
     !account ||
     (scope && (account.walletId !== scope.walletId || account.accountId !== scope.accountId)) ||
@@ -96,9 +136,11 @@ export function assertPrivateQuoteRoute(
     throw new Error('Swap funding source does not match the quoted Zcash account.')
   }
   const nonEvmPrivateMove = isNonEvmPrivateMoveQuote(purpose, request.fromChain)
-  const sourceChainId = nonEvmPrivateMove
-    ? rheaQuoteWalletChainId(request.fromChain)
-    : `eip155:${request.fromChain}`
+  const solanaPrivateSwap = purpose === 'private-swap' && request.fromChain === 'solana'
+  const sourceChainId =
+    nonEvmPrivateMove || solanaPrivateSwap
+      ? rheaQuoteWalletChainId(request.fromChain)
+      : `eip155:${request.fromChain}`
   const source = account.networks.find(network => network.chainId === sourceChainId)
   if (purpose === 'public-private-send') {
     const zcashSource =
@@ -202,13 +244,13 @@ export function assertPrivateQuoteRoute(
       ?.addresses?.some(
         address => address.value === request.sender && address.value.startsWith('u1')
       )
-  if (
-    !privateZcashSource &&
-    (!source?.privateExecutionAddress ||
-      (nonEvmPrivateMove
-        ? source.privateExecutionAddress !== request.sender
-        : source.privateExecutionAddress.toLowerCase() !== request.sender.toLowerCase()))
-  ) {
+  const exactSender = nonEvmPrivateMove || solanaPrivateSwap
+  const senderMatches =
+    source?.privateExecutionAddress !== undefined &&
+    (exactSender
+      ? source.privateExecutionAddress === request.sender
+      : source.privateExecutionAddress.toLowerCase() === request.sender.toLowerCase())
+  if (!privateZcashSource && !senderMatches) {
     throw new Error('Private quote source does not match this Account.')
   }
   if (purpose === 'private-cross-chain-send') {
@@ -257,14 +299,20 @@ export function assertPrivateQuoteRoute(
     }
     return
   }
+  if (purpose === 'private-swap' && !isPrivateSwapApiChain(request.toChain))
+    throw new Error('Private Swap must stay in this Account.')
   const destination = account.networks.find(
-    network => network.chainId === `eip155:${request.toChain}`
+    network => network.chainId === rheaQuoteWalletChainId(request.toChain)
   )
+  const recipient = request.recipient ?? ''
+  const evmDestination = /^[1-9]\d*$/.test(request.toChain)
   if (
-    !destination ||
-    !/^0x[0-9a-fA-F]{40}$/.test(request.recipient ?? '') ||
-    /^0x0{40}$/i.test(request.recipient ?? '') ||
-    destination.privateExecutionAddress?.toLowerCase() !== request.recipient?.toLowerCase()
+    !destination?.privateExecutionAddress ||
+    (evmDestination
+      ? !/^0x[0-9a-fA-F]{40}$/.test(recipient) ||
+        /^0x0{40}$/i.test(recipient) ||
+        destination.privateExecutionAddress.toLowerCase() !== recipient.toLowerCase()
+      : destination.privateExecutionAddress !== recipient)
   ) {
     throw new Error('Private Swap must stay in this Account.')
   }
@@ -277,6 +325,17 @@ const RHEA_NATIVE_QUOTE_ADDRESSES = Object.freeze(
     ['zcash:nep141:zec.omft.near', 'zec']
   ])
 )
+
+function nativeProtocolAssetId(chain: string): string | undefined {
+  let assetId: string | undefined
+  for (const key of RHEA_NATIVE_QUOTE_ADDRESSES.keys()) {
+    const separator = key.indexOf(':')
+    if (key.slice(0, separator) !== chain) continue
+    if (assetId !== undefined) return undefined
+    assetId = key.slice(separator + 1)
+  }
+  return assetId
+}
 const RHEA_NATIVE_CATALOG_ALIASES = new Map([
   ['zcash:zec:mainnet:native', { assetId: ASSET_PRICE_SOURCE_ASSETS.zec, quoteAddress: 'zec' }]
 ])
@@ -806,16 +865,25 @@ export function toRheaSwapToken(item: SwapTokenListItem): RheaSwapToken {
     isEvmChain && !evmNativeAssetId
       ? `eip155:${descriptor.apiChainId}/${isNative ? 'slip44:60' : `erc20:${readEvmQuoteAddress(item)}`}`
       : catalogAssetId
-  const quoteAddress = nativeQuoteAddress
-    ? nativeQuoteAddress
-    : isEvmChain && !isNative
-      ? readEvmQuoteAddress(item)
-      : isRecord(item.raw) && typeof item.raw.address === 'string'
-        ? readString(item.raw.address, 'RHEA Swap quote token address')
-        : readString(item.address, 'RHEA Swap quote token address')
+  // A native row may use the on-chain mint as its asset id. Quotes and the
+  // catalog identity use the single protocol asset for that chain.
+  const protocolNativeAssetId = nativeProtocolAssetId(item.chain)
+  const preliminaryAssetId = isNative
+    ? (evmNativeAssetId ?? protocolNativeAssetId ?? chainScopedCatalogAssetId)
+    : chainScopedCatalogAssetId
+  const canonicalQuoteAddress = RHEA_NATIVE_QUOTE_ADDRESSES.get(`${item.chain}:${preliminaryAssetId}`)
+  const quoteAddress = canonicalQuoteAddress
+    ? canonicalQuoteAddress
+    : nativeQuoteAddress
+      ? nativeQuoteAddress
+      : isEvmChain && !isNative
+        ? readEvmQuoteAddress(item)
+        : isRecord(item.raw) && typeof item.raw.address === 'string'
+          ? readString(item.raw.address, 'RHEA Swap quote token address')
+          : readString(item.address, 'RHEA Swap quote token address')
   const assetId = isNative
-    ? (evmNativeAssetId ?? chainScopedCatalogAssetId)
-    : normalizeRheaSwapEvmTokenAssetId(chainScopedCatalogAssetId, item.chain, quoteAddress, false)
+    ? preliminaryAssetId
+    : normalizeRheaSwapEvmTokenAssetId(preliminaryAssetId, item.chain, quoteAddress, false)
   return Object.freeze({
     assetId: readString(assetId, 'RHEA Swap asset ID'),
     blockchain: descriptor.blockchain,

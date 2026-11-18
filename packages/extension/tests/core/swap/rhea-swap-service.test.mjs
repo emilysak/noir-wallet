@@ -5,13 +5,17 @@ import { getNearNetworkConfig, getSolanaNetworkConfig } from '../../../src/confi
 import { getZcashChainId } from '../../../src/core/chains/registry/index.ts'
 import { parseTrustedExtensionRuntimeMessage } from '../../../src/lib/runtime-message-security.ts'
 import { readRheaDestinationHash } from '../../../src/core/services/rhea-swap/rhea-order-status.ts'
-import { parseRheaSwapReviewView } from '../../../src/core/services/rhea-swap/rhea-swap-runtime.ts'
+import {
+  parseRheaSwapCatalogResult,
+  parseRheaSwapReviewView
+} from '../../../src/core/services/rhea-swap/rhea-swap-runtime.ts'
 import {
   MemoryRheaSwapQuoteSessionStore,
   RHEA_SWAP_CHAIN_CATALOG,
   RheaSwapService,
   assertPrivateQuoteRoute,
   assertReviewedPrivateQuoteSender,
+  isConfidentialQuoteSender,
   parseRheaSwapQuoteRequest,
   toSdkQuoteRequest,
   toRheaSwapToken
@@ -720,10 +724,118 @@ test('Private Swap quote remains bound to the same Account and its managed desti
     )
   ).toThrow(/asset/)
   for (const purpose of ['private-swap', 'private-cross-chain-send', 'private-dapp-transfer']) {
-    expect(() => assertPrivateQuoteRoute(nearMove, nearAccount, purpose)).toThrow(
-      /account changed/
-    )
+    expect(() => assertPrivateQuoteRoute(nearMove, nearAccount, purpose)).toThrow(/account changed/)
   }
+})
+
+test('Private Swap accepts Solana private addresses on the same chain and across EVM', () => {
+  const solanaPrivate = 'SysvarRent111111111111111111111111111111111'
+  const solanaPublic = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk'
+  const evmPrivate = `0x${'2'.repeat(40)}`
+  const evmPublic = `0x${'4'.repeat(40)}`
+  const solanaToken = { address: 'So11111111111111111111111111111111111111112' }
+  const account = {
+    walletId: 'wallet-1',
+    accountId: 'account-1',
+    networks: [
+      {
+        chainId: getSolanaNetworkConfig('mainnet').chainId,
+        privateExecutionAddress: solanaPrivate,
+        addresses: [{ value: solanaPublic }]
+      },
+      {
+        chainId: 'eip155:1',
+        privateExecutionAddress: evmPrivate,
+        addresses: [{ value: evmPublic }]
+      }
+    ]
+  }
+  const sameChain = {
+    fromChain: 'solana',
+    toChain: 'solana',
+    sender: solanaPrivate,
+    recipient: solanaPrivate,
+    confidentiality: 'basic',
+    tokenIn: solanaToken,
+    tokenOut: { address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' }
+  }
+  expect(() => assertPrivateQuoteRoute(sameChain, account, 'private-swap', account)).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...sameChain, recipient: solanaPublic },
+      account,
+      'private-swap',
+      account
+    )
+  ).toThrow(/this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...sameChain, recipient: solanaPrivate.toLowerCase() },
+      account,
+      'private-swap',
+      account
+    )
+  ).toThrow(/this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...sameChain, sender: solanaPublic },
+      account,
+      'private-swap',
+      account
+    )
+  ).toThrow(/source does not match/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      {
+        fromChain: '1',
+        toChain: 'solana',
+        sender: evmPrivate,
+        recipient: solanaPrivate,
+        confidentiality: 'basic',
+        tokenIn: { address: 'native' },
+        tokenOut: solanaToken
+      },
+      account,
+      'private-swap',
+      account
+    )
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      {
+        fromChain: 'solana',
+        toChain: '1',
+        sender: solanaPrivate,
+        recipient: evmPrivate,
+        confidentiality: 'basic',
+        tokenIn: solanaToken,
+        tokenOut: { address: 'native' }
+      },
+      account,
+      'private-swap',
+      account
+    )
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...sameChain, toChain: 'near', recipient: 'alice.near' },
+      account,
+      'private-swap',
+      account
+    )
+  ).toThrow(/this Account/)
+  expect(isConfidentialQuoteSender({ fromChain: 'solana', sender: solanaPrivate }, [account])).toBe(
+    true
+  )
+  expect(isConfidentialQuoteSender({ fromChain: 'solana', sender: solanaPublic }, [account])).toBe(
+    false
+  )
+  expect(
+    isConfidentialQuoteSender({ fromChain: 'solana', sender: solanaPrivate.toLowerCase() }, [
+      account
+    ])
+  ).toBe(false)
+  expect(isConfidentialQuoteSender({ fromChain: '1', sender: evmPrivate }, [account])).toBe(true)
 })
 
 test('NEAR and Solana private Move quotes do not need an EVM confidential sender', () => {
@@ -973,6 +1085,63 @@ test('token adapter keeps the quote address separate from the displayed protocol
       })
     ).toMatchObject({ assetId, rheaAddress: quoteAddress })
   }
+})
+
+test('native Solana catalog rows share the protocol asset and quote address', async () => {
+  const wrappedSol = {
+    chain: 'solana',
+    address: 'So11111111111111111111111111111111111111112',
+    symbol: 'SOL',
+    decimals: 9,
+    isNative: true,
+    tokenListChainId: 501,
+    blockchain: 'sol',
+    assetId: 'So11111111111111111111111111111111111111112',
+    contractAddress: 'So11111111111111111111111111111111111111112',
+    coinType: null,
+    name: 'Wrapped SOL',
+    logoURI: null,
+    price: '150',
+    priceUpdatedAt: null,
+    sources: ['okx'],
+    raw: { address: 'So11111111111111111111111111111111111111112' }
+  }
+  const protocolSol = {
+    ...wrappedSol,
+    address: 'nep141:sol.omft.near',
+    assetId: 'nep141:sol.omft.near',
+    contractAddress: null,
+    name: 'SOL',
+    sources: ['nearIntents'],
+    raw: { address: 'So11111111111111111111111111111111111111112' }
+  }
+  expect(toRheaSwapToken(wrappedSol)).toMatchObject({
+    assetId: 'nep141:sol.omft.near',
+    rheaAddress: 'So11111111111111111111111111111111111111112',
+    isNative: true,
+    contractAddress: null
+  })
+  const client = {
+    async getFromTokens() {
+      return [wrappedSol, protocolSol]
+    },
+    getCrossChainToTokens() {
+      throw new Error('unexpected')
+    }
+  }
+  const service = new RheaSwapService(client, new MemoryRheaSwapQuoteSessionStore())
+  const result = await service.listTokens({ direction: 'from', tokenListChainIds: [501] })
+
+  expect(result.failedChainIds).toEqual([])
+  expect(result.tokens).toHaveLength(1)
+  expect(result.tokens[0]).toMatchObject({
+    assetId: 'nep141:sol.omft.near',
+    rheaAddress: 'So11111111111111111111111111111111111111112',
+    sources: ['okx', 'nearIntents']
+  })
+  expect(parseRheaSwapCatalogResult(result)).toMatchObject({
+    tokens: [{ assetId: 'nep141:sol.omft.near' }]
+  })
 })
 
 test('catalog loading limits concurrency and isolates a failed chain', async () => {

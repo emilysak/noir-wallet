@@ -52,13 +52,14 @@ import {
 import { marginalFeeForTier, staticFeeFallbackZats } from '@/core/zcash/fee-policy'
 import { selectSwapFeeEstimate } from '@/lib/swap-fee'
 import { isZecToken, type SwapToken } from '@/core/services/intents-api'
-import type {
-  RheaSwapEvmSignatureReview,
-  RheaSwapNearTransactionBatchReview,
-  RheaSwapQuoteView,
-  RheaSwapReviewView,
-  RheaSwapToken,
-  RheaSwapSolanaTransactionReview
+import {
+  isPrivateSwapApiChain,
+  type RheaSwapEvmSignatureReview,
+  type RheaSwapNearTransactionBatchReview,
+  type RheaSwapQuoteView,
+  type RheaSwapReviewView,
+  type RheaSwapToken,
+  type RheaSwapSolanaTransactionReview
 } from '@/core/services/rhea-swap'
 import {
   detectAddressType,
@@ -1704,7 +1705,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
     const eligible = (tokens: readonly RheaSwapToken[]) =>
       filterSwapDestinationTokens(tokens, 'basic').filter(
         token =>
-          (isZecToken(token) || /^[1-9]\d*$/.test(token.rheaChainId)) &&
+          (isZecToken(token) || isPrivateSwapApiChain(token.rheaChainId)) &&
           (supportsPrivateDestination(token, 'main') ||
             supportsPrivateDestination(token, 'private'))
       )
@@ -1735,10 +1736,12 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       const target = resolveWalletQuoteReceiveTarget(token, portfolio, receiveTargets)
       const privateAddress = target ? privateExecutionAddresses.get(target.chain.id) : undefined
       if (target?.kind === 'solana') {
-        if (!isSolanaPrivateExecutionAddress(privateAddress, target.address)) return false
-        return source
-          ? Boolean(selectWalletOwnedQuoteAssetExecution(source, 'private', privateAddress))
-          : false
+        // Same listing rule as an EVM managed token: a Private address is enough to
+        // choose the asset. Spending still waits for its private balance.
+        return (
+          target.chain.network?.kind === 'mainnet' &&
+          isSolanaPrivateExecutionAddress(privateAddress, target.address)
+        )
       }
       if (
         target?.kind !== 'evm' ||
@@ -1889,15 +1892,17 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         : null,
     [isZecDestination, swap.tokenOut, portfolio, receiveTargets]
   )
-  const destinationPrivateExecutionAddress = useMemo(
-    () =>
-      privateExecutionSupported && walletDestinationTarget?.kind === 'evm'
-        ? storageV2Account?.networks.find(
-            network => network.chain.id === walletDestinationTarget.chain.id
-          )?.privateExecutionAddress
-        : undefined,
-    [privateExecutionSupported, storageV2Account, walletDestinationTarget]
-  )
+  const destinationPrivateExecutionAddress = useMemo(() => {
+    if (
+      !privateExecutionSupported ||
+      (walletDestinationTarget?.kind !== 'evm' && walletDestinationTarget?.kind !== 'solana')
+    ) {
+      return undefined
+    }
+    return storageV2Account?.networks.find(
+      network => network.chain.id === walletDestinationTarget.chain.id
+    )?.privateExecutionAddress
+  }, [privateExecutionSupported, storageV2Account, walletDestinationTarget])
   const destinationMode: QuoteDepositExecutionMode = ordinarySwapRequested
     ? executionSourceMode
     : privateSwapRequested
@@ -1941,7 +1946,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const managedDestinationAddress = isZecDestination
     ? currentAccount?.addresses[zecDestinationType]
     : ordinarySwapRequested && destinationMode === 'private'
-      ? walletDestinationTarget?.kind === 'evm' &&
+      ? (walletDestinationTarget?.kind === 'evm' || walletDestinationTarget?.kind === 'solana') &&
         swap.tokenOut &&
         supportsPrivateDestination(swap.tokenOut, 'private')
         ? destinationPrivateExecutionAddress
@@ -1964,7 +1969,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const unsupportedPrivateDestination = Boolean(
     swap.tokenOut &&
     (privateSwapRequested
-      ? (!isZecDestination && !/^[1-9]\d*$/.test(swap.tokenOut.rheaChainId)) ||
+      ? (!isZecDestination && !isPrivateSwapApiChain(swap.tokenOut.rheaChainId)) ||
         !supportsPrivateDestination(swap.tokenOut, destinationMode)
       : !useCustomRecipient &&
         destinationWalletActionMode.mode === 'private' &&
@@ -2677,7 +2682,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             (!privateSwapRequested ||
               ((isZecToken(token)
                 ? !isZecToken(tokenIn ?? null)
-                : /^[1-9]\d*$/.test(token.rheaChainId)) &&
+                : isPrivateSwapApiChain(token.rheaChainId)) &&
                 (supportsPrivateDestination(token, 'main') ||
                   supportsPrivateDestination(token, 'private'))))
         ) ?? null)
@@ -2924,6 +2929,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
     setMaxSelected(true)
     swap.updateAmountIn(maximum)
   }
+  const solanaPrivateBalance =
+    executionSourceMode === 'private' &&
+    (swap.tokenIn?.rheaChainId === 'solana' || swap.tokenIn?.blockchain === 'sol')
   const mainWalletSpendableBalance = mainWalletOwnedSource
     ? resolvePortfolioTransferAvailability({
         balanceRaw: mainWalletOwnedSource.asset.balance.availableRaw,
@@ -2939,10 +2947,12 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         isNative: privateWalletOwnedSource.asset.asset.kind === 'native',
         maximumRaw: null
       }).display
-    : undefined
+    : solanaPrivateBalance
+      ? '0'
+      : undefined
   const spendableBalance = swap.isZecSource
     ? zcashAvailability.amount
-    : (walletAvailability?.display ?? '—')
+    : (walletAvailability?.display ?? (solanaPrivateBalance ? '0' : '—'))
   useEffect(() => {
     if (
       nativeMaximum === null ||
@@ -3125,14 +3135,15 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       const expectedAddress =
         typeof target === 'string'
           ? target
-          : record.sourceMode === 'private' && target?.kind === 'evm'
+          : record.sourceMode === 'private' && (target?.kind === 'evm' || target?.kind === 'solana')
             ? privateExecutionAddresses.get(target.chain.id)
             : target?.address
-      if (
-        record.customRecipient ||
+      const recipientChanged =
         !expectedAddress ||
-        record.recipientAddress.toLowerCase() !== expectedAddress.toLowerCase()
-      ) {
+        (typeof target !== 'string' && target?.kind === 'solana'
+          ? record.recipientAddress !== expectedAddress
+          : record.recipientAddress.toLowerCase() !== expectedAddress.toLowerCase())
+      if (record.customRecipient || recipientChanged) {
         swap.setQuoteError('Swap destination changed. Start a new Swap.')
         return
       }
@@ -3838,7 +3849,11 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
               throw new Error('Solana Swap routes are not supported with Keystone')
             }
             const solanaReview = await measure('rhea-prepare-solana', () =>
-              rheaSwapClient.prepareSolanaTransaction(result.quoteHandle, binding)
+              rheaSwapClient.prepareSolanaTransaction(
+                result.quoteHandle,
+                binding,
+                executionSourceMode
+              )
             )
             if (requestSequence !== quoteRequestSequence.current) {
               await rheaSwapClient.cancelSolanaTransaction(result.quoteHandle).catch(() => {})
@@ -5407,7 +5422,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
                 nativeConfidentialDestinations
               ) !== null) &&
             (!privateSwapRequested ||
-              ((isZecToken(token) ? !swap.isZecSource : /^[1-9]\d*$/.test(token.rheaChainId)) &&
+              ((isZecToken(token) ? !swap.isZecSource : isPrivateSwapApiChain(token.rheaChainId)) &&
                 supportsPrivateDestination(token, 'private')))
         )
       const filterSources = (tokens: readonly RheaSwapToken[]) =>
@@ -7253,7 +7268,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             ? 'Confidential'
             : isPrivateFunding
               ? 'Private'
-              : !requiresRecipientAddress && walletDestinationTarget?.kind === 'evm'
+              : !requiresRecipientAddress && (walletDestinationTarget?.kind === 'evm' || walletDestinationTarget?.kind === 'solana')
                 ? destinationMode === 'private'
                   ? 'Private'
                   : 'Public'
@@ -7268,7 +7283,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         hideSwitchAssets={isPrivateFunding || privateTransferRequested || crossChainSendRequested}
         hideReceiveAddress={isPrivateFunding || ordinarySwapRequested}
         onSelectDestinationAccount={
-          !ordinarySwapRequested && privateSwapRequested && walletDestinationTarget?.kind === 'evm'
+          !ordinarySwapRequested &&
+          privateSwapRequested &&
+          (walletDestinationTarget?.kind === 'evm' || walletDestinationTarget?.kind === 'solana')
             ? () => setDestinationSelectorOpen(true)
             : undefined
         }
@@ -7593,7 +7610,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           onSelect={handleDestinationModeChange}
           privateAvailable={Boolean(swap.tokenOut && supportsPrivateDestination(swap.tokenOut))}
           mainAddress={
-            walletDestinationTarget?.kind === 'evm' ? walletDestinationTarget.address : undefined
+            walletDestinationTarget?.kind === 'evm' || walletDestinationTarget?.kind === 'solana'
+              ? walletDestinationTarget.address
+              : undefined
           }
           privateAddress={destinationPrivateExecutionAddress}
           purpose="destination"

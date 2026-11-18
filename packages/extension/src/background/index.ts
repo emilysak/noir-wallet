@@ -188,8 +188,11 @@ import { getSafeRheaSwapRuntimeErrorMessage } from '@/core/services/rhea-swap/rh
 import {
   assertPrivateQuoteRoute,
   assertReviewedPrivateQuoteSender,
-  RHEA_SWAP_CHAIN_CATALOG,
+  isConfidentialQuoteSender,
+  isPrivateSwapApiChain,
   parseRheaSwapQuoteRequest,
+  quoteAddressesMatch,
+  RHEA_SWAP_CHAIN_CATALOG,
   toSdkQuoteRequest,
   type PrivateQuotePurpose
 } from '@/core/services/rhea-swap/rhea-swap-model'
@@ -574,7 +577,7 @@ async function requireCurrentPrivateSwapQuote(
   if (!rheaSwapService) throw new Error('RHEA Swap is unavailable')
   const quote = await rheaSwapService.readQuoteSecurityContext(quoteHandle)
   const catalog = await accountNetworksCoordinator.readCatalog()
-  if (!catalog && /^[1-9]\d*$/.test(quote.request.fromChain)) {
+  if (!catalog && isPrivateSwapApiChain(quote.request.fromChain)) {
     throw new Error('Wallet accounts are unavailable')
   }
   if (!quote.scope) {
@@ -609,8 +612,12 @@ async function requireCurrentPrivateSwapQuote(
   if (binding) {
     if (
       binding.quoteHandle !== quoteHandle ||
-      binding.sender.toLowerCase() !== quote.request.sender.toLowerCase() ||
-      binding.destination.recipient.toLowerCase() !== quote.request.recipient?.toLowerCase() ||
+      !quoteAddressesMatch(binding.sender, quote.request.sender, quote.request.fromChain) ||
+      !quoteAddressesMatch(
+        binding.destination.recipient,
+        quote.request.recipient,
+        quote.request.toChain
+      ) ||
       ((quote.scope.purpose === 'private-transfer' ||
         quote.scope.purpose === 'private-cross-chain-send' ||
         quote.scope.purpose === 'private-dapp-transfer' ||
@@ -4280,17 +4287,13 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
           ? accountContextTransition.runActiveOperation(async () => {
               const request = parseRheaSwapQuoteRequest(message.request)
               const catalog = await accountNetworksCoordinator.readCatalog()
-              if (!catalog && /^[1-9]\d*$/.test(request.fromChain)) {
+              if (!catalog && isPrivateSwapApiChain(request.fromChain)) {
                 throw new Error('Wallet accounts are unavailable')
               }
               const account = catalog?.accounts.find(candidate => candidate.active)
-              const privateSender =
-                catalog &&
-                resolveEvmAddressRole(
-                  request.sender,
-                  `eip155:${request.fromChain}`,
-                  catalog.accounts
-                ) === 'confidential'
+              const privateSender = Boolean(
+                catalog && isConfidentialQuoteSender(request, catalog.accounts)
+              )
               const purpose = message.purpose as PrivateQuotePurpose | undefined
               const requestedZcashFundingSource = message.zcashFundingSource
               if (
@@ -4391,18 +4394,22 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
                           )
                           .then(() => Object.freeze({ success: true }))
                       : message.type === 'PREPARE_RHEA_SWAP_SOLANA'
-                        ? accountContextTransition.runActiveOperation(() =>
-                            solanaCoordinator
-                              ? solanaCoordinator.prepare(
-                                  message.quoteHandle as string,
-                                  message.binding
-                                )
-                              : Promise.reject(
-                                  new Error('RHEA Swap Solana execution is unavailable')
-                                )
+                        ? runScopedSwap(
+                            message.quoteHandle as string,
+                            () =>
+                              solanaCoordinator
+                                ? solanaCoordinator.prepare(
+                                    message.quoteHandle as string,
+                                    message.binding
+                                  )
+                                : Promise.reject(
+                                    new Error('RHEA Swap Solana execution is unavailable')
+                                  ),
+                            message.executionMode as 'main' | 'private' | undefined,
+                            parseRheaSwapTransactionBinding(message.binding)
                           )
                         : message.type === 'CONFIRM_RHEA_SWAP_SOLANA'
-                          ? accountContextTransition.runActiveOperation(() =>
+                          ? runScopedSwap(message.quoteHandle as string, () =>
                               solanaCoordinator
                                 ? solanaCoordinator.confirm(
                                     message.quoteHandle as string,

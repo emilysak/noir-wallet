@@ -244,22 +244,8 @@ export class RheaSwapSolanaCoordinator {
     const plan = await this.options.service.readSolanaTransactionPlan(quoteHandle)
     const binding = parseRheaSwapTransactionBinding(bindingValue)
     const { context, sender: mainSender } = await this.loadSupportedContext()
-    let sender = mainSender
-    let signingKind: 'solana-transaction' | 'pea-solana-transaction' = 'solana-transaction'
-    if (binding.sender !== mainSender) {
-      if (!supportsSolanaPrivateExecution(context.keyDomainSource)) {
-        throw new Error('Solana private execution is unavailable')
-      }
-      const pea = await this.options.signer.deriveSolanaPea(
-        context.chainAccount.scope.keyDomainId,
-        context.accountIndex
-      )
-      if (pea.address === mainSender || binding.sender !== pea.address) {
-        throw new Error('RHEA Swap Solana binding does not match its build')
-      }
-      sender = pea.address
-      signingKind = 'pea-solana-transaction'
-    }
+    const sender = await this.resolveBoundSender(context, mainSender, binding.sender)
+    const signingKind = sender === mainSender ? 'solana-transaction' : 'pea-solana-transaction'
     this.assertBinding(plan, binding, sender)
     if (plan.format.toLowerCase() !== 'base64') {
       throw new Error('RHEA Swap Solana transaction format is not supported')
@@ -356,7 +342,8 @@ export class RheaSwapSolanaCoordinator {
     fingerprint: string
   ): Promise<RheaSwapSignedOrderResult> {
     let pending = await this.requirePending(quoteHandle, fingerprint)
-    const { context, sender } = await this.loadSupportedContext()
+    const { context, sender: mainSender } = await this.loadSupportedContext()
+    const sender = await this.resolveBoundSender(context, mainSender, pending.sender)
     if (
       sender !== pending.sender ||
       context.chainAccount.scope.chainId !== pending.chainId ||
@@ -465,6 +452,25 @@ export class RheaSwapSolanaCoordinator {
       throw new Error('RHEA Swap Solana review is unavailable or expired')
     }
     return pending
+  }
+
+  private async resolveBoundSender(
+    context: ActiveSolanaTransferContext,
+    mainSender: string,
+    requestedSender: string
+  ): Promise<string> {
+    if (requestedSender === mainSender) return mainSender
+    if (!supportsSolanaPrivateExecution(context.keyDomainSource)) {
+      throw new Error('Solana private execution is unavailable')
+    }
+    const pea = await this.options.signer.deriveSolanaPea(
+      context.chainAccount.scope.keyDomainId,
+      context.accountIndex
+    )
+    if (pea.address === mainSender || requestedSender !== pea.address) {
+      throw new Error('RHEA Swap Solana binding does not match its build')
+    }
+    return pea.address
   }
 
   private assertBinding(

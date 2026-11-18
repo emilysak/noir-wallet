@@ -1395,7 +1395,7 @@ function TransferForm() {
     eligible &&
     supportedPair &&
     routeState === 'supported' &&
-    (!clusterPair || (method === 'directly' && directQuoted)) &&
+    (!clusterPair || (method === 'directly' && (directQuoted || solanaClusterPair))) &&
     !tokenFeeBalanceError &&
     (direction === 'main-to-private' ? publicRaw !== null : privateRaw !== null) &&
     (!maxSelected || amount === currentAmount) &&
