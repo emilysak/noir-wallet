@@ -673,9 +673,92 @@ test('Private Swap quote remains bound to the same Account and its managed desti
       'private-transfer'
     )
   ).toThrow(/asset/)
-  for (const purpose of ['private-swap', 'private-cross-chain-send', 'private-dapp-transfer']) {
-    expect(() => assertPrivateQuoteRoute(nearMove, nearAccount, purpose)).toThrow(/account changed/)
+  expect(() => assertPrivateQuoteRoute(nearMove, nearAccount, 'private-swap')).toThrow(
+    /this Account/
+  )
+  for (const purpose of ['private-cross-chain-send', 'private-dapp-transfer']) {
+    expect(() => assertPrivateQuoteRoute(nearMove, nearAccount, purpose)).toThrow(
+      /account changed/
+    )
   }
+  const nearPrivateSwap = {
+    fromChain: 'near',
+    toChain: 'near',
+    sender: nearPrivateExecutionAddress,
+    recipient: nearPrivateExecutionAddress,
+    confidentiality: 'basic',
+    tokenIn: nearToken,
+    tokenOut: { address: 'usdt.tether-token.near' }
+  }
+  expect(() =>
+    assertPrivateQuoteRoute(nearPrivateSwap, nearAccount, 'private-swap', nearAccount)
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearPrivateSwap, recipient: nearPublicAddress },
+      nearAccount,
+      'private-swap',
+      nearAccount
+    )
+  ).toThrow(/this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...nearPrivateSwap, recipient: nearPrivateExecutionAddress.toUpperCase() },
+      nearAccount,
+      'private-swap',
+      nearAccount
+    )
+  ).toThrow(/this Account/)
+  const nearEvmAccount = {
+    ...nearAccount,
+    networks: [nearAccount.networks[0], account.networks[0]]
+  }
+  expect(() =>
+    assertPrivateQuoteRoute(
+      {
+        fromChain: '1',
+        toChain: 'near',
+        sender: source,
+        recipient: nearPrivateExecutionAddress,
+        confidentiality: 'basic',
+        tokenIn: { address: 'native' },
+        tokenOut: nearToken
+      },
+      nearEvmAccount,
+      'private-swap',
+      nearEvmAccount
+    )
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      {
+        fromChain: 'near',
+        toChain: '1',
+        sender: nearPrivateExecutionAddress,
+        recipient: source,
+        confidentiality: 'basic',
+        tokenIn: nearToken,
+        tokenOut: { address: 'native' }
+      },
+      nearEvmAccount,
+      'private-swap',
+      nearEvmAccount
+    )
+  ).not.toThrow()
+  expect(
+    isConfidentialQuoteSender({ fromChain: 'near', sender: nearPrivateExecutionAddress }, [
+      nearAccount
+    ])
+  ).toBe(true)
+  expect(
+    isConfidentialQuoteSender({ fromChain: 'near', sender: nearPublicAddress }, [nearAccount])
+  ).toBe(false)
+  expect(
+    isConfidentialQuoteSender(
+      { fromChain: 'near', sender: nearPrivateExecutionAddress.toUpperCase() },
+      [nearAccount]
+    )
+  ).toBe(false)
 })
 
 test('Private Swap accepts Solana private addresses on the same chain and across EVM', () => {

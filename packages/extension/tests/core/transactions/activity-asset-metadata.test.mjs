@@ -1,13 +1,18 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
+import { getSolanaNetworkConfig } from '../../../src/config/networks.ts'
+import { getActiveChainEndpointSettings } from '../../../src/core/chains/chain-endpoint-settings.ts'
 import { mergeActivityAssetMetadata } from '../../../src/popup/components/transaction/activity-asset-metadata.ts'
 import {
   getActivityDetailTitle,
   getActivityDisplayChanges,
+  getActivitySwapPresentation,
+  hasMatchingActivityTokenIcons,
   resolveActivityDisplayAmount
 } from '../../../src/popup/components/transaction/multichain-activity-presentation.ts'
 import { getActivityInteractionPresentation } from '../../../src/popup/components/transaction/activity-interaction-adapters.ts'
+import { buildActivityPresentationCatalog } from '../../../src/popup/services/activity-presentation-catalog.ts'
 
 const chainId = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'
 const mint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -132,4 +137,83 @@ test('formats a detected ERC-20 transfer after its balance leaves Portfolio', ()
   expect(getActivityDisplayChanges(call, metadata)).toMatchObject([
     { symbol: 'USD0', value: '0.550431', direction: 'outgoing', isRaw: false }
   ])
+})
+
+test('formats a NEAR Confidential USDT send from the intents catalog', () => {
+  const nearAssetId = 'near:mainnet/nep141:usdt.tether-token.near'
+  const solanaAssetId = `${getSolanaNetworkConfig('mainnet').chainId}/token:${mint}`
+  const catalog = buildActivityPresentationCatalog({
+    network: 'mainnet',
+    endpointSettings: getActiveChainEndpointSettings(),
+    userEvmAssets: [],
+    catalogTokens: [
+      {
+        assetId: 'nep141:usdt.tether-token.near',
+        blockchain: 'near',
+        contractAddress: 'usdt.tether-token.near',
+        decimals: 6,
+        icon: 'https://example.test/usdt.png',
+        price: 1,
+        priceUpdatedAt: '2026-11-18T00:00:00.000Z',
+        symbol: 'USDT'
+      },
+      {
+        assetId: 'nep141:usdc.omft.near',
+        blockchain: 'sol',
+        contractAddress: mint,
+        decimals: 6,
+        price: 1,
+        priceUpdatedAt: '2026-11-18T00:00:00.000Z',
+        symbol: 'USDC'
+      }
+    ]
+  })
+  expect(catalog.assetMetadata.get(solanaAssetId)?.metadata).toMatchObject({
+    symbol: 'USDC',
+    decimals: 6
+  })
+  const route = getActivitySwapPresentation(
+    {
+      id: 'tx:confidential:near-usdt',
+      source: 'wallet-v2',
+      scope: { keyDomainId: 'wallet:one', accountId: 'account:one' },
+      kind: 'withdraw',
+      status: 'final',
+      completeness: 'complete',
+      snapshot: {
+        schemaVersion: 1,
+        direction: 'outgoing',
+        shield: {
+          schemaVersion: 1,
+          operation: 'withdraw',
+          sourceDomain: 'shield',
+          destinationDomain: 'public'
+        },
+        primaryAmount: { assetId: nearAssetId, amountRaw: '12000' },
+        counterAmount: { assetId: nearAssetId, amountRaw: '11940' }
+      },
+      segments: [
+        {
+          id: 'segment:destination',
+          role: 'destination',
+          target: { kind: 'onchain', chainId: 'near:mainnet' },
+          status: 'final'
+        }
+      ]
+    },
+    catalog.assetMetadata,
+    catalog.chainMetadata
+  )
+  expect(route?.source).toMatchObject({
+    assetId: nearAssetId,
+    symbol: 'USDT',
+    formatted: '0.012',
+    iconUrl: 'https://example.test/usdt.png'
+  })
+  expect(route?.destination).toMatchObject({
+    assetId: nearAssetId,
+    symbol: 'USDT',
+    formatted: '0.01194'
+  })
+  expect(hasMatchingActivityTokenIcons(route)).toBe(true)
 })

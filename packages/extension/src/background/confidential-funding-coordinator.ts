@@ -196,6 +196,25 @@ function isRecoverableLocalFailure(plan: ConfidentialFundingPlan): boolean {
   )
 }
 
+function hasDirectSubmissionEvidence(
+  plan: Pick<ConfidentialFundingPlan, 'orderId' | 'batchSubmissionAttemptedAt' | 'withdraws'>
+): boolean {
+  return Boolean(
+    plan.orderId ||
+    plan.batchSubmissionAttemptedAt ||
+    plan.withdraws.some(row => row.intentHash || row.transactionHash)
+  )
+}
+
+function isUnsubmittedDirectLocalFailure(plan: ConfidentialFundingPlan): boolean {
+  return (
+    (plan.operation === 'withdraw' || plan.operation === 'swap') &&
+    plan.phase === 'submitting' &&
+    plan.errorStatus === 'LOCAL_PROCESSING_FAILED' &&
+    !hasDirectSubmissionEvidence(plan)
+  )
+}
+
 function isUnsignedDirectWithdraw(plan: ConfidentialFundingPlan): boolean {
   return (
     (plan.operation === 'withdraw' || plan.operation === 'swap') &&
@@ -3026,6 +3045,8 @@ export class ConfidentialFundingCoordinator {
         errorStatus: 'WITHDRAW_SIGNING_INTERRUPTED'
       })
     }
+    // The signed intent was never accepted. Do not submit it on a later resume.
+    if (isUnsubmittedDirectLocalFailure(plan)) return this.failUnsubmittedDirectPlan(plan)
     if (
       plan.phase === 'authorized' &&
       plan.requiresDeposit &&
@@ -4487,6 +4508,27 @@ export class ConfidentialFundingCoordinator {
     return next
   }
 
+  private async failUnsubmittedDirectPlan(
+    plan: ConfidentialFundingPlan
+  ): Promise<ConfidentialFundingPlan> {
+    await this.applyGraphStatus(plan, 'relay', 'failed', undefined, 'relay-failed')
+    for (const row of plan.withdraws) {
+      await this.applyGraphStatus(
+        plan,
+        `withdraw:${row.sequence}`,
+        'failed',
+        undefined,
+        'relay-failed'
+      )
+    }
+    if (plan.phase === 'failed' && plan.errorStatus === 'LOCAL_PROCESSING_FAILED') return plan
+    return this.updatePlan(plan, {
+      phase: 'failed',
+      resumePhase: undefined,
+      errorStatus: 'LOCAL_PROCESSING_FAILED'
+    })
+  }
+
   private async handleContinuationError(
     planId: string,
     error: unknown
@@ -4529,6 +4571,12 @@ export class ConfidentialFundingCoordinator {
           ? `SERVICE_${error.status}`
           : 'LOCAL_PROCESSING_FAILED'
     })
+    if (
+      !(error instanceof ConfidentialFundingApiError) &&
+      isUnsubmittedDirectLocalFailure(failed)
+    ) {
+      return this.failUnsubmittedDirectPlan(failed)
+    }
     // Unsigned Cluster generate-intent responses are not frozen yet, so NEAR and Solana both
     // retry. Direct withdraws and swaps must not be rescheduled here.
     if (

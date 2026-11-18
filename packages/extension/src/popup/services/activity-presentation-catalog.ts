@@ -8,8 +8,9 @@ import {
   parseAssetDisplayMetadata,
   type AssetRegistryEntry
 } from '@/core/chains/registry'
-import type { SwapToken } from '@/core/services/intents-api'
+import { resolveSwapTokenIconUrl, type SwapToken } from '@/core/services/intents-api'
 import { resolveIntentsEvmAssets } from '@/core/services/intents-evm-assets'
+import { resolveIntentsWalletAsset } from '@/core/services/intents-wallet-assets'
 import {
   userEvmAssetToDefinition,
   type DetectedEvmAssetRecord,
@@ -102,6 +103,34 @@ export function buildActivityPresentationCatalog({
       })
       catalogMetadata.set(asset.id, {
         asset: { ...asset, kind: 'token' },
+        metadata
+      })
+    } catch {
+      // Catalog labels and icon URLs outside wallet limits cannot supplement Activity.
+    }
+  }
+  for (const token of catalogTokens) {
+    const descriptor = resolveIntentsWalletAsset(token, network)
+    if (!descriptor || descriptor.kind === 'native' || descriptor.chainId.startsWith('eip155:')) {
+      continue
+    }
+    try {
+      const asset = parseAssetId(descriptor.assetId)
+      const iconUrl = resolveSwapTokenIconUrl(token)
+      const metadata = parseAssetDisplayMetadata({
+        name: token.name?.trim() || token.symbol,
+        symbol: token.symbol,
+        decimals: token.decimals,
+        ...(iconUrl ? { iconUrl } : {})
+      })
+      catalogMetadata.set(asset.id, {
+        asset: {
+          id: asset.id,
+          chainId: asset.chainId,
+          namespace: descriptor.namespace,
+          reference: descriptor.reference,
+          kind: descriptor.kind
+        },
         metadata
       })
     } catch {

@@ -99,7 +99,9 @@ export function selectHomeActionSource(
     if (
       action === 'swap' &&
       !['evm', 'zcash', 'bitcoin'].includes(chain.chain.family) &&
-      !(domain === 'private' && chain.chain.family === 'solana')
+      !(domain === 'private' && chain.chain.family === 'solana') &&
+      !(domain === 'private' && chain.chain.family === 'near') &&
+      !(domain === 'public' && chain.chain.family === 'near')
     ) {
       return []
     }

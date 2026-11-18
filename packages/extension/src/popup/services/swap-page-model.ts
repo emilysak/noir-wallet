@@ -335,9 +335,9 @@ export function resolveWalletSwapSourceAvailableRaw(
   source: WalletOwnedQuoteAsset,
   evmExecutionMode: 'main' | 'private'
 ): string | undefined {
-  if (source.family === 'solana') {
+  if (source.family === 'solana' || source.family === 'near') {
     // Missing privateRaw means the private account has no recorded balance.
-    // Show 0 instead of hiding the row. A recorded amount still wins.
+    // Show 0 instead of the combined public balance. A recorded amount still wins.
     return evmExecutionMode === 'private'
       ? (source.asset.balance.privateRaw ?? '0')
       : source.asset.balance.availableRaw
@@ -386,7 +386,9 @@ export function resolveSwapExecutionSourceMode(input: {
 }): 'main' | 'private' {
   if (input.isPrivateFunding) return 'main'
   return input.requestedMode === 'private' &&
-    (input.sourceFamily === 'evm' || input.sourceFamily === 'solana') &&
+    (input.sourceFamily === 'evm' ||
+      input.sourceFamily === 'solana' ||
+      input.sourceFamily === 'near') &&
     input.privateSourceAvailable
     ? 'private'
     : 'main'
@@ -437,8 +439,14 @@ export function isPrivateSwapDestinationSupported(
   if (!portfolio || !isConfidentialSwapDestinationSupported(token)) return false
   if (isZecToken(token)) return Boolean(zcashAddresses?.shielded && zcashAddresses.transparent)
   const target = resolveWalletQuoteReceiveTarget(token, portfolio, receiveTargets)
-  if (target?.kind === 'near')
-    return target.chain.network?.kind === 'mainnet' && target.address.length > 0
+  if (target?.kind === 'near') {
+    if (target.chain.network?.kind !== 'mainnet') return false
+    if (mode === 'main') return target.address.length > 0
+    const privateAddress = privateExecutionAddresses.get(target.chain.id)
+    return Boolean(
+      privateAddress && /^[0-9a-f]{64}$/.test(privateAddress) && privateAddress !== target.address
+    )
+  }
   if (target?.kind === 'solana') {
     if (target.chain.network?.kind !== 'mainnet') return false
     if (mode === 'main') return target.address.length > 0

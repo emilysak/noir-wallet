@@ -10,7 +10,8 @@ import { serializeConfidentialFundingPlan } from '../../../src/background/confid
 import {
   createConfidentialFundingGraph,
   fingerprintConfidentialValue,
-  fingerprintDirectConfidentialApproval
+  fingerprintDirectConfidentialApproval,
+  normalizeConfidentialWithdrawRequest
 } from '../../../src/core/services/confidential-funding/index.ts'
 import { InMemoryTransactionRepository } from '../../../src/infrastructure/persistence/repositories/in-memory-transaction-repository.ts'
 import { assertPersistableTransactionGraph } from '../../../src/infrastructure/persistence/repositories/transaction-repository-support.ts'
@@ -256,7 +257,8 @@ async function harness(
     async submitIntent(signedData) {
       state.submissions.push(structuredClone(signedData))
       if (state.submitError) throw state.submitError
-      const sequence = Number(signedData.payload.split('-').at(-1))
+      const sequence =
+        typeof signedData.payload === 'string' ? Number(signedData.payload.split('-').at(-1)) : 0
       return { intentHash: `intent-${sequence}`, correlationId: `submit-${sequence}` }
     },
     async getStatus(address, chainId) {
@@ -1413,14 +1415,14 @@ test.describe('confidential funding persisted recovery', () => {
       getStatus: async () => ({ status: 'PROCESSING' }),
       quote: async input => ({
         correlationId: 'quote-one',
-          quoteRequest: {
-            swapType: 'EXACT_INPUT',
-            confidentiality: 'basic',
-            originAsset: input.originAsset,
-            destinationAsset: input.destinationAsset,
-            amount: input.amountRaw,
-            refundTo: input.refundTo ?? input.signerId,
-            depositType: input.depositType,
+        quoteRequest: {
+          swapType: 'EXACT_INPUT',
+          confidentiality: 'basic',
+          originAsset: input.originAsset,
+          destinationAsset: input.destinationAsset,
+          amount: input.amountRaw,
+          refundTo: input.refundTo ?? input.signerId,
+          depositType: input.depositType,
           refundType: input.refundType,
           recipient: input.recipient,
           recipientType: input.recipientType,
@@ -1920,6 +1922,196 @@ test.describe('confidential funding persisted recovery', () => {
       h.initial.frozenRequest.withdraws.map(row => row.signed_payload)
     )
     expect(h.state.intentSignatures).toBe(0)
+  })
+
+  test('submits a NEAR direct withdraw after storage reorders the NEP-413 payload keys', async () => {
+    const h = await harness('submitting', true)
+    const chainId = getNearNetworkConfig('mainnet').chainId
+    const signer = 'ab'.repeat(32)
+    const destination = 'cd'.repeat(32)
+    const signedPayload = {
+      standard: 'nep413',
+      payload: {
+        recipient: 'intents.far',
+        nonce: 'Vij2xgDhEPMXAEI7GlkC6hjLFhhNivtpabHy0KR75XU=',
+        message: '{"deadline":"2026-11-21T08:33:03.176Z","signer_id":"signer"}'
+      },
+      public_key: 'ed25519:AjpHyjUcjhDo3ySeRrBTydpBM2xgunPH2eLEyddPEpK4',
+      signature:
+        'ed25519:3nagyVEg2QgxW2jW7ie8LFwhMkPVUyLyJCDpH1ervSdRtsDy2kgeebKifAhduLLf5CTw1YjApu42By4RJCfb4qS8'
+    }
+    const source = {
+      chainId,
+      chainName: 'near',
+      assetId: `${chainId}/slip44:397`,
+      protocolAssetId: 'nep141:usdt.tether-token.near',
+      amountRaw: h.initial.source.amountRaw,
+      address: signer
+    }
+    const frozenRequest = normalizeConfidentialWithdrawRequest({
+      from_amount: source.amountRaw,
+      from_chain: 'near',
+      from_token: source.protocolAssetId,
+      mode: 'TRANSFER',
+      signer_id: signer,
+      withdraws: [
+        {
+          amount: h.initial.withdraws[0].amountRaw,
+          deposit_address: h.initial.withdraws[0].depositAddress,
+          destination_address: destination,
+          destination_chain: 'near',
+          execution_type: 'CONFIDENTIAL_1CLICK',
+          sequence: 0,
+          signed_payload: signedPayload,
+          token: source.protocolAssetId
+        }
+      ]
+    })
+    const reorderedSigned = {
+      ...signedPayload,
+      payload: Object.fromEntries(Object.entries(signedPayload.payload).reverse())
+    }
+    expect(JSON.stringify(reorderedSigned.payload)).not.toBe(JSON.stringify(signedPayload.payload))
+    const plan = {
+      ...h.initial,
+      source,
+      destination: {
+        chainId,
+        chainName: 'near',
+        assetId: source.assetId,
+        protocolAssetId: source.protocolAssetId,
+        address: destination
+      },
+      signerId: signer,
+      frozenRequest: {
+        ...frozenRequest,
+        withdraws: [{ ...frozenRequest.withdraws[0], signed_payload: reorderedSigned }]
+      },
+      requestFingerprint: await fingerprintConfidentialValue(frozenRequest),
+      withdraws: [
+        {
+          ...h.initial.withdraws[0],
+          destinationAddress: destination,
+          destinationChain: 'near',
+          token: source.protocolAssetId,
+          signedPayload: reorderedSigned
+        }
+      ]
+    }
+    await h.store.putPlan(plan)
+    h.state.session = { ...h.state.session, signerId: signer }
+    const resumed = await h.restart().continuePlan(plan.planId)
+    expect(resumed.phase).toBe('processing')
+    expect(resumed.errorStatus).toBeUndefined()
+    expect(h.state.submissions).toEqual([signedPayload])
+    expect(h.state.intentSignatures).toBe(0)
+  })
+
+  test('fails an unsubmitted direct withdraw instead of submitting the signed intent again', async () => {
+    const h = await harness('submitting', true)
+    await h.store.putPlan({ ...h.initial, errorStatus: 'LOCAL_PROCESSING_FAILED' })
+    const failed = await h.restart().continuePlan(h.initial.planId)
+    expect(failed.phase).toBe('failed')
+    expect(failed.errorStatus).toBe('LOCAL_PROCESSING_FAILED')
+    expect(failed.withdraws[0].signedPayload).toEqual(h.initial.withdraws[0].signedPayload)
+    expect(h.state.submissions).toEqual([])
+    const graph = await h.repository.get(scope, h.initial.transactionId)
+    expect(graph.root.status).toBe('failed')
+    expect(graph.segments.find(segment => segment.role === 'relay').status).toBe('failed')
+    expect(graph.segments.find(segment => segment.role === 'destination').status).toBe('failed')
+    await h.restart().resumeAll()
+    expect(h.state.submissions).toEqual([])
+    expect((await h.store.getPlan(h.initial.planId)).phase).toBe('failed')
+  })
+
+  test('fails a direct withdraw whose frozen request no longer matches its fingerprint', async () => {
+    const h = await harness('submitting', true)
+    await h.store.putPlan({ ...h.initial, requestFingerprint: 'c'.repeat(64) })
+    const failed = await h.restart().continuePlan(h.initial.planId)
+    expect(failed.phase).toBe('failed')
+    expect(failed.errorStatus).toBe('LOCAL_PROCESSING_FAILED')
+    expect(h.state.submissions).toEqual([])
+    const graph = await h.repository.get(scope, h.initial.transactionId)
+    expect(graph.root.status).toBe('failed')
+    expect(graph.segments.find(segment => segment.role === 'relay').status).toBe('failed')
+    expect(graph.segments.find(segment => segment.role === 'destination').status).toBe('failed')
+  })
+
+  test('fails a stuck Solana direct withdraw without submitting its raw signature again', async () => {
+    const h = await harness('submitting', true)
+    const chainId = getSolanaNetworkConfig('mainnet').chainId
+    const address = '11111111111111111111111111111111'
+    const destination = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+    const signedPayload = {
+      standard: 'raw_ed25519',
+      payload: 'frozen-0',
+      public_key: `ed25519:${address}`,
+      signature:
+        'ed25519:3nagyVEg2QgxW2jW7ie8LFwhMkPVUyLyJCDpH1ervSdRtsDy2kgeebKifAhduLLf5CTw1YjApu42By4RJCfb4qS8'
+    }
+    const source = {
+      chainId,
+      chainName: 'solana',
+      assetId: `${chainId}/slip44:501`,
+      protocolAssetId: 'nep141:sol.omft.near',
+      amountRaw: h.initial.source.amountRaw,
+      address
+    }
+    const frozenRequest = normalizeConfidentialWithdrawRequest({
+      from_amount: source.amountRaw,
+      from_chain: 'solana',
+      from_token: source.protocolAssetId,
+      mode: 'TRANSFER',
+      signer_id: address,
+      withdraws: [
+        {
+          amount: h.initial.withdraws[0].amountRaw,
+          deposit_address: h.initial.withdraws[0].depositAddress,
+          destination_address: destination,
+          destination_chain: 'solana',
+          execution_type: 'CONFIDENTIAL_1CLICK',
+          sequence: 0,
+          signed_payload: signedPayload,
+          token: source.protocolAssetId
+        }
+      ]
+    })
+    const plan = {
+      ...h.initial,
+      source,
+      destination: {
+        chainId,
+        chainName: 'solana',
+        assetId: source.assetId,
+        protocolAssetId: source.protocolAssetId,
+        address: destination
+      },
+      signerId: address,
+      errorStatus: 'LOCAL_PROCESSING_FAILED',
+      frozenRequest,
+      requestFingerprint: await fingerprintConfidentialValue(frozenRequest),
+      withdraws: [
+        {
+          ...h.initial.withdraws[0],
+          destinationAddress: destination,
+          destinationChain: 'solana',
+          token: source.protocolAssetId,
+          signedPayload
+        }
+      ]
+    }
+    await h.store.putPlan(plan)
+    h.state.session = { ...h.state.session, signerId: address }
+    const failed = await h.restart().continuePlan(plan.planId)
+    expect(failed.phase).toBe('failed')
+    expect(failed.errorStatus).toBe('LOCAL_PROCESSING_FAILED')
+    expect(h.state.submissions).toEqual([])
+    const graph = await h.repository.get(scope, h.initial.transactionId)
+    expect(graph.root.status).toBe('failed')
+    expect(graph.segments.find(segment => segment.role === 'relay').status).toBe('failed')
+    expect(graph.segments.find(segment => segment.role === 'destination').status).toBe('failed')
+    await h.restart().resumeAll()
+    expect(h.state.submissions).toEqual([])
   })
 
   test('clears optional signing and resume fields through JSON persistence without corrupting plan bindings', async () => {

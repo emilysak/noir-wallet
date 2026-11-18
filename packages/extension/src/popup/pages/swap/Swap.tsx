@@ -133,6 +133,7 @@ import {
   isSolanaPrivateExecutionAddress,
   supportsSolanaPrivateExecution
 } from '@/core/chains/solana'
+import { supportsNearPrivateExecution } from '@/core/chains/near'
 import { InlineError } from '../../components/common/InlineError'
 import { ZcashSyncProgress } from '../../components/common/ZcashSyncProgress'
 import { useZcashSyncReadStatus } from '@/popup/hooks/usePersistedExtensionContextSync'
@@ -620,7 +621,26 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       return isSolanaPrivateExecutionAddress(network.privateExecutionAddress, mainAddress)
     })
   )
-  const privateExecutionSupported = evmPrivateExecutionSupported || solanaPrivateExecutionSupported
+  const nearPrivateExecutionSupported = Boolean(
+    supportsNearPrivateExecution(storageV2Account?.walletSource) &&
+    storageV2Account?.networks.some(network => {
+      if (network.chain.family !== 'near' || network.chain.network.kind !== 'mainnet') {
+        return false
+      }
+      const mainAddress =
+        network.addresses.find(address => address.preferredForReceive)?.value ??
+        network.addresses[0]?.value
+      const privateAddress = network.privateExecutionAddress
+      return Boolean(
+        mainAddress &&
+        privateAddress &&
+        /^[0-9a-f]{64}$/.test(privateAddress) &&
+        privateAddress !== mainAddress
+      )
+    })
+  )
+  const privateExecutionSupported =
+    evmPrivateExecutionSupported || solanaPrivateExecutionSupported || nearPrivateExecutionSupported
   const confidentialShieldAvailable =
     getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length > 0
   const nativeZecShieldAvailable = resolveShieldNativeZecSwapAvailable({
@@ -750,7 +770,11 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       ? storageV2Account?.networks.find(
           network => network.chain.family === 'solana' && network.privateExecutionAddress
         )?.chain.id
-      : undefined
+      : nearPrivateExecutionSupported
+        ? storageV2Account?.networks.find(
+            network => network.chain.family === 'near' && network.chain.network.kind === 'mainnet'
+          )?.chain.id
+        : undefined
   const swap = useSwapState(
     lockedAssetFlowRequested || crossChainSendRequested ? null : swapPreferenceScope,
     {
@@ -1369,7 +1393,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
     const confidentialMove = privateTransferRequested && (kind === 'near' || kind === 'solana')
     if (
       !walletSourceQuoteTarget ||
-      (!confidentialMove && !(privateExecutionSupported && (kind === 'evm' || kind === 'solana')))
+      (!confidentialMove &&
+        !(privateExecutionSupported && (kind === 'evm' || kind === 'solana' || kind === 'near')))
     ) {
       return undefined
     }
@@ -1415,7 +1440,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       ? 'private'
       : !isPrivateFunding &&
           sourceMode === 'private' &&
-          (walletOwnedSourceBase?.family === 'evm' || walletOwnedSourceBase?.family === 'solana')
+          (walletOwnedSourceBase?.family === 'evm' ||
+            walletOwnedSourceBase?.family === 'solana' ||
+            walletOwnedSourceBase?.family === 'near')
         ? 'private'
         : resolveSwapExecutionSourceMode({
             requestedMode: sourceMode,
@@ -1603,6 +1630,16 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         return (
           target.chain.network?.kind === 'mainnet' &&
           isSolanaPrivateExecutionAddress(privateAddress, target.address)
+        )
+      }
+      if (target?.kind === 'near') {
+        return (
+          target.chain.network?.kind === 'mainnet' &&
+          Boolean(
+            privateAddress &&
+            /^[0-9a-f]{64}$/.test(privateAddress) &&
+            privateAddress !== target.address
+          )
         )
       }
       if (
@@ -1802,7 +1839,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const destinationPrivateExecutionAddress = useMemo(() => {
     if (
       !privateExecutionSupported ||
-      (walletDestinationTarget?.kind !== 'evm' && walletDestinationTarget?.kind !== 'solana')
+      (walletDestinationTarget?.kind !== 'evm' &&
+        walletDestinationTarget?.kind !== 'solana' &&
+        walletDestinationTarget?.kind !== 'near')
     ) {
       return undefined
     }
@@ -1853,7 +1892,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const managedDestinationAddress = isZecDestination
     ? currentAccount?.addresses[zecDestinationType]
     : ordinarySwapRequested && destinationMode === 'private'
-      ? (walletDestinationTarget?.kind === 'evm' || walletDestinationTarget?.kind === 'solana') &&
+      ? (walletDestinationTarget?.kind === 'evm' ||
+          walletDestinationTarget?.kind === 'solana' ||
+          walletDestinationTarget?.kind === 'near') &&
         swap.tokenOut &&
         supportsPrivateDestination(swap.tokenOut, 'private')
         ? destinationPrivateExecutionAddress
@@ -3008,15 +3049,18 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         : portfolio
           ? resolveWalletQuoteReceiveTarget(destination, portfolio, receiveTargets)
           : null
+      const exactPrivateDestination =
+        typeof target !== 'string' && (target?.kind === 'solana' || target?.kind === 'near')
       const expectedAddress =
         typeof target === 'string'
           ? target
-          : record.sourceMode === 'private' && (target?.kind === 'evm' || target?.kind === 'solana')
+          : record.sourceMode === 'private' &&
+              (target?.kind === 'evm' || target?.kind === 'solana' || target?.kind === 'near')
             ? privateExecutionAddresses.get(target.chain.id)
             : target?.address
       const recipientChanged =
         !expectedAddress ||
-        (typeof target !== 'string' && target?.kind === 'solana'
+        (exactPrivateDestination
           ? record.recipientAddress !== expectedAddress
           : record.recipientAddress.toLowerCase() !== expectedAddress.toLowerCase())
       if (record.customRecipient || recipientChanged) {
@@ -3902,7 +3946,11 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
               throw new Error('NEAR Swap routes are not supported with Keystone')
             }
             const nearReview = await measure('rhea-prepare-near', () =>
-              rheaSwapClient.prepareNearTransactionBatch(result.quoteHandle, binding)
+              rheaSwapClient.prepareNearTransactionBatch(
+                result.quoteHandle,
+                binding,
+                executionSourceMode
+              )
             )
             if (requestSequence !== quoteRequestSequence.current) {
               await rheaSwapClient.cancelNearTransactionBatch(result.quoteHandle).catch(() => {})
@@ -7424,7 +7472,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             ? 'Private'
             : !requiresRecipientAddress &&
                 (walletDestinationTarget?.kind === 'evm' ||
-                  walletDestinationTarget?.kind === 'solana')
+                  walletDestinationTarget?.kind === 'solana' ||
+                  walletDestinationTarget?.kind === 'near')
               ? destinationMode === 'private'
                 ? 'Private'
                 : 'Public'
