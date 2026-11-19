@@ -62,6 +62,10 @@ function preparedContext() {
     network: networks.bitcoin
   }).address
   if (!signer || !recipient) throw new Error('Unable to derive Bitcoin test addresses')
+  const funding = new Transaction()
+  funding.version = 2
+  funding.addInput(Buffer.alloc(32), 0xffffffff)
+  funding.addOutput(payments.p2wpkh({ pubkey: publicKey, network: networks.bitcoin }).output, 50300)
   const selection = selectBitcoinCoins({
     chainId,
     accountIndex: 0,
@@ -79,7 +83,7 @@ function preparedContext() {
         address: signer,
         derivationPath: "m/84'/0'/0'/0/0",
         publicKey: `0x${publicKey.toString('hex')}`,
-        transactionId: 'a'.repeat(64),
+        transactionId: funding.getId(),
         outputIndex: 0,
         valueSats: '50300',
         blockHeight: 899_999
@@ -89,12 +93,15 @@ function preparedContext() {
   const prepared = buildBitcoinPsbt({
     selection,
     masterFingerprint: '0x01020304',
-    lockTime: 900_000
+    lockTime: 900_000,
+    previousTransactions: [{ transactionId: funding.getId(), rawTransactionHex: funding.toHex() }]
   })
+  const fundingTransactionId = funding.getId()
   const psbt = Psbt.fromBase64(prepared.psbtBase64)
   return {
     prepared,
     signer,
+    fundingTransactionId,
     summary: {
       schema: 'bitcoin.psbt.v1',
       chainId,
@@ -106,7 +113,7 @@ function preparedContext() {
         inputs: [
           {
             index: 0,
-            transactionId: 'a'.repeat(64),
+            transactionId: funding.getId(),
             outputIndex: 0,
             amountSats: '50300',
             sequence: 0xfffffffd,
@@ -132,7 +139,7 @@ function preparedContext() {
 }
 
 function awaitingRecord() {
-  const { prepared, signer, summary } = preparedContext()
+  const { prepared, signer, summary, fundingTransactionId } = preparedContext()
   const chainAccount = {
     id: 'chain-account:bitcoin:pending',
     scope: { ...scope, chainId },
@@ -155,7 +162,7 @@ function awaitingRecord() {
       addressType: 'p2wpkh',
       transactionId,
       state: 'reserved',
-      outpoints: [{ transactionId: 'a'.repeat(64), outputIndex: 0 }],
+      outpoints: [{ transactionId: fundingTransactionId, outputIndex: 0 }],
       createdAt: 1_000,
       updatedAt: 1_000
     },

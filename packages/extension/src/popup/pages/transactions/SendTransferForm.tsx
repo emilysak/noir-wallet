@@ -75,7 +75,14 @@ export function SendTransferForm(
 
   switch (family) {
     case 'bitcoin':
-      return <BitcoinTransfer selection={selection} priceUsd={priceUsd} onSubmitted={onSubmitted} />
+      return (
+        <BitcoinTransfer
+          selection={selection}
+          priceUsd={priceUsd}
+          executionMode={executionMode}
+          onSubmitted={onSubmitted}
+        />
+      )
     case 'solana':
       return (
         <ConfiguredTransfer
@@ -164,8 +171,9 @@ function ConfiguredTransfer<
 function BitcoinTransfer({
   selection,
   priceUsd,
+  executionMode,
   onSubmitted
-}: Pick<SendTransferFormProps, 'selection' | 'priceUsd' | 'onSubmitted'>) {
+}: Pick<SendTransferFormProps, 'selection' | 'priceUsd' | 'executionMode' | 'onSubmitted'>) {
   const {
     input,
     feeTier,
@@ -176,6 +184,7 @@ function BitcoinTransfer({
     changeReviewFeeTier
   } = useBitcoinSendTransfer({
     selection,
+    executionMode,
     onSubmitted: value => onSubmitted({ family: 'bitcoin', value })
   })
 

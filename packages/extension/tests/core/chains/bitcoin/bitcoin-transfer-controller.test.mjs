@@ -81,6 +81,15 @@ function harness(options = {}) {
         changeReservation: null,
         inputReservation: { marker: 'inputs' }
       }
+    },
+    preparePrivate: async input => {
+      calls.push(['preparation.private', input])
+      return {
+        prepared: { marker: 'private' },
+        signerAddress: options.privateAddress ?? sender,
+        changeReservation: null,
+        inputReservation: { marker: 'inputs' }
+      }
     }
   }
   const orchestrator = {
@@ -106,18 +115,99 @@ function harness(options = {}) {
     preparation,
     orchestrator,
     loadActiveContext: async () => (options.noContext ? null : context),
-    scanActive: async () =>
-      options.mismatchedDiscovery
+    scanActive: async () => {
+      if (options.rejectScan) throw new Error('public discovery must not be scanned')
+      return options.mismatchedDiscovery
         ? {
             ...discovery,
             chainAccount: { ...chainAccount, id: 'chain-account:bitcoin:other' }
           }
-        : discovery,
+        : discovery
+    },
     getAddressType: options.activeAddressType ? async () => options.activeAddressType : undefined,
     requiredConfirmations: 6,
-    createId: () => 'fixed'
+    createId: () => 'fixed',
+    ...(options.privateAddress
+      ? {
+          resolvePrivateExecutionAccount: async () => ({
+            address: options.privateAddress,
+            publicKey: `0x${'11'.repeat(33)}`
+          })
+        }
+      : {})
   })
   return { controller, calls, recipient, chainAccount }
+}
+
+function privateIntent(testHarness) {
+  return { recipient: testHarness.recipient, amount: { mode: 'exact', valueSats: '50000' } }
+}
+
+function nearIntentsQuoteBinding(testHarness) {
+  return {
+    schemaVersion: 1,
+    provider: 'near-intents',
+    kind: 'swap',
+    depositAddress: testHarness.recipient,
+    refundAddress: testHarness.chainAccount.identity.value,
+    expiresAt: 5_000,
+    origin: {
+      chainId,
+      assetId: `${chainId}/slip44:0`,
+      protocolAssetId: 'nep141:btc.omft.near'
+    },
+    destination: {
+      chainId: 'bip122:00040fe8ec8471911baa1db1266ea15d',
+      assetId: 'bip122:00040fe8ec8471911baa1db1266ea15d/slip44:133',
+      protocolAssetId: 'nep141:zec.omft.near',
+      recipient: 'u1destination',
+      expectedAmountRaw: '100',
+      minimumAmountRaw: '99'
+    }
+  }
+}
+
+function rheaQuoteBinding(testHarness) {
+  return {
+    schemaVersion: 1,
+    provider: 'rhea-cross-chain-dex',
+    kind: 'swap',
+    quoteHandle: 'rhea-quote:private',
+    executionId: 'execution-private',
+    router: 'nearintents',
+    sourceTarget: testHarness.recipient,
+    sender: testHarness.chainAccount.identity.value,
+    originAmountRaw: '50000',
+    expiresAt: 5_000,
+    isCrossChain: true,
+    origin: {
+      chainId,
+      assetId: `${chainId}/slip44:0`,
+      protocolChainId: 'btc',
+      protocolAssetId: 'btc'
+    },
+    destination: {
+      chainId: 'bip122:00040fe8ec8471911baa1db1266ea15d',
+      assetId: 'bip122:00040fe8ec8471911baa1db1266ea15d/slip44:133',
+      protocolChainId: 'zcash',
+      protocolAssetId: 'nep141:zec.omft.near',
+      recipient: 'u1destination',
+      expectedAmountRaw: '100',
+      minimumAmountRaw: '99'
+    }
+  }
+}
+
+function preparePrivate(controller, testHarness, nearIntentsBinding, rheaSwapBinding) {
+  return controller.prepare(
+    privateIntent(testHarness),
+    nearIntentsBinding,
+    'standard',
+    'p2tr',
+    undefined,
+    rheaSwapBinding,
+    'private'
+  )
 }
 
 test('prepares a default BIP-84 transfer from active discovery without accepting address policy input', async () => {
@@ -288,4 +378,156 @@ test('derives continuation scope from the active Account', async () => {
   await expect(
     missing.controller.approve('transaction:bitcoin:fixed', 'a'.repeat(64))
   ).rejects.toThrow(/no Bitcoin ChainAccount/)
+})
+
+test('private Bitcoin send prepares only the PEA and does not scan public discovery', async () => {
+  const pea = addressFor(9)
+  const testHarness = harness({ privateAddress: pea, rejectScan: true })
+  await testHarness.controller.prepare(
+    { recipient: testHarness.recipient, amount: { mode: 'exact', valueSats: '50000' } },
+    undefined,
+    'standard',
+    'p2tr',
+    undefined,
+    undefined,
+    'private'
+  )
+
+  expect(testHarness.calls.map(call => call[0])).toEqual([
+    'orchestrator.expire',
+    'preparation.private',
+    'orchestrator.prepare'
+  ])
+  expect(testHarness.calls[1][1]).toMatchObject({
+    privateExecutionAddress: pea,
+    publicReceiveAddress: testHarness.chainAccount.identity.value,
+    feeTargetBlocks: 6
+  })
+  expect(testHarness.calls[1][1].addressType).toBeUndefined()
+  expect(testHarness.calls[2][1]).toMatchObject({
+    signerAddress: pea,
+    signingFamily: 'bitcoin-pea',
+    signingMode: 'internal'
+  })
+  expect(testHarness.calls[2][1].nearIntentsBinding).toBeUndefined()
+  expect(testHarness.calls[2][1].rheaSwapBinding).toBeUndefined()
+})
+
+test('private Bitcoin send stores exactly one quote binding on the PEA PSBT', async () => {
+  const pea = addressFor(9)
+  const nearHarness = harness({ privateAddress: pea, rejectScan: true })
+  const nearBinding = nearIntentsQuoteBinding(nearHarness)
+  await preparePrivate(nearHarness.controller, nearHarness, nearBinding, undefined)
+
+  expect(nearHarness.calls.map(call => call[0])).toEqual([
+    'orchestrator.expire',
+    'preparation.private',
+    'orchestrator.prepare'
+  ])
+  expect(nearHarness.calls[1][1]).toMatchObject({
+    recipient: nearHarness.recipient,
+    privateExecutionAddress: pea,
+    publicReceiveAddress: nearHarness.chainAccount.identity.value
+  })
+  expect(nearHarness.calls[1][1].addressType).toBeUndefined()
+  expect(nearHarness.calls[1][1].nearIntentsBinding).toBeUndefined()
+  expect(nearHarness.calls[1][1].rheaSwapBinding).toBeUndefined()
+  expect(nearHarness.calls[2][1]).toMatchObject({
+    signerAddress: pea,
+    signingFamily: 'bitcoin-pea',
+    signingMode: 'internal',
+    nearIntentsBinding: nearBinding
+  })
+  expect(nearHarness.calls[2][1].signerAddress).not.toBe(nearHarness.chainAccount.identity.value)
+  expect(nearHarness.calls[2][1].rheaSwapBinding).toBeUndefined()
+
+  const rheaHarness = harness({ privateAddress: addressFor(8), rejectScan: true })
+  const rheaBinding = rheaQuoteBinding(rheaHarness)
+  await preparePrivate(rheaHarness.controller, rheaHarness, undefined, rheaBinding)
+
+  expect(rheaHarness.calls.map(call => call[0])).toEqual([
+    'orchestrator.expire',
+    'preparation.private',
+    'orchestrator.prepare'
+  ])
+  expect(rheaHarness.calls[2][1]).toMatchObject({
+    signerAddress: addressFor(8),
+    signingFamily: 'bitcoin-pea',
+    signingMode: 'internal',
+    rheaSwapBinding: rheaBinding
+  })
+  expect(rheaHarness.calls[2][1].nearIntentsBinding).toBeUndefined()
+})
+
+test('private Bitcoin send rejects two quote bindings before preparing', async () => {
+  const testHarness = harness({ privateAddress: addressFor(9), rejectScan: true })
+  await expect(
+    preparePrivate(
+      testHarness.controller,
+      testHarness,
+      nearIntentsQuoteBinding(testHarness),
+      rheaQuoteBinding(testHarness)
+    )
+  ).rejects.toThrow(/cannot bind multiple swap protocols/)
+  expect(testHarness.calls).toEqual([])
+})
+
+test('missing or hardware PEA does not select a public Bitcoin spend', async () => {
+  const missing = harness({ rejectScan: true })
+  await expect(
+    missing.controller.prepare(
+      { recipient: missing.recipient, amount: { mode: 'exact', valueSats: '50000' } },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'private'
+    )
+  ).rejects.toThrow(/Bitcoin private execution address is unavailable/)
+  expect(missing.calls).toEqual([])
+
+  const hardware = harness({
+    hardware: true,
+    privateAddress: addressFor(9),
+    rejectScan: true
+  })
+  await expect(
+    hardware.controller.prepare(
+      { recipient: hardware.recipient, amount: { mode: 'exact', valueSats: '50000' } },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'private'
+    )
+  ).rejects.toThrow(/Bitcoin private send is unavailable/)
+  expect(hardware.calls).toEqual([])
+
+  const missingWithQuote = harness({ rejectScan: true })
+  await expect(
+    preparePrivate(
+      missingWithQuote.controller,
+      missingWithQuote,
+      nearIntentsQuoteBinding(missingWithQuote),
+      undefined
+    )
+  ).rejects.toThrow(/Bitcoin private execution address is unavailable/)
+  expect(missingWithQuote.calls).toEqual([])
+
+  const hardwareWithQuote = harness({
+    hardware: true,
+    privateAddress: addressFor(9),
+    rejectScan: true
+  })
+  await expect(
+    preparePrivate(
+      hardwareWithQuote.controller,
+      hardwareWithQuote,
+      undefined,
+      rheaQuoteBinding(hardwareWithQuote)
+    )
+  ).rejects.toThrow(/Bitcoin private send is unavailable/)
+  expect(hardwareWithQuote.calls).toEqual([])
 })

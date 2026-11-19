@@ -13,9 +13,13 @@ import {
   type SigningCommandId,
   type SigningResult
 } from '@/core/keyring/ports'
-import type { BitcoinSigningPreparePayload } from '@/infrastructure/chains/bitcoin'
+import type {
+  BitcoinPeaSigningPreparePayload,
+  BitcoinSigningPreparePayload
+} from '@/infrastructure/chains/bitcoin'
 import {
   assertExactKeys,
+  parseRawBitcoinPeaAccount,
   readBoolean,
   readLiteral,
   readRecord,
@@ -52,11 +56,10 @@ export interface BitcoinBip322SigningPreparePayload {
 
 export type BitcoinMultichainSigningPreparePayload =
   | BitcoinSigningPreparePayload
+  | BitcoinPeaSigningPreparePayload
   | BitcoinBip322SigningPreparePayload
 
-function toRawBitcoinAddressType(
-  addressType: BitcoinMultichainSigningPreparePayload['addressType']
-) {
+function toRawBitcoinAddressType(addressType: 'p2pkh' | 'p2sh-p2wpkh' | 'p2wpkh' | 'p2tr') {
   return addressType === 'p2sh-p2wpkh' ? 'p2sh_p2wpkh' : addressType
 }
 
@@ -197,6 +200,16 @@ function parseCancelledSigning(value: unknown): boolean {
   return readBoolean(record.cancelled, 'cancelled Bitcoin signing state')
 }
 
+export interface BitcoinPeaAccount {
+  readonly address: string
+  readonly publicKey: string
+  readonly curve: 'secp256k1'
+  readonly derivationScheme: 'pea_v2'
+  readonly parent: Readonly<{ readonly accountIndex: number }>
+  readonly chainId: string
+  readonly addressType: 'p2wpkh'
+}
+
 export class BitcoinMultichainSigningClient {
   private readonly commandClient: MultichainCommandClient
 
@@ -214,16 +227,53 @@ export class BitcoinMultichainSigningClient {
     )
   }
 
+  async deriveBitcoinPea(
+    keyDomainId: KeyDomainId,
+    accountIndex: number,
+    chainId: ChainId,
+    signal?: AbortSignal
+  ): Promise<BitcoinPeaAccount> {
+    const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
+    return this.commandClient.execute(
+      {
+        operation: 'account.derive-public',
+        binding,
+        payload: { family: 'bitcoin-pea', accountIndex, chainId },
+        signal
+      },
+      value => {
+        const account = parseRawBitcoinPeaAccount(value, accountIndex, chainId)
+        return Object.freeze({
+          address: account.address,
+          publicKey: account.publicKey,
+          curve: account.curve,
+          derivationScheme: account.derivationScheme,
+          parent: account.parent,
+          chainId: account.chainId,
+          addressType: account.addressType
+        })
+      }
+    )
+  }
+
   async prepare(
     keyDomainId: KeyDomainId,
     payload: BitcoinMultichainSigningPreparePayload,
     signal?: AbortSignal
   ): Promise<PreparedSigningCommand> {
     const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
-    const workerPayload = Object.freeze({
-      ...payload,
-      addressType: toRawBitcoinAddressType(payload.addressType)
-    })
+    const workerPayload =
+      payload.kind === 'pea-bitcoin-psbt'
+        ? Object.freeze({
+            kind: payload.kind,
+            chainId: payload.chainId,
+            accountIndex: payload.accountIndex,
+            psbt: payload.psbt
+          })
+        : Object.freeze({
+            ...payload,
+            addressType: toRawBitcoinAddressType(payload.addressType)
+          })
     return this.commandClient.execute(
       {
         operation: 'signing.prepare',

@@ -7,6 +7,7 @@ import { parseAssetId } from '@/core/chains/registry'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
 import { supportsNearPrivateExecution } from '@/core/chains/near'
 import {
+  resolveBitcoinFeatureRuntimePolicy,
   resolveNearFeatureRuntimePolicy,
   resolveSolanaFeatureRuntimePolicy
 } from '@/core/chains/feature-runtime-policy'
@@ -85,6 +86,9 @@ import { getFundingSourceUnavailableReason } from '@/core/wallet/funding-source'
 import { getConfidentialZcashMoveRecipients } from '@/popup/services/zcash-self-move'
 import type { KeySource } from '@/types/wallet'
 
+const bitcoinOperationsEnabled = resolveBitcoinFeatureRuntimePolicy(
+  __ENABLED_CHAIN_FEATURE_FLAGS__
+).newOperationsEnabled
 const solanaOperationsEnabled = resolveSolanaFeatureRuntimePolicy(
   __ENABLED_CHAIN_FEATURE_FLAGS__
 ).newOperationsEnabled
@@ -285,10 +289,20 @@ export function AssetDetail() {
     /^[0-9a-f]{64}$/.test(nearPrivateExecutionAddress) &&
     nearPrivateExecutionAddress !== nearMainAddress
   )
+  const bitcoinAccountNetwork = storageV2Account?.networks.find(
+    network => network.chain.id === chain?.chain.id && network.chain.family === 'bitcoin'
+  )
+  const bitcoinPrivateExecutionAddress = bitcoinAccountNetwork?.privateExecutionAddress
+  const bitcoinPrivateReady = Boolean(
+    bitcoinOperationsEnabled &&
+    storageV2Account?.walletSource.kind !== 'hardware' &&
+    bitcoinPrivateExecutionAddress
+  )
   const refreshConfidentialBalances =
     privateTransferEligible ||
     solanaPrivateEligible ||
     nearPrivateSwapReady ||
+    bitcoinPrivateReady ||
     (chain?.chain.family === 'zcash' &&
       getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length > 0)
   const categories =
@@ -296,7 +310,11 @@ export function AssetDetail() {
       ? getAssetDetailCategories(
           asset,
           visibleModel,
-          chain?.chain.family === 'solana' ? solanaPrivateEligible : privateTransferEligible,
+          chain?.chain.family === 'solana'
+            ? solanaPrivateEligible
+            : chain?.chain.family === 'bitcoin'
+              ? bitcoinPrivateReady
+              : privateTransferEligible,
           findAssetPrice(displayPrices, asset.asset.id)?.priceUsd
         )
       : null
@@ -314,13 +332,16 @@ export function AssetDetail() {
   const privateExecutionChain =
     chain?.chain.family === 'evm' ||
     chain?.chain.family === 'solana' ||
-    chain?.chain.family === 'near'
+    chain?.chain.family === 'near' ||
+    (chain?.chain.family === 'bitcoin' && bitcoinPrivateReady)
   const privateMoveReady =
-    chain?.chain.family === 'solana'
-      ? solanaPrivateActions && currentNetwork === 'mainnet'
-      : chain?.chain.family === 'near'
-        ? nearPrivateSwapReady
-        : privateTransferEligible
+    chain?.chain.family === 'bitcoin'
+      ? bitcoinPrivateReady
+      : chain?.chain.family === 'solana'
+        ? solanaPrivateActions && currentNetwork === 'mainnet'
+        : chain?.chain.family === 'near'
+          ? nearPrivateSwapReady
+          : privateTransferEligible
   const privateDomainRequested =
     searchParams.get('domain') === 'private' ||
     (searchParams.get('domain') !== 'public' && searchParams.get('mode') === 'private')
@@ -329,7 +350,8 @@ export function AssetDetail() {
     (privateExecutionChain ? privateMoveReady : chain?.chain.family !== 'evm' || privateTransferEligible)
       ? 'private'
       : 'public'
-  const showPrivateMove = actionDomain === 'private' && privateExecutionChain
+  const showPrivateMove =
+    actionDomain === 'private' && privateExecutionChain && chain?.chain.family !== 'bitcoin'
   const activityFilterDomain = searchParams.get('history') === 'shield' ? 'shield' : undefined
   useEffect(() => {
     if (!refreshConfidentialBalances || !effectiveWalletId || !effectiveAccountId) return
@@ -881,7 +903,11 @@ export function AssetDetail() {
     },
     {
       domain: 'private',
-      address: privateTransferEligible ? accountNetwork?.privateExecutionAddress : undefined,
+      address: privateTransferEligible
+        ? accountNetwork?.privateExecutionAddress
+        : bitcoinPrivateReady
+          ? bitcoinPrivateExecutionAddress
+          : undefined,
       label: 'View Private address'
     }
   ].flatMap(({ domain, address, label }) => {
@@ -1172,7 +1198,7 @@ export function AssetDetail() {
           </section>
         )}
 
-        {bitcoinCatalog && (
+        {bitcoinCatalog && actionDomain !== 'private' && (
           <section className="border-t border-border py-4" aria-label="Bitcoin accounts">
             <div className="flex items-start justify-between gap-4">
               <div>

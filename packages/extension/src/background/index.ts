@@ -167,6 +167,7 @@ import {
 import { createBackgroundEvmPortfolioCoordinator } from './evm-portfolio'
 import { createBackgroundPortfolioCoordinator } from './portfolio'
 import { createBackgroundActivityCoordinator } from './activity'
+import { setBitcoinPrivateExecutionAddressReader } from './bitcoin-private-execution-address'
 import {
   observeActivityReceipts,
   observePortfolioBalances,
@@ -255,6 +256,7 @@ import {
   CONFIDENTIAL_FUNDING_MONITOR_ALARM,
   createBackgroundConfidentialFundingCoordinator
 } from './confidential-funding'
+import { createBitcoinConfidentialDepositClient } from './bitcoin-confidential-deposit-client'
 import type { ConfidentialFundingCoordinator } from './confidential-funding-coordinator'
 import type { NativeZecIntentsSwapReview } from '@/core/services/native-zec-intents-swap'
 import { getConfidentialFundingMessageHandler } from './confidential-funding-messages'
@@ -1313,6 +1315,15 @@ async function reloadMultichainRuntime(
     },
     accountNetworksSolanaPeaDerivation
   )
+  setBitcoinPrivateExecutionAddressReader(async request => {
+    const catalog = await accountNetworksCoordinator.readCatalog()
+    const account = catalog?.accounts.find(
+      item => item.walletId === request.keyDomainId && item.accountId === request.accountId
+    )
+    if (!account || account.walletSource.kind === 'hardware') return undefined
+    return account.networks.find(network => network.chainId === request.chainId)
+      ?.privateExecutionAddress
+  })
   const evmTransferRuntime =
     evmFeatureRuntimePolicy.newOperationsEnabled && hasBackgroundEvmTransferCapability(activeEvm)
       ? createBackgroundEvmTransferRuntime(
@@ -1417,6 +1428,11 @@ async function reloadMultichainRuntime(
     bitcoinFeatureRuntimePolicy.newOperationsEnabled && hasBackgroundBitcoinTransferCapability()
       ? createBackgroundBitcoinTransferController()
       : null
+  confidentialFundingCoordinator?.attachBitcoinDepositClient(
+    bitcoinTransferController
+      ? createBitcoinConfidentialDepositClient(bitcoinTransferController)
+      : null
+  )
   solanaTransferController = solanaOperationsEnabled
     ? createBackgroundSolanaTransferController(intentsProtocolAssets, settings)
     : null
@@ -5031,7 +5047,8 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
             message.feeTier,
             message.bitcoinAddressType,
             undefined,
-            message.rheaSwapBinding
+            message.rheaSwapBinding,
+            message.executionMode
           )
         : message.type === 'GET_PENDING_BITCOIN_TRANSFER'
           ? bitcoinTransferController.getPendingApproval(message.transactionId)

@@ -150,6 +150,10 @@ import {
   supportsSolanaPrivateExecution
 } from '@/core/chains/solana'
 import { supportsNearPrivateExecution } from '@/core/chains/near'
+import {
+  parseSupportedBitcoinAddress,
+  supportsBitcoinPrivateExecution
+} from '@/core/chains/bitcoin'
 import { InlineError } from '../../components/common/InlineError'
 import { ZcashSyncProgress } from '../../components/common/ZcashSyncProgress'
 import { useZcashSyncReadStatus } from '@/popup/hooks/usePersistedExtensionContextSync'
@@ -189,6 +193,10 @@ import { logger } from '@/lib/logger'
 import { EvmWalletClientError, evmWalletClient } from '@/popup/services/evm-wallet-client'
 import { resolveSelectedSwapMaximum } from '@/popup/services/swap-maximum'
 import { resolveNativeRouteMaximum } from '@/popup/services/transfer-maximum'
+import {
+  assertBitcoinDirectMovePreparedOutputs,
+  settleBitcoinDirectMoveQuote
+} from '@/popup/services/move-method-estimate'
 import {
   createRheaSwapBinding,
   listWalletSwapSourceTokens,
@@ -246,7 +254,8 @@ import { toWalletEvmSwapToken } from '@/popup/services/token-address-discovery'
 import {
   buildPublicPrivateEvmSendPath,
   isPrivateFundingDestinationChain,
-  parsePublicPrivateEvmSwapRoute
+  parsePublicPrivateEvmSwapRoute,
+  resolvePrivateFundingSourceChainId
 } from '@/popup/services/evm-send-validation'
 import { requiredRheaEvmApproval } from '@/popup/services/rhea-evm-approval'
 import { swapApprovalContinuationClient } from '@/popup/services/swap-approval-continuation-client'
@@ -645,8 +654,38 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       )
     })
   )
+  const bitcoinPrivateExecutionSupported = Boolean(
+    storageV2Account?.networks.some(network => {
+      if (
+        network.chain.family !== 'bitcoin' ||
+        !supportsBitcoinPrivateExecution(
+          storageV2Account.walletSource,
+          storageV2Account.accountIndex,
+          network.chain.id
+        )
+      ) {
+        return false
+      }
+      const mainAddress =
+        network.addresses.find(address => address.preferredForReceive)?.value ??
+        network.addresses[0]?.value
+      const privateAddress = network.privateExecutionAddress
+      if (!mainAddress || !privateAddress || privateAddress === mainAddress) return false
+      try {
+        return (
+          parseSupportedBitcoinAddress(privateAddress, network.chain.id, 'p2wpkh') ===
+          privateAddress
+        )
+      } catch {
+        return false
+      }
+    })
+  )
   const privateExecutionSupported =
-    evmPrivateExecutionSupported || solanaPrivateExecutionSupported || nearPrivateExecutionSupported
+    evmPrivateExecutionSupported ||
+    solanaPrivateExecutionSupported ||
+    nearPrivateExecutionSupported ||
+    bitcoinPrivateExecutionSupported
   const confidentialShieldAvailable =
     getPrivateTransferChainIds(storageV2Account, currentNetwork === 'mainnet').length > 0
   const nativeZecConfidentialAvailable = Boolean(
@@ -798,7 +837,9 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         ? storageV2Account?.networks.find(
             network => network.chain.family === 'near' && network.chain.network.kind === 'mainnet'
           )?.chain.id
-        : undefined
+        : bitcoinPrivateExecutionSupported
+          ? storageV2Account?.networks.find(network => network.chain.family === 'bitcoin')?.chain.id
+          : undefined
   const swap = useSwapState(
     lockedAssetFlowRequested || crossChainSendRequested ? null : swapPreferenceScope,
     {
@@ -812,11 +853,10 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       enabledChainsError: accountNetworksError,
       defaultSourceChainId:
         isPrivateFunding && privateFundingDestinationChain
-          ? /^\d+$/.test(privateFundingDestinationChain)
-            ? `eip155:${privateFundingDestinationChain}`
-            : storageV2Account?.networks.find(
-                network => network.chain.family === privateFundingDestinationChain
-              )?.chain.id
+          ? resolvePrivateFundingSourceChainId(
+              privateFundingDestinationChain,
+              storageV2Account?.networks ?? []
+            )
           : shieldNativeZecSwap
             ? storageV2Account?.networks.find(network => network.chain.family === 'zcash')?.chain.id
             : !crossChainSendRequested &&
@@ -1512,7 +1552,10 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
     if (
       !walletSourceQuoteTarget ||
       (!confidentialMove &&
-        !(privateExecutionSupported && (kind === 'evm' || kind === 'solana' || kind === 'near')))
+        !(
+          privateExecutionSupported &&
+          (kind === 'evm' || kind === 'solana' || kind === 'near' || kind === 'bitcoin')
+        ))
     ) {
       return undefined
     }
@@ -1561,7 +1604,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           (walletOwnedSourceBase?.family === 'evm' ||
             swap.isZecSource ||
             walletOwnedSourceBase?.family === 'solana' ||
-            walletOwnedSourceBase?.family === 'near')
+            walletOwnedSourceBase?.family === 'near' ||
+            walletOwnedSourceBase?.family === 'bitcoin')
         ? 'private'
         : resolveSwapExecutionSourceMode({
             requestedMode: sourceMode,
@@ -1779,6 +1823,17 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           )
         )
       }
+      if (target?.kind === 'bitcoin') {
+        if (!privateAddress || privateAddress === target.address) return false
+        try {
+          return (
+            parseSupportedBitcoinAddress(privateAddress, target.chain.id, 'p2wpkh') ===
+            privateAddress
+          )
+        } catch {
+          return false
+        }
+      }
       if (
         target?.kind !== 'evm' ||
         !privateAddress ||
@@ -1933,7 +1988,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       !privateExecutionSupported ||
       (walletDestinationTarget?.kind !== 'evm' &&
         walletDestinationTarget?.kind !== 'solana' &&
-        walletDestinationTarget?.kind !== 'near')
+        walletDestinationTarget?.kind !== 'near' &&
+        walletDestinationTarget?.kind !== 'bitcoin')
     ) {
       return undefined
     }
@@ -1976,24 +2032,37 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const confidentialFundingPrivateAddress =
     isPrivateFunding &&
     walletDestinationTarget &&
-    (walletDestinationTarget.kind === 'near' || walletDestinationTarget.kind === 'solana')
+    (walletDestinationTarget.kind === 'near' ||
+      walletDestinationTarget.kind === 'solana' ||
+      walletDestinationTarget.kind === 'bitcoin')
       ? storageV2Account?.networks.find(
           network => network.chain.id === walletDestinationTarget.chain.id
         )?.privateExecutionAddress
       : undefined
+  // Bitcoin confidential funding pays the private address. The public receive address is not a fallback.
+  const confidentialFundingRecipient =
+    walletDestinationTarget?.kind === 'bitcoin'
+      ? confidentialFundingPrivateAddress &&
+        confidentialFundingPrivateAddress !== walletDestinationTarget.address
+        ? confidentialFundingPrivateAddress
+        : undefined
+      : confidentialFundingPrivateAddress
   const managedDestinationAddress = isZecDestination
     ? currentAccount?.addresses[zecDestinationType]
     : ordinarySwapRequested && destinationMode === 'private'
       ? (walletDestinationTarget?.kind === 'evm' ||
           walletDestinationTarget?.kind === 'solana' ||
-          walletDestinationTarget?.kind === 'near') &&
+          walletDestinationTarget?.kind === 'near' ||
+          walletDestinationTarget?.kind === 'bitcoin') &&
         swap.tokenOut &&
         supportsPrivateDestination(swap.tokenOut, 'private')
         ? destinationPrivateExecutionAddress
         : undefined
       : isPrivateFunding &&
-          (walletDestinationTarget?.kind === 'near' || walletDestinationTarget?.kind === 'solana')
-        ? confidentialFundingPrivateAddress
+          (walletDestinationTarget?.kind === 'near' ||
+            walletDestinationTarget?.kind === 'solana' ||
+            walletDestinationTarget?.kind === 'bitcoin')
+        ? confidentialFundingRecipient
         : (isPrivateFunding || destinationMode === 'private') &&
             walletDestinationTarget?.kind === 'evm'
           ? destinationPrivateExecutionAddress
@@ -2040,13 +2109,19 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         ? resolvedRecipientAddress === publicPrivacySendRoute.recipient
         : resolvedRecipientAddress.toLowerCase() ===
           publicPrivacySendRoute.recipient.toLowerCase()))
+  const bitcoinPrivateQuote =
+    privateSwapRequested &&
+    executionSourceMode === 'private' &&
+    walletSourceQuoteTarget?.kind === 'bitcoin'
   const resolvedRefundAddress = swap.isZecSource
     ? shieldNativeZecSwap
       ? currentAccount?.addresses.transparent || ''
       : currentAccount?.addresses[fundingSource] || ''
-    : !isPrivateFunding && executionSourceMode === 'private'
-      ? walletOwnedSource?.refundAddress || ''
-      : walletSourceQuoteTarget?.address || ''
+    : bitcoinPrivateQuote
+      ? sourcePrivateExecutionAddress || ''
+      : !isPrivateFunding && executionSourceMode === 'private'
+        ? walletOwnedSource?.refundAddress || ''
+        : walletSourceQuoteTarget?.address || ''
   const publicPrivacySendFundingReady =
     !publicPrivacySendRequested ||
     (executionSourceMode === 'main' &&
@@ -2969,6 +3044,15 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
     setMaxSelected(true)
     swap.updateAmountIn(maximum)
   }
+  const bitcoinPrivateSpendable =
+    bitcoinPrivateQuote && !walletOwnedSource && walletOwnedSourceBase
+      ? resolvePortfolioTransferAvailability({
+          balanceRaw: walletOwnedSourceBase.asset.balance.privateRaw ?? '0',
+          decimals: walletOwnedSourceBase.asset.metadata.decimals,
+          isNative: walletOwnedSourceBase.asset.asset.kind === 'native',
+          maximumRaw: null
+        }).display
+      : undefined
   const solanaPrivateBalance =
     executionSourceMode === 'private' &&
     (swap.tokenIn?.rheaChainId === 'solana' || swap.tokenIn?.blockchain === 'sol')
@@ -2992,7 +3076,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       : undefined
   const spendableBalance = swap.isZecSource
     ? zcashAvailability.amount
-    : (walletAvailability?.display ?? (solanaPrivateBalance ? '0' : '—'))
+    : (walletAvailability?.display ?? bitcoinPrivateSpendable ?? (solanaPrivateBalance ? '0' : '—'))
   useEffect(() => {
     if (
       nativeMaximum === null ||
@@ -3032,14 +3116,24 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const zcashAmountErrorCopy = getFundingAmountErrorCopy(zcashAmountError)
   const hasInsufficientFunds = swap.isZecSource
     ? zcashAmountError !== null
-    : isSwapSourceAmountInsufficient({
-        isZecSource: swap.isZecSource,
-        amount: swap.amountIn,
-        amountRaw: walletAmountRaw,
-        sourceAvailableRaw: walletOwnedSource?.asset.balance.availableRaw ?? null,
-        sourceSelected: !!swap.tokenIn,
-        zcashAvailable: zcashAvailability.amount
-      })
+    : bitcoinPrivateQuote && !walletOwnedSource
+      ? walletOwnedSourceBase?.asset.balance.privateRaw !== undefined &&
+        isSwapSourceAmountInsufficient({
+          isZecSource: swap.isZecSource,
+          amount: swap.amountIn,
+          amountRaw: walletAmountRaw,
+          sourceAvailableRaw: walletOwnedSourceBase.asset.balance.privateRaw,
+          sourceSelected: !!swap.tokenIn,
+          zcashAvailable: zcashAvailability.amount
+        })
+      : isSwapSourceAmountInsufficient({
+          isZecSource: swap.isZecSource,
+          amount: swap.amountIn,
+          amountRaw: walletAmountRaw,
+          sourceAvailableRaw: walletOwnedSource?.asset.balance.availableRaw ?? null,
+          sourceSelected: !!swap.tokenIn,
+          zcashAvailable: zcashAvailability.amount
+        })
   const hasInvalidWalletAmount =
     !!walletOwnedSource &&
     !!swap.amountIn &&
@@ -3173,12 +3267,16 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           ? resolveWalletQuoteReceiveTarget(destination, portfolio, receiveTargets)
           : null
       const exactPrivateDestination =
-        typeof target !== 'string' && (target?.kind === 'solana' || target?.kind === 'near')
+        typeof target !== 'string' &&
+        (target?.kind === 'solana' || target?.kind === 'near' || target?.kind === 'bitcoin')
       const expectedAddress =
         typeof target === 'string'
           ? target
           : record.sourceMode === 'private' &&
-              (target?.kind === 'evm' || target?.kind === 'solana' || target?.kind === 'near')
+              (target?.kind === 'evm' ||
+                target?.kind === 'solana' ||
+                target?.kind === 'near' ||
+                target?.kind === 'bitcoin')
             ? privateExecutionAddresses.get(target.chain.id)
             : target?.address
       const recipientChanged =
@@ -3671,7 +3769,19 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             throw new Error('Insufficient ZEC for the network fee')
           }
         } else {
-          if (!walletOwnedSource) throw new Error('The selected source asset is unavailable')
+          if (!walletOwnedSource) {
+            if (bitcoinPrivateQuote) {
+              throw new Error('Private Bitcoin swap cannot be signed from the public address.')
+            }
+            throw new Error('The selected source asset is unavailable')
+          }
+          if (
+            bitcoinPrivateQuote &&
+            walletOwnedSource.family === 'bitcoin' &&
+            walletOwnedSource.refundAddress !== sourcePrivateExecutionAddress
+          ) {
+            throw new Error('Private Bitcoin swap cannot be signed from the public address.')
+          }
           const destination = resolveRheaSwapDestinationIdentity(tokenOut, portfolio)
           const binding = createRheaSwapBinding({
             source: walletOwnedSource,
@@ -3712,7 +3822,22 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             if (!review.execution.target || review.execution.amountRaw !== review.amountIn) {
               throw new Error('RHEA Swap Bitcoin build does not match the quoted source amount')
             }
-            const depositAddress = review.execution.target
+            let depositAddress = review.execution.target
+            if (privateBalanceTransferRequested) {
+              const settlement = settleBitcoinDirectMoveQuote({
+                chainId: walletOwnedSource.chain.chain.id,
+                sourceAddress: walletOwnedSource.refundAddress,
+                counterpartyAddress: resolvedRecipientAddress,
+                quote: {
+                  failed: false,
+                  routeMissing: false,
+                  executionKind: review.execution.kind,
+                  depositAddress: review.execution.target
+                }
+              })
+              if (settlement.kind !== 'deposit') throw new Error(settlement.error)
+              depositAddress = settlement.depositAddress
+            }
             prepared = await measure('bitcoin-prepare-deposit', () =>
               quoteDepositTransferClient.prepare({
                 source: walletOwnedSource,
@@ -3722,6 +3847,19 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
                 feeTier: feeTierOverride ?? networkFeeTier
               })
             )
+            if (privateBalanceTransferRequested && prepared.family === 'bitcoin') {
+              try {
+                assertBitcoinDirectMovePreparedOutputs({
+                  depositAddress,
+                  amountRaw: review.amountIn,
+                  summary: prepared.review.review.summary
+                })
+              } catch (error) {
+                await quoteDepositTransferClient.reject(prepared).catch(() => {})
+                prepared = null
+                throw error
+              }
+            }
           } else if (
             walletOwnedSource.family === 'evm' &&
             review.execution.kind === 'evm-transaction'
@@ -4081,6 +4219,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       isPrivateFunding,
       crossChainSendRequested,
       quotePurpose,
+      bitcoinPrivateQuote,
+      sourcePrivateExecutionAddress,
       mainWalletOwnedSource,
       walletDestinationTarget,
       privateFundingRequestId,
@@ -7373,7 +7513,13 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       : null) ??
     (isPrivateFunding && !swap.destinationTokensLoading && !privateFundingDestinationToken
       ? 'This asset is not available for Confidential transfers.'
-      : swap.quoteError)
+      : isPrivateFunding &&
+          walletDestinationTarget?.kind === 'bitcoin' &&
+          !walletSourcesLoading &&
+          !swap.destinationTokensLoading &&
+          !confidentialFundingRecipient
+        ? 'Private receive account unavailable'
+        : swap.quoteError)
   const preparingSimplifiedTransfer =
     lockedAssetFlowRequested && autoReviewRequested && viewStep === 'input'
   const publicPrivacySendInitializing =

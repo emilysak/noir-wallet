@@ -252,6 +252,19 @@ function parseNetwork(value: unknown, chains: AddressGatedChainRegistry): Accoun
         throw new Error('Invalid Confidential address')
       }
       privateExecutionAddress = rawPrivateExecutionAddress
+    } else if (chain.family === 'bitcoin') {
+      if (typeof rawPrivateExecutionAddress !== 'string' || conflictsWithListedAddress) {
+        throw new Error('Invalid Confidential address')
+      }
+      try {
+        privateExecutionAddress = parseSupportedBitcoinAddress(
+          rawPrivateExecutionAddress,
+          chain.id,
+          'p2wpkh'
+        )
+      } catch {
+        throw new Error('Invalid Confidential address')
+      }
     } else if (
       chain.family !== 'evm' ||
       typeof rawPrivateExecutionAddress !== 'string' ||

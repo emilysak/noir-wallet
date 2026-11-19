@@ -38,6 +38,7 @@ import { Skeleton } from '../components/ui/skeleton'
 import { MultichainActivityDetail } from '../components/transaction/MultichainActivityDetail'
 import type { ActivityItem } from '@/core/activity'
 import {
+  resolveBitcoinFeatureRuntimePolicy,
   resolveEvmFeatureRuntimePolicy,
   resolveSolanaFeatureRuntimePolicy
 } from '@/core/chains/feature-runtime-policy'
@@ -101,6 +102,10 @@ const evmOperationsEnabled = resolveEvmFeatureRuntimePolicy(
 const canUseSharedPortfolioTotalCache = __ENABLED_CHAIN_FEATURE_FLAGS__.length > 1
 
 const solanaOperationsEnabled = resolveSolanaFeatureRuntimePolicy(
+  __ENABLED_CHAIN_FEATURE_FLAGS__
+).newOperationsEnabled
+
+const bitcoinOperationsEnabled = resolveBitcoinFeatureRuntimePolicy(
   __ENABLED_CHAIN_FEATURE_FLAGS__
 ).newOperationsEnabled
 
@@ -298,11 +303,21 @@ export function Home() {
   const modeActionsReady = hardwareWallet || !supportsDAppExecutionMode || dappExecutionMode.ready
   const privateMode = !hardwareWallet && dappExecutionMode.state?.mode === 'private'
   const actionDomain = assetDomain === 'all' ? (privateMode ? 'private' : 'public') : assetDomain
+  const bitcoinPrivateReady = Boolean(
+    bitcoinOperationsEnabled &&
+    storageV2Account &&
+    storageV2Account.walletSource.kind !== 'hardware' &&
+    storageV2Account.networks.some(
+      network => network.chain.family === 'bitcoin' && network.privateExecutionAddress
+    )
+  )
   const publicSendSource =
     assetDomain === 'public' ? selectHomeActionSource(multichainPortfolio, 'public', 'send') : null
   const swapSource =
     assetDomain === 'public' || assetDomain === 'private'
-      ? selectHomeActionSource(multichainPortfolio, assetDomain, 'swap')
+      ? selectHomeActionSource(multichainPortfolio, assetDomain, 'swap', {
+          bitcoinPrivateAvailable: bitcoinPrivateReady
+        })
       : null
   const shieldActions = selectShieldActions({
     model: multichainPortfolio,
@@ -329,8 +344,9 @@ export function Home() {
       false)
   const showMove =
     assetDomain === 'all'
-      ? privateMode && (evmOperationsEnabled || canMoveSolana)
-      : (assetDomain === 'public' || assetDomain === 'private') && (canMoveEvm || canMoveSolana)
+      ? privateMode && (evmOperationsEnabled || canMoveSolana || bitcoinPrivateReady)
+      : (assetDomain === 'public' || assetDomain === 'private') &&
+        (canMoveEvm || canMoveSolana || bitcoinPrivateReady)
   const openSend = () => {
     const sendPath =
       assetDomain === 'public' && publicSendSource

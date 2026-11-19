@@ -15,7 +15,11 @@ import type {
 import type { BitcoinDiscoveryState } from './bitcoin-discovery-repository'
 import { BitcoinDiscoveryError } from './bitcoin-gap-limit-scanner'
 import type { BitcoinInputReservationRepository } from './bitcoin-input-reservation-model'
-import type { BitcoinSupportedAddressType } from '@/core/chains/bitcoin'
+import {
+  parseSupportedBitcoinAddress,
+  type BitcoinSupportedAddressType,
+  type BitcoinUtxo
+} from '@/core/chains/bitcoin'
 import { BitcoinRpcError } from './bitcoin-esplora-client'
 import {
   bitcoinDiscoveryAddressTypeComplete,
@@ -44,6 +48,12 @@ export interface BitcoinPortfolioCoordinatorOptions {
   readonly getAddressType?: (
     context: ActiveBitcoinDiscoveryContext
   ) => Promise<BitcoinSupportedAddressType>
+  // Reads the account-network PEA when another component has already exposed it.
+  readonly resolvePrivateExecutionAddress?: (
+    context: ActiveBitcoinDiscoveryContext
+  ) => Promise<string | undefined>
+  // One address lookup. This must not scan a gap or a change chain.
+  readonly readPrivateAddressUtxos?: (address: string) => Promise<readonly BitcoinUtxo[]>
   readonly onRefreshError?: (
     error: unknown,
     context: ActiveBitcoinDiscoveryContext
@@ -217,19 +227,14 @@ export class BitcoinPortfolioCoordinator {
     errorCode?: PortfolioReadErrorCode
   ): Promise<PortfolioSourceSnapshot> {
     const asset = this.options.assets.list(this.chainId)[0]
+    const privateAddress = await this.readPrivateExecutionAddress(context)
     if (!state) {
+      const privateRaw = await this.readPrivateRaw(privateAddress)
       return Object.freeze({
         chainAccount: context.chainAccount,
         status,
         balances: Object.freeze([
-          Object.freeze({
-            assetId: asset.asset.id,
-            totalRaw: '0',
-            spendableRaw: '0',
-            availableRaw: '0',
-            pendingRaw: '0',
-            updatedAt: 0
-          })
+          this.balanceSnapshot(asset.asset.id, 0n, 0n, 0n, 0n, 0, privateRaw)
         ]),
         ...(errorCode === undefined ? {} : { errorCode })
       })
@@ -250,7 +255,9 @@ export class BitcoinPortfolioCoordinator {
     let available = 0n
     let pending = 0n
     const ledgerRoot = this.ledgerAccountRoot(context)
+    const privateRaw = await this.readPrivateRaw(privateAddress)
     for (const observation of state.observations) {
+      if (privateAddress !== undefined && observation.derived.address === privateAddress) continue
       if (
         ledgerRoot === undefined
           ? !isActiveBitcoinAddressObservation(observation, addressType)
@@ -276,17 +283,77 @@ export class BitcoinPortfolioCoordinator {
       chainAccount: context.chainAccount,
       status,
       balances: Object.freeze([
-        Object.freeze({
-          assetId: asset.asset.id,
-          totalRaw: total.toString(),
-          spendableRaw: spendable.toString(),
-          availableRaw: available.toString(),
-          pendingRaw: pending.toString(),
-          updatedAt: state.updatedAt
-        })
+        this.balanceSnapshot(
+          asset.asset.id,
+          total,
+          spendable,
+          available,
+          pending,
+          state.updatedAt,
+          privateRaw
+        )
       ]),
       ...(errorCode === undefined ? {} : { errorCode })
     })
+  }
+
+  private balanceSnapshot(
+    assetId: string,
+    publicTotal: bigint,
+    spendable: bigint,
+    available: bigint,
+    pending: bigint,
+    updatedAt: number,
+    privateRaw: bigint | undefined
+  ) {
+    // mainRaw is the public-address total. privateRaw is only the PEA.
+    // The portfolio balance type requires totalRaw to be their sum.
+    const split = privateRaw !== undefined
+    return Object.freeze({
+      assetId,
+      totalRaw: (split ? publicTotal + privateRaw : publicTotal).toString(),
+      ...(split ? { mainRaw: publicTotal.toString(), privateRaw: privateRaw.toString() } : {}),
+      spendableRaw: spendable.toString(),
+      availableRaw: available.toString(),
+      pendingRaw: pending.toString(),
+      updatedAt
+    })
+  }
+
+  private async readPrivateExecutionAddress(
+    context: ActiveBitcoinDiscoveryContext
+  ): Promise<string | undefined> {
+    if (context.keyDomainSource.kind === 'hardware') return undefined
+    const resolve = this.options.resolvePrivateExecutionAddress
+    if (!resolve || !this.options.readPrivateAddressUtxos) return undefined
+    try {
+      const address = await resolve(context)
+      if (!address) return undefined
+      return parseSupportedBitcoinAddress(address, this.chainId, 'p2wpkh')
+    } catch {
+      return undefined
+    }
+  }
+
+  private async readPrivateRaw(address: string | undefined): Promise<bigint | undefined> {
+    if (!address) return undefined
+    const read = this.options.readPrivateAddressUtxos
+    if (!read) return undefined
+    try {
+      const utxos = await read(address)
+      const seen = new Set<string>()
+      let total = 0n
+      for (const utxo of utxos) {
+        const key = outpointKey(utxo.transactionId, utxo.outputIndex)
+        if (seen.has(key)) throw new Error('Duplicate Bitcoin Portfolio UTXO')
+        seen.add(key)
+        total += BigInt(utxo.valueRaw)
+      }
+      return total
+    } catch {
+      // A PEA lookup failure leaves the public discovery total unchanged.
+      return undefined
+    }
   }
 
   private loadActiveContext(): Promise<ActiveBitcoinDiscoveryContext | null> {

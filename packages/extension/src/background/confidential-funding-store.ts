@@ -1,7 +1,10 @@
 import type { Network } from '@/types'
 import { ZEC_ZCASH_ASSET } from '@/config/intents'
+import { parseSupportedBitcoinAddress } from '@/core/chains/bitcoin'
 import { getZcashChainId } from '@/core/chains/registry'
 import { parseNearAccountId } from '@/core/chains/near'
+import type { ChainId } from '@/core/chains/domain'
+import { BITCOIN_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { confidentialIntentsAccountId, parseSolanaPublicKey } from '@/core/chains/solana'
 import { externalRecipientsMatch, isValidExternalRecipient } from './confidential-funding-recipient'
 import { withMetadataLock, withUndeletedWalletAccountMetadata } from '@/lib/wallet-metadata-storage'
@@ -107,8 +110,21 @@ function isChainAccountAddress(value: string, chainId: string): boolean {
   return false
 }
 
+function isBitcoinPlanAddress(value: string, chainId: string): boolean {
+  if (chainId !== BITCOIN_CHAIN_IDS.mainnet && chainId !== BITCOIN_CHAIN_IDS.testnet) return false
+  try {
+    return parseSupportedBitcoinAddress(value, chainId as ChainId) === value
+  } catch {
+    return false
+  }
+}
+
 function isPlanAddress(value: string, chainId: string): boolean {
-  return /^0x[0-9a-f]{40}$/.test(value) || isChainAccountAddress(value, chainId)
+  return (
+    /^0x[0-9a-f]{40}$/.test(value) ||
+    isChainAccountAddress(value, chainId) ||
+    isBitcoinPlanAddress(value, chainId)
+  )
 }
 
 function samePayloadValue(left: unknown, right: unknown): boolean {

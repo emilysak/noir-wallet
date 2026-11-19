@@ -102,7 +102,7 @@ function transferContext(addressType = 'p2wpkh', selfChange = false) {
   }
   let fundingTransaction
   let fundingTransactionId = 'a'.repeat(64)
-  if (addressType === 'p2pkh') {
+  if (addressType !== 'p2tr') {
     fundingTransaction = new Transaction()
     fundingTransaction.version = 2
     fundingTransaction.addInput(Buffer.alloc(32), 0xffffffff)

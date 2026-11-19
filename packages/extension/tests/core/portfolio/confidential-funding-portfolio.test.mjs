@@ -109,7 +109,9 @@ test('projects Shield-only holdings independently of Public assets and preserves
     {
       tokenId: confidentialPrivateTokenId(bitcoinProtocolId),
       protocolAssetId: bitcoinProtocolId,
-      availableRaw: '7000'
+      availableRaw: '7000',
+      assetId: bitcoinAssetId,
+      chainId: getBitcoinChainId('mainnet')
     },
     { tokenId: 'unknown:asset', protocolAssetId: 'unknown:asset', availableRaw: '7' }
   ])
@@ -121,24 +123,34 @@ test('projects Shield-only holdings independently of Public assets and preserves
   ).toEqual([])
 })
 
-test('keeps NEAR and Solana Shield mappings and does not fold them into on-chain balances', () => {
+test('keeps NEAR, Solana, and Bitcoin Shield mappings and does not fold them into on-chain balances', () => {
   const nearAssetId = 'near:mainnet/slip44:397'
   const solanaAssetId = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501'
   const bitcoinAssetId = `${getBitcoinChainId('mainnet')}/slip44:0`
+  const otherBip122AssetId = `bip122:${'ab'.repeat(16)}/slip44:0`
   const mappings = filterConfidentialPortfolioMappings(
     [
       { assetId: nearAssetId, protocolAssetId: 'nep141:wrap.near' },
       { assetId: solanaAssetId, protocolAssetId: 'solana:nep141:sol.omft.near' },
       { assetId: 'eip155:1/slip44:60', protocolAssetId: 'nep141:eth.omft.near' },
-      { assetId: bitcoinAssetId, protocolAssetId: 'nep141:btc.omft.near' }
+      { assetId: bitcoinAssetId, protocolAssetId: 'nep141:btc.omft.near' },
+      { assetId: otherBip122AssetId, protocolAssetId: 'nep141:btc.omft.near' },
+      { assetId: `${getBitcoinChainId('testnet')}/slip44:0`, protocolAssetId: 'nep141:btc.omft.near' }
     ],
     'mainnet'
   )
   expect(mappings.map(mapping => mapping.assetId)).toEqual([
     nearAssetId,
     solanaAssetId,
-    'eip155:1/slip44:60'
+    'eip155:1/slip44:60',
+    bitcoinAssetId
   ])
+  expect(
+    filterConfidentialPortfolioMappings(
+      [{ assetId: otherBip122AssetId, protocolAssetId: 'nep141:btc.omft.near' }],
+      'mainnet'
+    )
+  ).toEqual([])
   const nearAsset = {
     asset: { id: nearAssetId },
     balance: {
@@ -168,6 +180,25 @@ test('keeps NEAR and Solana Shield mappings and does not fold them into on-chain
     ]
   )
   expect(merged.assets[0].balance).toEqual({ ...nearAsset.balance, confidentialRaw: '7' })
+  const bitcoinAsset = {
+    asset: { id: bitcoinAssetId },
+    balance: {
+      totalRaw: '15',
+      mainRaw: '10',
+      privateRaw: '5',
+      spendableRaw: '10',
+      availableRaw: '10',
+      pendingRaw: '0'
+    }
+  }
+  const bitcoinMerged = mergeConfidentialBalancesIntoPortfolio(
+    { assets: [bitcoinAsset], chains: [{ assets: [bitcoinAsset] }] },
+    [{ assetId: bitcoinAssetId, protocolAssetId: 'nep141:btc.omft.near' }],
+    [{ tokenId: 'nep141:btc.omft.near', available: '7' }]
+  )
+  expect(bitcoinMerged.assets[0].balance.privateRaw).toBe('5')
+  expect(bitcoinMerged.assets[0].balance.totalRaw).toBe('15')
+  expect(bitcoinMerged.assets[0].balance.confidentialRaw).toBe('7')
   expect(merged.assets[1].balance).toEqual({ ...solanaAsset.balance, confidentialRaw: '2' })
   expect(merged.chains[0].assets[0].balance.confidentialRaw).toBe('7')
 })

@@ -67,7 +67,8 @@ function showsPrivateExecutionAddress(network: AccountNetworkView): boolean {
   return (
     (network.chain.family === 'evm' ||
       network.chain.family === 'solana' ||
-      network.chain.family === 'near') &&
+      network.chain.family === 'near' ||
+      network.chain.family === 'bitcoin') &&
     Boolean(network.privateExecutionAddress)
   )
 }
@@ -270,7 +271,14 @@ function AddressNetworkGroup({
     />
   )
 
-  if (mode === 'private' && privateExecutionAddress) {
+  if (
+    mode === 'private' &&
+    (network.chain.family === 'bitcoin' ||
+      network.chain.family === 'evm' ||
+      network.chain.family === 'solana' ||
+      network.chain.family === 'near')
+  ) {
+    if (!privateExecutionAddress) return null
     return (
       <section
         className="flex min-h-[72px] min-w-0 items-center gap-[13px] border-b border-border/40 py-2"
@@ -312,7 +320,7 @@ function AddressNetworkGroup({
                 confidential: true,
                 address: {
                   value: privateExecutionAddress,
-                  scheme: 'eip55',
+                  scheme: network.chain.family === 'bitcoin' ? 'bitcoin-p2wpkh' : 'eip55',
                   privacy: 'transparent',
                   preferredForReceive: false
                 }
@@ -439,11 +447,7 @@ export function AddressesList() {
   const defaultMode =
     privateExecutionSupported && executionMode.state?.mode === 'private' ? 'private' : 'public'
   const requestedMode =
-    explicitMode === 'private' && !privateExecutionSupported
-      ? 'public'
-      : explicitMode === 'private' || explicitMode === 'public'
-        ? explicitMode
-        : defaultMode
+    explicitMode === 'private' || explicitMode === 'public' ? explicitMode : defaultMode
   const requestedZcashMode = explicitMode === 'private' ? 'private' : 'public'
   const [networkQuery, setNetworkQuery] = useState('')
   const availableFamilies = useMemo(() => availableSoftwareAccountFamilies(), [])
@@ -508,15 +512,21 @@ export function AddressesList() {
           setError('No enabled network addresses are available for this account.')
           return
         }
+        const hardware = entry.walletSource.kind === 'hardware'
         const canUsePrivate = supportsEvmPrivateExecution(entry.walletSource)
-        setPrivateExecutionSupported(canUsePrivate)
+        const bitcoinPrivateAddress =
+          !hardware &&
+          entry.networks.some(
+            network => network.chain.family === 'bitcoin' && network.privateExecutionAddress
+          )
+        setPrivateExecutionSupported(canUsePrivate || bitcoinPrivateAddress)
         setNetworks(
-          canUsePrivate
-            ? entry.networks
-            : entry.networks.map(network => ({
-                ...network,
-                privateExecutionAddress: undefined
-              }))
+          entry.networks.map(network => {
+            if (network.chain.family === 'bitcoin') {
+              return hardware ? { ...network, privateExecutionAddress: undefined } : network
+            }
+            return canUsePrivate ? network : { ...network, privateExecutionAddress: undefined }
+          })
         )
         setAccountIdentity({ name: entry.accountDisplayName })
       } catch {
@@ -553,7 +563,8 @@ export function AddressesList() {
         if (
           (network.chain.family === 'evm' ||
             network.chain.family === 'solana' ||
-            network.chain.family === 'near') &&
+            network.chain.family === 'near' ||
+            network.chain.family === 'bitcoin') &&
           requestedMode === 'private' &&
           !network.privateExecutionAddress
         )

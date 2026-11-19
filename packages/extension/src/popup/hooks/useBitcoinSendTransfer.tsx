@@ -36,6 +36,7 @@ import {
 import { RecipientSelector } from '@/popup/components/transaction/RecipientSelector'
 import type { SendTransferViewState } from '@/popup/components/transaction/SendTransferView'
 import { DEFAULT_NETWORK_FEE_TIER, type NetworkFeeTier } from '@/core/transactions/domain'
+import { ExecutionAccountBadge } from '@/popup/components/account/ExecutionAccountSelector'
 import { useActiveAccountNetworks } from '@/popup/hooks/useActiveAccountNetworks'
 import { usePortfolioUpdates } from '@/popup/hooks/usePortfolioUpdates'
 import { useTransferFeePreview } from '@/popup/hooks/useTransferFeePreview'
@@ -65,9 +66,12 @@ interface PreparedReview {
 
 export function useBitcoinSendTransfer({
   selection,
+  selection,
+  executionMode = 'main',
   onSubmitted
 }: {
   readonly selection: BitcoinSendAsset
+  readonly executionMode?: 'main' | 'private'
   readonly onSubmitted: (submission: BitcoinTransferSubmission) => void
 }) {
   const [amount, setAmount] = useState('')
@@ -88,14 +92,30 @@ export function useBitcoinSendTransfer({
   const [addressCatalog, setAddressCatalog] = useState<BitcoinAddressBalanceCatalogView | null>(
     null
   )
-  const { activeAccount } = useActiveAccountNetworks()
+  const { activeAccount, loading: accountLoading } = useActiveAccountNetworks()
   const pendingReview = useRef<BitcoinTransferReview | null>(null)
   const asset = selection.asset
   const chain = selection.chain
-  const selectedAvailableRaw = addressCatalog?.availableRaw ?? asset.balance.availableRaw
-  const balanceKnown = Boolean(
-    addressCatalog && isBitcoinBalanceKnown(addressCatalog.updatedAt || asset.updatedAt)
+  const privateMode = executionMode === 'private'
+  const bitcoinNetwork = activeAccount?.networks.find(
+    network => network.chain.family === 'bitcoin' && network.chain.id === chain.chain.id
   )
+  const privateExecutionAddress = bitcoinNetwork?.privateExecutionAddress
+  const publicReceiveAddresses = useMemo(
+    () => new Set(bitcoinNetwork?.addresses.map(address => address.value) ?? []),
+    [bitcoinNetwork]
+  )
+  const privatePending = privateMode && (accountLoading || !activeAccount)
+  const privateUnavailable =
+    privateMode &&
+    !privatePending &&
+    (activeAccount?.walletSource.kind === 'hardware' || !privateExecutionAddress)
+  const selectedAvailableRaw = privateMode
+    ? (asset.balance.privateRaw ?? '0')
+    : (addressCatalog?.availableRaw ?? asset.balance.availableRaw)
+  const balanceKnown = privateMode
+    ? asset.balance.privateRaw !== undefined && isBitcoinBalanceKnown(asset.updatedAt)
+    : Boolean(addressCatalog && isBitcoinBalanceKnown(addressCatalog.updatedAt || asset.updatedAt))
 
   const refreshAddressCatalog = useCallback(async () => {
     if (!activeAccount) return
@@ -151,36 +171,74 @@ export function useBitcoinSendTransfer({
       return null
     }
   }, [chain.chain.id, recipient])
+  const paysPublicReceive =
+    privateMode && parsedRecipient !== null && publicReceiveAddresses.has(parsedRecipient)
+  const prepareOptions = useMemo(
+    () =>
+      privateMode
+        ? { feeTier, executionMode: 'private' as const }
+        : { feeTier, bitcoinAddressType },
+    [bitcoinAddressType, feeTier, privateMode]
+  )
   const maximum = useTransferMaximum({
     enabled:
+      !privatePending &&
+      !privateUnavailable &&
+      !paysPublicReceive &&
       balanceKnown &&
       parsedRecipient !== null &&
       BigInt(selectedAvailableRaw) > 0n &&
       !preparing &&
       review === null,
-    requestKey: `${activeAccount?.walletId}:${activeAccount?.accountId}:${selectedAvailableRaw}:${parsedRecipient}:${feeTier}:${bitcoinAddressType}`,
+    requestKey: `${activeAccount?.walletId}:${activeAccount?.accountId}:${executionMode}:${selectedAvailableRaw}:${parsedRecipient}:${feeTier}:${privateMode ? 'private' : bitcoinAddressType}`,
     fallback: () =>
       fallbackTransferMaximum(
         createNativeTransferSource({
           asset,
           chain,
           availableRaw: selectedAvailableRaw,
-          sender: '',
-          bitcoinAddressType
+          sender: privateMode ? (privateExecutionAddress ?? '') : '',
+          bitcoinAddressType: privateMode ? 'p2wpkh' : bitcoinAddressType
         })
       ),
-    estimate: () =>
-      estimateNativeTransferMaximum({
-        source: createNativeTransferSource({
-          asset,
-          chain,
-          availableRaw: selectedAvailableRaw,
-          sender: '',
-          bitcoinAddressType
-        }),
-        recipient: parsedRecipient ?? '',
-        feeTier
-      })
+    estimate: async () => {
+      if (!privateMode) {
+        return estimateNativeTransferMaximum({
+          source: createNativeTransferSource({
+            asset,
+            chain,
+            availableRaw: selectedAvailableRaw,
+            sender: '',
+            bitcoinAddressType
+          }),
+          recipient: parsedRecipient ?? '',
+          feeTier
+        })
+      }
+      const value = await bitcoinWalletClient.prepareTransfer(
+        { recipient: parsedRecipient ?? '', amount: { mode: 'max' } },
+        prepareOptions
+      )
+      try {
+        const amountRawValue = value.graph.root.intent?.primaryAmount?.amountRaw
+        const summary = value.review.summary
+        if (
+          summary.schema !== 'bitcoin.psbt.v1' ||
+          amountRawValue === undefined ||
+          !/^(?:0|[1-9][0-9]*)$/.test(summary.fields.feeSats)
+        ) {
+          throw new Error('Invalid Bitcoin maximum')
+        }
+        return {
+          amountRaw: amountRawValue,
+          networkFeeRaw: summary.fields.feeSats,
+          networkFeeSymbol: 'BTC',
+          networkFeeDecimals: 8
+        }
+      } finally {
+        await bitcoinWalletClient.rejectTransfer(value.graph.root.id).catch(() => {})
+      }
+    }
   })
   const transferAvailability = resolvePortfolioTransferAvailability({
     balanceRaw: selectedAvailableRaw,
@@ -210,7 +268,14 @@ export function useBitcoinSendTransfer({
   }
 
   const estimateFee = useCallback(async () => {
-    if (!validAmount || !parsedRecipient || (!sendMaximum && amountRaw === null)) {
+    if (
+      privatePending ||
+      privateUnavailable ||
+      paysPublicReceive ||
+      !validAmount ||
+      !parsedRecipient ||
+      (!sendMaximum && amountRaw === null)
+    ) {
       throw new Error('Incomplete Bitcoin transfer')
     }
     let requestedAmount: BitcoinTransferAmount
@@ -224,7 +289,7 @@ export function useBitcoinSendTransfer({
     try {
       value = await bitcoinWalletClient.prepareTransfer(
         { recipient: parsedRecipient, amount: requestedAmount },
-        { feeTier, bitcoinAddressType }
+        prepareOptions
       )
       const feeLimit = value.graph.root.intent?.feeLimit
       if (!feeLimit || !/^(?:0|[1-9][0-9]*)$/.test(feeLimit.amountRaw)) {
@@ -234,10 +299,27 @@ export function useBitcoinSendTransfer({
     } finally {
       if (value) await bitcoinWalletClient.rejectTransfer(value.graph.root.id).catch(() => {})
     }
-  }, [amountRaw, bitcoinAddressType, feeTier, parsedRecipient, sendMaximum, validAmount])
+  }, [
+    amountRaw,
+    feeTier,
+    parsedRecipient,
+    paysPublicReceive,
+    prepareOptions,
+    privatePending,
+    privateUnavailable,
+    sendMaximum,
+    validAmount
+  ])
   const feePreview = useTransferFeePreview({
     enabled:
-      validAmount && !sendMaximum && parsedRecipient !== null && !preparing && review === null,
+      !privatePending &&
+      !privateUnavailable &&
+      !paysPublicReceive &&
+      validAmount &&
+      !sendMaximum &&
+      parsedRecipient !== null &&
+      !preparing &&
+      review === null,
     requestKey: `${parsedRecipient ?? ''}:${amountRaw ?? ''}:${sendMaximum}:${feeTier}:${bitcoinAddressType}`,
     estimate: estimateFee
   })
@@ -266,7 +348,15 @@ export function useBitcoinSendTransfer({
   }
 
   const handleContinue = async () => {
-    if (!validAmount || !parsedRecipient || (!sendMaximum && amountRaw === null)) return
+    if (
+      privatePending ||
+      privateUnavailable ||
+      paysPublicReceive ||
+      !validAmount ||
+      !parsedRecipient ||
+      (!sendMaximum && amountRaw === null)
+    )
+      return
     let requestedAmount: BitcoinTransferAmount
     if (sendMaximum) {
       requestedAmount = { mode: 'max' }
@@ -282,7 +372,7 @@ export function useBitcoinSendTransfer({
           recipient: parsedRecipient,
           amount: requestedAmount
         },
-        { feeTier, bitcoinAddressType }
+        prepareOptions
       )
       const summary = value.review.summary
       if (summary.schema !== 'bitcoin.psbt.v1') {
@@ -295,7 +385,12 @@ export function useBitcoinSendTransfer({
       )
       if (
         recipientOutputs.length !== 1 ||
-        (!sendMaximum && recipientOutputs[0].amountSats !== amountRaw)
+        (!sendMaximum && recipientOutputs[0].amountSats !== amountRaw) ||
+        (privateMode &&
+          (summary.fields.signer !== privateExecutionAddress ||
+            summary.fields.outputs.some(
+              output => output.address !== null && publicReceiveAddresses.has(output.address)
+            )))
       ) {
         await rejectPrepared(value)
         setError('The Bitcoin review does not match the requested transfer.')
@@ -339,7 +434,9 @@ export function useBitcoinSendTransfer({
           recipient: current.recipient,
           amount: sendMaximum ? { mode: 'max' } : { mode: 'exact', valueSats: current.amountRaw }
         },
-        { feeTier: nextFeeTier, bitcoinAddressType }
+        privateMode
+          ? { feeTier: nextFeeTier, executionMode: 'private' as const }
+          : { feeTier: nextFeeTier, bitcoinAddressType }
       )
       const nextSummary = replacement.review.summary
       if (nextSummary.schema !== 'bitcoin.psbt.v1') {
@@ -350,7 +447,12 @@ export function useBitcoinSendTransfer({
       )
       if (
         recipientOutputs.length !== 1 ||
-        (!sendMaximum && recipientOutputs[0].amountSats !== current.amountRaw)
+        (!sendMaximum && recipientOutputs[0].amountSats !== current.amountRaw) ||
+        (privateMode &&
+          (nextSummary.fields.signer !== privateExecutionAddress ||
+            nextSummary.fields.outputs.some(
+              output => output.address !== null && publicReceiveAddresses.has(output.address)
+            )))
       ) {
         throw new Error('The Bitcoin review does not match the requested transfer.')
       }
@@ -460,10 +562,21 @@ export function useBitcoinSendTransfer({
       BigInt(amountRaw) > BigInt(selectedAvailableRaw),
     maxSelected: sendMaximum,
     maxDisabled:
-      !balanceKnown || BigInt(selectedAvailableRaw) <= 0n || !parsedRecipient || maximum.loading,
+      privatePending ||
+      privateUnavailable ||
+      !balanceKnown ||
+      BigInt(selectedAvailableRaw) <= 0n ||
+      !parsedRecipient ||
+      maximum.loading,
     feePreviewLoading: feePreview.loading,
     previewFee,
-    continueDisabled: !validAmount || !parsedRecipient || maximum.loading || feePreview.loading,
+    continueDisabled:
+      !validAmount ||
+      !parsedRecipient ||
+      privatePending ||
+      privateUnavailable ||
+      maximum.loading ||
+      feePreview.loading,
     continueLoading: preparing || maximum.loading || feePreview.loading,
     approving,
     error,

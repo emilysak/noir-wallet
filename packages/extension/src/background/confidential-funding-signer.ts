@@ -6,6 +6,14 @@ import {
   confidentialNep413Recipient,
   type ConfidentialSignedPayload
 } from '@/core/services/confidential-funding'
+import {
+  assertBitcoinDepositAddress,
+  assertBitcoinDepositOutputs,
+  assertBitcoinPayableDepositAddress,
+  isBitcoinConfidentialChain,
+  type BitcoinConfidentialDepositClient
+} from '@/core/services/confidential-funding/bitcoin-confidential-deposit'
+import { readBitcoinPrivateExecutionAddress } from './bitcoin-private-execution-address'
 import { base64ToBytes } from '@/lib/bytes'
 import { parseEvmAccountBinding, type ActiveEvmPortfolioContext } from '@/infrastructure/chains/evm'
 import {
@@ -82,9 +90,10 @@ export interface ConfidentialNearSigningContext extends ActiveEvmPortfolioContex
 }
 
 export interface ConfidentialChainDeposit {
-  readonly family: 'near' | 'solana'
+  readonly family: 'near' | 'solana' | 'bitcoin'
   readonly chainId: ChainId
   readonly networkFeeRaw?: string
+  readonly payloadFingerprint?: string
 }
 
 interface ConfidentialChainSigners {
@@ -121,6 +130,12 @@ function sameConfidentialAddress(left: string, right: string): boolean {
 }
 
 export class ConfidentialFundingSigner {
+  private bitcoinDeposits: BitcoinConfidentialDepositClient | null = null
+
+  setBitcoinDepositClient(client: BitcoinConfidentialDepositClient | null): void {
+    this.bitcoinDeposits = client
+  }
+
   constructor(
     private readonly signer: EvmMultichainSigningClient,
     private readonly loadContext: (chainId: ChainId) => Promise<ActiveEvmPortfolioContext | null>,
@@ -169,6 +184,41 @@ export class ConfidentialFundingSigner {
       addressIndex: binding.addressIndex,
       peaAddress: pea.address
     })
+  }
+
+  async resolveBitcoinPublicSpendAddress(chainId: ChainId): Promise<{
+    readonly sourceAddress: string
+    readonly counterpartyAddress?: string
+  }> {
+    if (!isBitcoinConfidentialChain(chainId) || !this.bitcoinDeposits) {
+      throw new Error('Bitcoin deposit signing is unavailable')
+    }
+    const spend = await this.bitcoinDeposits.resolvePublicSpendAddress(chainId)
+    if (!spend.sourceAddress) throw new Error('Bitcoin deposit signing is unavailable')
+    return spend
+  }
+
+  // Public spend resolution does not include the account's Bitcoin private execution address.
+  async resolveBitcoinFundingAddresses(
+    chainId: ChainId,
+    identity: ConfidentialSigningIdentity
+  ): Promise<{
+    readonly publicAddress: string
+    readonly privateExecutionAddress: string
+  }> {
+    const spend = await this.resolveBitcoinPublicSpendAddress(chainId)
+    const publicAddress = assertBitcoinDepositAddress(spend.sourceAddress, chainId)
+    const observed = await readBitcoinPrivateExecutionAddress({
+      keyDomainId: identity.context.chainAccount.scope.keyDomainId,
+      accountId: identity.context.chainAccount.scope.accountId,
+      chainId
+    })
+    if (!observed) throw new Error('Bitcoin deposit signing is unavailable')
+    const privateExecutionAddress = assertBitcoinDepositAddress(observed, chainId)
+    if (privateExecutionAddress === publicAddress) {
+      throw new Error('Bitcoin deposit signing is unavailable')
+    }
+    return Object.freeze({ publicAddress, privateExecutionAddress })
   }
 
   async signMessage(input: {
@@ -332,6 +382,11 @@ export class ConfidentialFundingSigner {
     readonly identity: ConfidentialSigningIdentity
     readonly commandId: string
   }): Promise<void> {
+    if (input.commandId.startsWith('transaction:bitcoin:')) {
+      if (!this.bitcoinDeposits) throw new Error('Bitcoin deposit signing is unavailable')
+      await this.bitcoinDeposits.rejectDeposit(input.commandId)
+      return
+    }
     await this.runActiveOperation(async () => {
       await this.assertCurrentIdentity(
         input.identity,
@@ -355,6 +410,8 @@ export class ConfidentialFundingSigner {
     readonly recipient: string
     readonly amountRaw: string
     readonly sourceDomain: 'public' | 'private'
+    readonly bitcoinSourceAddress?: string
+    readonly bitcoinCounterpartyAddress?: string
   }): Promise<
     Readonly<{
       commandId: string
@@ -366,6 +423,7 @@ export class ConfidentialFundingSigner {
     const namespace = parseChainId(input.chainId).namespace
     if (namespace === 'near') return this.prepareNearDeposit(input)
     if (namespace === 'solana') return this.prepareSolanaDeposit(input)
+    if (isBitcoinConfidentialChain(input.chainId)) return this.prepareBitcoinDeposit(input)
     throw new Error('Confidential chain deposit signing is unavailable')
   }
 
@@ -375,6 +433,8 @@ export class ConfidentialFundingSigner {
     readonly expectedTransactionHash: string
   }): Promise<void> {
     const namespace = parseChainId(input.chainId).namespace
+    // The Bitcoin transfer controller broadcasts during approval.
+    if (isBitcoinConfidentialChain(input.chainId)) return
     const hash =
       namespace === 'near'
         ? await this.chains.near?.rpc.broadcastSignedTransaction(input.rawTransaction)
@@ -579,6 +639,177 @@ export class ConfidentialFundingSigner {
     })
   }
 
+  private async prepareBitcoinDeposit(input: {
+    readonly identity: ConfidentialSigningIdentity
+    readonly chainId: ChainId
+    readonly recipient: string
+    readonly amountRaw: string
+    readonly sourceDomain: 'public' | 'private'
+    readonly bitcoinSourceAddress?: string
+    readonly bitcoinCounterpartyAddress?: string
+  }) {
+    assertBitcoinPayableDepositAddress(input.recipient, input.chainId)
+    const client = this.bitcoinDeposits
+    if (!client) throw new Error('Bitcoin deposit signing is unavailable')
+    // Spend the Bitcoin PEA. Do not substitute the public receive address or the EVM signer.
+    if (input.sourceDomain === 'private') {
+      return this.preparePrivateBitcoinDeposit(input, client)
+    }
+    const spend = await client.resolvePublicSpendAddress(input.chainId)
+    const sourceAddress = input.bitcoinSourceAddress ?? spend.sourceAddress
+    const counterpartyAddress =
+      input.bitcoinCounterpartyAddress ??
+      spend.counterpartyAddress ??
+      (await this.readBitcoinCounterpartyAddress(input.identity, input.chainId, sourceAddress))
+    if (sourceAddress !== spend.sourceAddress) {
+      throw new Error('Bitcoin deposit source does not match the selected address')
+    }
+    const prepared = await client.preparePublicDeposit({
+      chainId: input.chainId,
+      recipient: input.recipient,
+      amountRaw: input.amountRaw,
+      sourceAddress,
+      ...(counterpartyAddress === undefined ? {} : { counterpartyAddress })
+    })
+    try {
+      if (prepared.signerAddress !== sourceAddress) {
+        throw new Error('Bitcoin deposit source does not match the selected address')
+      }
+      assertBitcoinDepositOutputs({
+        chainId: input.chainId,
+        depositAddress: input.recipient,
+        sourceAddress,
+        ...(counterpartyAddress === undefined ? {} : { counterpartyAddress }),
+        outputs: prepared.outputs
+      })
+      if (!/^[1-9][0-9]*$/.test(prepared.networkFeeRaw)) {
+        throw new Error('Confidential chain deposit network fee is invalid')
+      }
+      return Object.freeze({
+        commandId: prepared.commandId,
+        payloadFingerprint: prepared.payloadFingerprint,
+        expiresAt: prepared.expiresAt,
+        preparedTransfer: Object.freeze({
+          family: 'bitcoin' as const,
+          chainId: input.chainId,
+          networkFeeRaw: prepared.networkFeeRaw,
+          payloadFingerprint: prepared.payloadFingerprint
+        })
+      })
+    } catch (error) {
+      await client.rejectDeposit(prepared.commandId).catch(() => {})
+      throw error
+    }
+  }
+
+  private async preparePrivateBitcoinDeposit(
+    input: {
+      readonly identity: ConfidentialSigningIdentity
+      readonly chainId: ChainId
+      readonly recipient: string
+      readonly amountRaw: string
+      readonly bitcoinSourceAddress?: string
+      readonly bitcoinCounterpartyAddress?: string
+    },
+    client: BitcoinConfidentialDepositClient
+  ) {
+    const spend = await client.resolvePublicSpendAddress(input.chainId)
+    const publicAddress = assertBitcoinDepositAddress(spend.sourceAddress, input.chainId)
+    const observed = await readBitcoinPrivateExecutionAddress({
+      keyDomainId: input.identity.context.chainAccount.scope.keyDomainId,
+      accountId: input.identity.context.chainAccount.scope.accountId,
+      chainId: input.chainId
+    })
+    if (!observed) throw new Error('Bitcoin private deposit signing is unavailable')
+    let privateExecutionAddress: string
+    try {
+      privateExecutionAddress = assertBitcoinDepositAddress(observed, input.chainId)
+    } catch {
+      throw new Error('Bitcoin private deposit signing is unavailable')
+    }
+    if (
+      privateExecutionAddress === publicAddress ||
+      privateExecutionAddress === input.identity.address
+    ) {
+      throw new Error('Bitcoin private deposit signing is unavailable')
+    }
+    if (
+      input.bitcoinSourceAddress !== undefined &&
+      input.bitcoinSourceAddress !== privateExecutionAddress
+    ) {
+      throw new Error('Bitcoin deposit source does not match the selected address')
+    }
+    const otherWalletAddress =
+      input.bitcoinCounterpartyAddress !== undefined &&
+      input.bitcoinCounterpartyAddress !== privateExecutionAddress &&
+      input.bitcoinCounterpartyAddress !== publicAddress
+        ? input.bitcoinCounterpartyAddress
+        : undefined
+    const prepared = await client.preparePrivateDeposit({
+      chainId: input.chainId,
+      recipient: input.recipient,
+      amountRaw: input.amountRaw,
+      privateExecutionAddress,
+      publicReceiveAddress: publicAddress,
+      counterpartyAddress: otherWalletAddress ?? publicAddress
+    })
+    try {
+      if (prepared.signerAddress !== privateExecutionAddress) {
+        throw new Error('Bitcoin deposit source does not match the selected address')
+      }
+      assertBitcoinDepositOutputs({
+        chainId: input.chainId,
+        depositAddress: input.recipient,
+        sourceAddress: privateExecutionAddress,
+        counterpartyAddress: publicAddress,
+        outputs: prepared.outputs
+      })
+      if (
+        otherWalletAddress !== undefined &&
+        prepared.outputs.some(output => output.address === otherWalletAddress)
+      ) {
+        throw new Error('Bitcoin deposit output pays another wallet address')
+      }
+      if (!/^[1-9][0-9]*$/.test(prepared.networkFeeRaw)) {
+        throw new Error('Confidential chain deposit network fee is invalid')
+      }
+      return Object.freeze({
+        commandId: prepared.commandId,
+        payloadFingerprint: prepared.payloadFingerprint,
+        expiresAt: prepared.expiresAt,
+        preparedTransfer: Object.freeze({
+          family: 'bitcoin' as const,
+          chainId: input.chainId,
+          networkFeeRaw: prepared.networkFeeRaw,
+          payloadFingerprint: prepared.payloadFingerprint
+        })
+      })
+    } catch (error) {
+      await client.rejectDeposit(prepared.commandId).catch(() => {})
+      throw error
+    }
+  }
+
+  private async readBitcoinCounterpartyAddress(
+    identity: ConfidentialSigningIdentity,
+    chainId: ChainId,
+    sourceAddress: string
+  ): Promise<string | undefined> {
+    const observed = await readBitcoinPrivateExecutionAddress({
+      keyDomainId: identity.context.chainAccount.scope.keyDomainId,
+      accountId: identity.context.chainAccount.scope.accountId,
+      chainId
+    })
+    if (!observed || observed === sourceAddress) return undefined
+    try {
+      const parsed = assertBitcoinDepositAddress(observed, chainId)
+      return parsed === sourceAddress ? undefined : parsed
+    } catch {
+      // A missing or unreadable private address must not change the public deposit.
+      return undefined
+    }
+  }
+
   private async prepareNearDeposit(input: {
     readonly identity: ConfidentialSigningIdentity
     readonly chainId: ChainId
@@ -771,6 +1002,17 @@ export class ConfidentialFundingSigner {
     commandId: string,
     preparedTransfer: ConfidentialChainDeposit
   ) {
+    if (preparedTransfer.family === 'bitcoin') {
+      const client = this.bitcoinDeposits
+      const payloadFingerprint = preparedTransfer.payloadFingerprint
+      if (!client || !payloadFingerprint) throw new Error('Bitcoin deposit signing is unavailable')
+      const confirmed = await client.confirmPublicDeposit({ commandId, payloadFingerprint })
+      return Object.freeze({
+        prepared: preparedTransfer,
+        rawTransaction: confirmed.rawTransaction,
+        transactionHash: confirmed.transactionHash
+      })
+    }
     const client =
       preparedTransfer.family === 'near' ? this.chains.near?.client : this.chains.solana?.client
     if (!client) throw new Error('Confidential chain deposit signing is unavailable')
@@ -931,6 +1173,7 @@ function isConfidentialChainDeposit(value: unknown): value is ConfidentialChainD
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const record = value as Record<string, unknown>
   return (
-    (record.family === 'near' || record.family === 'solana') && typeof record.chainId === 'string'
+    (record.family === 'near' || record.family === 'solana' || record.family === 'bitcoin') &&
+    typeof record.chainId === 'string'
   )
 }

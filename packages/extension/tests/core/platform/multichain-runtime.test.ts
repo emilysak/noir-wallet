@@ -67,6 +67,72 @@ const NEAR_PEA = Object.freeze({
   family: 'near',
   addressScheme: 'near'
 })
+const BITCOIN_MAINNET = 'bip122:000000000019d6689c085ae165831e93'
+const BITCOIN_PEA = Object.freeze({
+  address: 'bc1qhshj2sek7ff9e7gkhq6hsm9sdq8lr8u0dakdzc',
+  publicKey: '0x0337f142f69980b7a8d7294949e02220b9f9ff98f363d247487c15518184363851',
+  curve: 'secp256k1',
+  derivationScheme: 'pea_v2',
+  parent: Object.freeze({ accountIndex: 0 }),
+  family: 'bitcoin',
+  chainId: BITCOIN_MAINNET,
+  addressScheme: 'bitcoin_p2wpkh',
+  addressType: 'p2wpkh',
+  bitcoinNetwork: 'mainnet'
+})
+const BITCOIN_MAIN_ACCOUNT = Object.freeze({
+  accountId: `${BITCOIN_MAINNET}:bc1qmainaddressplaceholder000000000000`,
+  address: 'bc1qmainaddressplaceholder000000000000',
+  derivationPath: "m/84'/0'/0'/0/0",
+  publicKey: `0x02${'11'.repeat(32)}`,
+  curve: 'secp256k1',
+  addressScheme: 'bitcoin_p2wpkh',
+  derivationScheme: 'bip84',
+  masterFingerprint: '0x11223344',
+  network: 'mainnet',
+  scriptPubKey: `0x0014${'ab'.repeat(20)}`
+})
+const BITCOIN_PEA_PSBT_SUMMARY = Object.freeze({
+  chainId: BITCOIN_MAINNET,
+  network: 'mainnet',
+  addressType: 'p2wpkh',
+  accountIndex: 0,
+  psbtVersion: 0,
+  unsignedTxid: 'cd'.repeat(32),
+  transactionVersion: 2,
+  lockTime: 0,
+  inputCount: 1,
+  outputCount: 1,
+  signableInputCount: 1,
+  totalInputSats: '1000',
+  totalOutputSats: '900',
+  feeSats: '100',
+  inputs: Object.freeze([
+    Object.freeze({
+      index: 0,
+      txid: '11'.repeat(32),
+      vout: 0,
+      sequence: 0xfffffffd,
+      valueSats: '1000',
+      address: BITCOIN_PEA.address,
+      scriptPubKey: `0x0014${'22'.repeat(20)}`,
+      walletOwned: true,
+      derivationPath: 'm',
+      sighashType: 'SIGHASH_ALL'
+    })
+  ]),
+  outputs: Object.freeze([
+    Object.freeze({
+      index: 0,
+      valueSats: '900',
+      address: 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4',
+      scriptPubKey: `0x0014${'33'.repeat(20)}`,
+      walletOwned: false,
+      isChange: false,
+      derivationPath: null
+    })
+  ])
+})
 const NEAR_ACCOUNT = Object.freeze({
   accountId: `near:testnet:${'11'.repeat(32)}`,
   address: '11'.repeat(32),
@@ -92,6 +158,15 @@ class FakeWalletEngine implements RawWalletEngine {
   readonly rejectedRequests: number[] = []
   readonly lockedSessions: number[] = []
   readonly peaRequests: string[] = []
+  readonly peaBitcoinPsbtRequests: Array<{
+    readonly request: string
+    readonly chainId: string
+    readonly psbt: string
+  }> = []
+  readonly confirmedBitcoinPsbtIds: number[] = []
+  peaOverride: unknown = undefined
+  bitcoinAccount: unknown = undefined
+  privateKeyScope: { chainFamily: 'bip122'; bitcoinNetwork: 'mainnet' | 'testnet' } | null = null
   lockAllCalls = 0
   freeCalls = 0
   nextSessionId = 1
@@ -137,6 +212,13 @@ class FakeWalletEngine implements RawWalletEngine {
 
   unlock(_vault: unknown, password: string): unknown {
     this.unlockPasswords.push(password)
+    if (this.privateKeyScope) {
+      return {
+        sessionId: this.nextSessionId++,
+        kind: 'private_key',
+        ...this.privateKeyScope
+      }
+    }
     return {
       sessionId: this.nextSessionId++,
       ...((_vault as { version?: unknown }).version === 2
@@ -160,8 +242,11 @@ class FakeWalletEngine implements RawWalletEngine {
 
   derivePeaAccount(_sessionId: number, requestJson: string): unknown {
     this.peaRequests.push(requestJson)
+    if (this.peaOverride !== undefined) return this.peaOverride
     const request = JSON.parse(requestJson) as { family?: string }
-    return request.family === 'near' ? NEAR_PEA : GLOBAL_PEA
+    if (request.family === 'near') return NEAR_PEA
+    if (request.family === 'bitcoin') return BITCOIN_PEA
+    return GLOBAL_PEA
   }
 
   deriveSolanaAccount(): unknown {
@@ -172,8 +257,9 @@ class FakeWalletEngine implements RawWalletEngine {
     return NEAR_ACCOUNT
   }
 
-  deriveBitcoinAccount(): never {
-    throw new Error('Unexpected Bitcoin derivation')
+  deriveBitcoinAccount(): unknown {
+    if (this.bitcoinAccount === undefined) throw new Error('Unexpected Bitcoin derivation')
+    return this.bitcoinAccount
   }
 
   deriveBitcoinAccounts(): never {
@@ -252,8 +338,26 @@ class FakeWalletEngine implements RawWalletEngine {
     throw new Error('Unexpected Bitcoin PSBT')
   }
 
-  confirmBitcoinPsbt(): never {
-    throw new Error('Unexpected Bitcoin PSBT confirmation')
+  preparePeaBitcoinPsbt(
+    _sessionId: number,
+    requestJson: string,
+    chainId: string,
+    psbt: string
+  ): unknown {
+    this.peaBitcoinPsbtRequests.push({ request: requestJson, chainId, psbt })
+    return {
+      requestId: this.nextRequestId++,
+      summary: BITCOIN_PEA_PSBT_SUMMARY
+    }
+  }
+
+  confirmBitcoinPsbt(_sessionId: number, requestId: number): unknown {
+    this.confirmedBitcoinPsbtIds.push(requestId)
+    return {
+      psbt: 'AAAA',
+      unsignedTxid: 'ab'.repeat(32),
+      signedInputIndexes: [0]
+    }
   }
 
   prepareBitcoinMessage(): never {
@@ -465,6 +569,110 @@ test.describe('Multichain Worker runtime boundaries', () => {
       '{"version":1,"parent":{"addressIndex":0}}',
       '{"version":1,"parent":{"addressIndex":0}}'
     ])
+  })
+
+  test('derives a Bitcoin P2WPKH PEA and signs it through confirmBitcoinPsbt', async () => {
+    const engine = new FakeWalletEngine()
+    engine.bitcoinAccount = BITCOIN_MAIN_ACCOUNT
+    const runtime = createRuntime(engine, {
+      createSigningCommandId: () => 'signing-command:bitcoin-pea'
+    })
+    expectSuccess(
+      await runtime.execute(command('credential.unlock', { vault: VAULT, password: 'password' }))
+    )
+
+    const pea = expectSuccess(
+      await runtime.execute(
+        command('account.derive-public', {
+          family: 'bitcoin-pea',
+          chainId: BITCOIN_MAINNET,
+          accountIndex: 0
+        })
+      )
+    )
+    expect(pea).toEqual(BITCOIN_PEA)
+
+    const prepared = expectSuccess(
+      await runtime.execute(
+        command('signing.prepare', {
+          kind: 'pea-bitcoin-psbt',
+          chainId: BITCOIN_MAINNET,
+          accountIndex: 0,
+          psbt: 'AAAA'
+        })
+      )
+    ) as { commandId: string; summary: { fields: { signer: string } } }
+    expect(prepared.summary.fields.signer).toBe(BITCOIN_PEA.address)
+    expect(engine.peaRequests).toEqual([
+      `{"version":2,"family":"bitcoin","parent":{"accountIndex":0},"addressType":"p2wpkh","chainId":"${BITCOIN_MAINNET}"}`,
+      `{"version":2,"family":"bitcoin","parent":{"accountIndex":0},"addressType":"p2wpkh","chainId":"${BITCOIN_MAINNET}"}`
+    ])
+    expect(engine.peaBitcoinPsbtRequests).toEqual([
+      {
+        request: `{"version":2,"family":"bitcoin","parent":{"accountIndex":0},"addressType":"p2wpkh","chainId":"${BITCOIN_MAINNET}"}`,
+        chainId: BITCOIN_MAINNET,
+        psbt: 'AAAA'
+      }
+    ])
+
+    const signed = expectSuccess(
+      await runtime.execute(command('signing.confirm', { signingCommandId: prepared.commandId }))
+    )
+    expect(signed).toMatchObject({
+      kind: 'signed-payload',
+      payload: { encoding: 'base64', value: 'AAAA' }
+    })
+    expect(engine.confirmedBitcoinPsbtIds).toEqual([1])
+  })
+
+  test('rejects a Bitcoin PEA whose address does not match its public key', async () => {
+    const engine = new FakeWalletEngine()
+    engine.peaOverride = {
+      ...BITCOIN_PEA,
+      address: 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'
+    }
+    const runtime = createRuntime(engine)
+    expectSuccess(
+      await runtime.execute(command('credential.unlock', { vault: VAULT, password: 'password' }))
+    )
+    expectFailure(
+      await runtime.execute(
+        command('account.derive-public', {
+          family: 'bitcoin-pea',
+          chainId: BITCOIN_MAINNET,
+          accountIndex: 0
+        })
+      ),
+      'INVALID_RESPONSE'
+    )
+  })
+
+  test('allows an imported Bitcoin PEA only at account index 0', async () => {
+    const engine = new FakeWalletEngine()
+    engine.privateKeyScope = { chainFamily: 'bip122', bitcoinNetwork: 'mainnet' }
+    const runtime = createRuntime(engine)
+    expectSuccess(
+      await runtime.execute(command('credential.unlock', { vault: VAULT, password: 'password' }))
+    )
+    expectSuccess(
+      await runtime.execute(
+        command('account.derive-public', {
+          family: 'bitcoin-pea',
+          chainId: BITCOIN_MAINNET,
+          accountIndex: 0
+        })
+      )
+    )
+    expectFailure(
+      await runtime.execute(
+        command('account.derive-public', {
+          family: 'bitcoin-pea',
+          chainId: BITCOIN_MAINNET,
+          accountIndex: 1
+        })
+      ),
+      'INVALID_COMMAND'
+    )
   })
 
   test('derives a global NEAR PEA from the parent account index', async () => {

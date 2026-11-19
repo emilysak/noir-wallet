@@ -1,7 +1,7 @@
 import * as secp256k1 from '@bitcoinerlab/secp256k1'
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
-import { initEccLib, networks, payments } from 'bitcoinjs-lib'
+import { initEccLib, networks, payments, Psbt, Transaction } from 'bitcoinjs-lib'
 
 import { parseTransactionId } from '../../../../src/core/transactions/domain/index.ts'
 import { BitcoinTransferPreparationCoordinator } from '../../../../src/infrastructure/chains/bitcoin/index.ts'
@@ -37,6 +37,16 @@ function keyMaterial(digit, change, addressIndex) {
 
 function context() {
   const sender = keyMaterial(1, false, 0)
+  const funding = new Transaction()
+  funding.version = 2
+  funding.addInput(Buffer.alloc(32), 0xffffffff)
+  funding.addOutput(
+    payments.p2wpkh({
+      pubkey: Buffer.from(sender.derived.publicKey.slice(2), 'hex'),
+      network: networks.bitcoin
+    }).output,
+    100000
+  )
   const unused = keyMaterial(2, false, 1)
   const discoveredChange = keyMaterial(3, true, 0)
   const recipient = keyMaterial(5, false, 0)
@@ -87,7 +97,7 @@ function context() {
     observations: [
       observation(sender.derived, true, [
         {
-          transactionId: 'a'.repeat(64),
+          transactionId: funding.getId(),
           outputIndex: 0,
           valueRaw: '100000',
           status: {
@@ -103,7 +113,7 @@ function context() {
     ],
     updatedAt: 2_000
   }
-  return { sender, recipient, chainAccount, state }
+  return { sender, recipient, chainAccount, state, funding }
 }
 
 function harness(options = {}) {
@@ -151,6 +161,17 @@ function harness(options = {}) {
       getFeeEstimates: async () => {
         if (options.feeEstimatesThrow) throw new Error('fee estimates must not be requested')
         return { 6: 2 }
+      },
+      getRawTransaction: async requested => {
+        calls.push(['raw-transaction', requested])
+        if (options.rawTransactionThrows) throw new Error('previous transaction unavailable')
+        const known = {
+          [current.funding.getId()]: current.funding.toHex(),
+          ...(options.extraRawTransactions ?? {})
+        }
+        const raw = known[requested]
+        if (!raw) throw new Error('unexpected previous transaction')
+        return raw
       }
     },
     inputReservations,
@@ -171,6 +192,18 @@ function prepareInput(testHarness, amount = { mode: 'exact', valueSats: '50000' 
     amount
   }
 }
+
+test('does not build a Native SegWit PSBT without the previous transaction', async () => {
+  const testHarness = harness({ rawTransactionThrows: true })
+  await expect(testHarness.coordinator.prepare(prepareInput(testHarness))).rejects.toThrow(
+    'previous transaction unavailable'
+  )
+  expect(testHarness.calls.map(call => call[0])).toEqual([
+    'derive-signer',
+    'assert-chain',
+    'raw-transaction'
+  ])
+})
 
 test('prepares a fee-bound PSBT from the active address and returns change to it', async () => {
   const testHarness = harness()
@@ -200,8 +233,12 @@ test('prepares a fee-bound PSBT from the active address and returns change to it
   expect(testHarness.calls.map(call => call[0])).toEqual([
     'derive-signer',
     'assert-chain',
+    'raw-transaction',
     'reserve-inputs'
   ])
+  const psbt = Psbt.fromBase64(plan.prepared.psbtBase64)
+  expect(psbt.data.inputs[0].nonWitnessUtxo).toEqual(testHarness.funding.toBuffer())
+  expect(psbt.data.inputs[0].witnessUtxo).toBeDefined()
   expect(() => parsePreparedBitcoinPsbt(plan.prepared)).not.toThrow()
 })
 
@@ -209,6 +246,16 @@ test('spends Ledger receive children together and reserves a change child on the
   const baseline = context()
   const root = "m/84'/0'/5'"
   const second = keyMaterial(7, false, 1)
+  const secondFunding = new Transaction()
+  secondFunding.version = 2
+  secondFunding.addInput(Buffer.alloc(32), 0xffffffff)
+  secondFunding.addOutput(
+    payments.p2wpkh({
+      pubkey: Buffer.from(second.derived.publicKey.slice(2), 'hex'),
+      network: networks.bitcoin
+    }).output,
+    100000
+  )
   const change = keyMaterial(8, true, 1)
   const withRoot = derived => ({
     ...derived,
@@ -234,7 +281,7 @@ test('spends Ledger receive children together and reserves a change child on the
         activity: { confirmedTransactionCount: 1, mempoolTransactionCount: 0, used: true },
         utxos: [
           {
-            transactionId: 'c'.repeat(64),
+            transactionId: secondFunding.getId(),
             outputIndex: 0,
             valueRaw: '100000',
             status: {
@@ -272,6 +319,10 @@ test('spends Ledger receive children together and reserves a change child on the
   const changeCalls = []
   const testHarness = harness({
     discovery,
+    extraRawTransactions: {
+      [baseline.funding.getId()]: baseline.funding.toHex(),
+      [secondFunding.getId()]: secondFunding.toHex()
+    },
     derivedSigner: { ...withRoot(baseline.sender.derived), masterFingerprint: '0x01020304' },
     changeReservations: {
       reserve: async input => {
@@ -325,6 +376,7 @@ test('prepares Max without allocating a change address', async () => {
   expect(testHarness.calls.map(call => call[0])).toEqual([
     'derive-signer',
     'assert-chain',
+    'raw-transaction',
     'reserve-inputs'
   ])
 })
@@ -332,6 +384,7 @@ test('prepares Max without allocating a change address', async () => {
 test('excludes inputs reserved by another transaction before coin selection', async () => {
   const current = context()
   const testHarness = harness({
+    discovery: current.state,
     inputReservations: [
       {
         schemaVersion: 1,
@@ -340,14 +393,19 @@ test('excludes inputs reserved by another transaction before coin selection', as
         addressType: 'p2wpkh',
         transactionId: 'transaction:bitcoin:other',
         state: 'committed',
-        outpoints: [{ transactionId: 'a'.repeat(64), outputIndex: 0 }],
+        outpoints: [{ transactionId: current.funding.getId(), outputIndex: 0 }],
         createdAt: 2_500,
         updatedAt: 2_500
       }
     ]
   })
 
-  await expect(testHarness.coordinator.prepare(prepareInput(testHarness))).rejects.toMatchObject({
+  await expect(
+    testHarness.coordinator.prepare({
+      ...prepareInput(testHarness),
+      chainAccount: current.chainAccount
+    })
+  ).rejects.toMatchObject({
     code: 'insufficient-funds'
   })
   expect(testHarness.calls.map(call => call[0])).toEqual(['derive-signer', 'assert-chain'])
@@ -359,6 +417,7 @@ test('excludes inputs reserved by another transaction before coin selection', as
   expect(alreadyCommitted.calls.map(call => call[0])).toEqual([
     'derive-signer',
     'assert-chain',
+    'raw-transaction',
     'reserve-inputs'
   ])
 })
@@ -393,6 +452,7 @@ test('releases inputs when self-change PSBT construction fails', async () => {
   expect(testHarness.calls.map(call => call[0])).toEqual([
     'derive-signer',
     'assert-chain',
+    'raw-transaction',
     'reserve-inputs',
     'release-inputs'
   ])

@@ -117,7 +117,14 @@ export function MultichainPortfolioPanel({
       : null
   const domainModel = visibleModel
     ? projectPortfolioForDomain(visibleModel, domain, {
-        evmPrivateAvailable: supportsEvmPrivateExecution(scopedAccount?.walletSource)
+        evmPrivateAvailable: supportsEvmPrivateExecution(scopedAccount?.walletSource),
+        bitcoinPrivateAvailable: Boolean(
+          scopedAccount &&
+          scopedAccount.walletSource.kind !== 'hardware' &&
+          scopedAccount.networks.some(
+            network => network.chain.family === 'bitcoin' && network.privateExecutionAddress
+          )
+        )
       })
     : null
   const availableChainIds = resolvePortfolioChainSelection(

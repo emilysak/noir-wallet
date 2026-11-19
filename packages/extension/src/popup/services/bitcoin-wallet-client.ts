@@ -94,6 +94,7 @@ export interface BitcoinTransferPrepareOptions {
   readonly rheaSwapBinding?: import('@/core/transactions/domain').RheaSwapTransactionBinding
   readonly feeTier?: NetworkFeeTier
   readonly bitcoinAddressType?: BitcoinSupportedAddressType
+  readonly executionMode?: 'main' | 'private'
 }
 
 export interface BitcoinWalletIdentity {
@@ -542,6 +543,13 @@ export function createBitcoinWalletClient(
         options?.bitcoinAddressType === undefined
           ? undefined
           : parseClientInput(() => parseBitcoinAddressType(options.bitcoinAddressType))
+      const executionMode = options?.executionMode
+      if (executionMode !== undefined && executionMode !== 'main' && executionMode !== 'private') {
+        throw new BitcoinWalletClientError(
+          'invalid-request',
+          'The Bitcoin wallet request is invalid'
+        )
+      }
       return send(
         {
           type: 'PREPARE_BITCOIN_TRANSFER',
@@ -553,7 +561,8 @@ export function createBitcoinWalletClient(
             ? {}
             : { rheaSwapBinding: options.rheaSwapBinding }),
           ...(feeTier === undefined ? {} : { feeTier }),
-          ...(bitcoinAddressType === undefined ? {} : { bitcoinAddressType })
+          ...(bitcoinAddressType === undefined ? {} : { bitcoinAddressType }),
+          ...(executionMode === undefined ? {} : { executionMode })
         },
         value => parseTransferReview(value, undefined, parsedIntent)
       )

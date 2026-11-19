@@ -105,11 +105,14 @@ import { openConfidentialActivity } from '@/popup/components/transaction/Confide
 import { resolveNativeRouteMaximum } from '@/popup/services/transfer-maximum'
 import {
   normalizePrivateBalanceTransferInput,
+  getBitcoinMoveChains,
   getNearMoveChainIds,
   getPrivateTransferChainIds,
   getTransferDomainBalanceRaw,
+  resolveBitcoinMoveSource,
   resolvePrivateBalanceTransferAmount,
   resolvePrivateBalanceTransferSource,
+  selectBitcoinMoveMethod,
   selectDefaultTransferAssetId,
   type PrivateBalanceTransferDirection,
   type TransferDomain
@@ -684,6 +687,11 @@ function TransferForm() {
     () => getNearMoveChainIds(activeAccount, currentNetwork === 'mainnet'),
     [activeAccount, currentNetwork]
   )
+  const bitcoinMove = useMemo(
+    () => getBitcoinMoveChains(activeAccount, currentNetwork === 'mainnet'),
+    [activeAccount, currentNetwork]
+  )
+  const bitcoinChainIds = bitcoinMove.chainIds
   const currentShieldBalances = useMemo(
     () => shieldBalances ?? shieldPortfolioBalances(portfolio),
     [shieldBalances, portfolio]
@@ -697,7 +705,8 @@ function TransferForm() {
         chain.chain.capabilities.transaction.status === 'available' &&
         ((chain.chain.family === 'evm' && eligibleChainIds.includes(chain.chain.id)) ||
           (chain.chain.family === 'solana' && solanaChainIds.includes(chain.chain.id)) ||
-          (chain.chain.family === 'near' && nearChainIds.includes(chain.chain.id)))
+          (chain.chain.family === 'near' && nearChainIds.includes(chain.chain.id)) ||
+          (chain.chain.family === 'bitcoin' && bitcoinChainIds.includes(chain.chain.id)))
         ? [{ asset, chain }]
         : []
     })
@@ -718,7 +727,8 @@ function TransferForm() {
           item =>
             (eligibleChainIds.includes(item.chain.chain.id) ||
               nearChainIds.includes(item.chain.chain.id) ||
-              (currentNetwork === 'mainnet' && solanaChainIds.includes(item.chain.chain.id))) &&
+              (currentNetwork === 'mainnet' && solanaChainIds.includes(item.chain.chain.id)) ||
+              bitcoinChainIds.includes(item.chain.chain.id)) &&
             !existing.has(item.asset.asset.id)
         )
         .map(({ asset, chain }) => ({ asset, chain }))
@@ -732,6 +742,7 @@ function TransferForm() {
     eligibleChainIds,
     solanaChainIds,
     nearChainIds,
+    bitcoinChainIds,
     shieldEntry
   ])
   const defaultAssetId = useMemo(
@@ -746,13 +757,23 @@ function TransferForm() {
             network: currentNetwork,
             shieldBalances: currentShieldBalances
           })
-        : selectDefaultTransferAssetId({ assets, from, to, eligibleChainIds, solanaChainIds }),
+        : selectDefaultTransferAssetId({
+            assets,
+            from,
+            to,
+            eligibleChainIds,
+            solanaChainIds,
+            bitcoinChainIds:
+              from === 'private' || to === 'private' ? bitcoinMove.privateChainIds : bitcoinChainIds
+          }),
     [
       assets,
       from,
       to,
       eligibleChainIds,
       solanaChainIds,
+      bitcoinChainIds,
+      bitcoinMove.privateChainIds,
       shieldEntry,
       managedAssets,
       catalogTokens,
@@ -851,7 +872,8 @@ function TransferForm() {
     selectedAssetId &&
     (!requestedChain ||
       (requestedChain.status === 'ready' &&
-        (!eligibleChainIds.includes(requestedChain.chain.id) ||
+        ((!eligibleChainIds.includes(requestedChain.chain.id) &&
+          !bitcoinChainIds.includes(requestedChain.chain.id)) ||
           requestedChain.chain.capabilities.transaction.status !== 'available' ||
           !requestedAssetKnown)))
   )
@@ -951,13 +973,24 @@ function TransferForm() {
   const mainnetConfidentialChain = Boolean(
     currentNetwork === 'mainnet' &&
     selected &&
-    (selected.chain.chain.family === 'near' || selected.chain.chain.family === 'solana')
+    (selected.chain.chain.family === 'near' ||
+      selected.chain.chain.family === 'solana' ||
+      selected.chain.chain.family === 'bitcoin')
   )
+  const bitcoinPrivateReady = Boolean(
+    selected?.chain.chain.family === 'bitcoin' &&
+    bitcoinMove.privateChainIds.includes(selected.chain.chain.id) &&
+    privateAddress
+  )
+  const bitcoinPrivateRoute = from === 'private' || to === 'private'
   const eligible = Boolean(
     selected &&
     (eligibleChainIds.includes(selected.chain.chain.id) ||
       solanaChainIds.includes(selected.chain.chain.id) ||
-      nearChainIds.includes(selected.chain.chain.id))
+      nearChainIds.includes(selected.chain.chain.id) ||
+      (selected.chain.chain.family === 'bitcoin' &&
+        bitcoinChainIds.includes(selected.chain.chain.id) &&
+        (!bitcoinPrivateRoute || bitcoinPrivateReady)))
   )
   const direction: PrivateBalanceTransferDirection =
     from === 'private' ? 'private-to-main' : 'main-to-private'
@@ -990,17 +1023,26 @@ function TransferForm() {
           mainAddress,
           privateAddress
         })
-      : mainnetConfidentialChain && mainAddress
-        ? {
-            availableRaw: sourceRaw ?? '0',
-            sender: from === 'private' && privateAddress ? privateAddress : mainAddress,
-            recipient: to === 'private' && privateAddress ? privateAddress : mainAddress,
-            executionMode: (from === 'private' && privateAddress ? 'private' : 'main') as
-              | 'main'
-              | 'private',
-            sourceLabel: from === 'private' ? ('Private' as const) : ('Public' as const)
-          }
-        : null
+      : selected?.chain.chain.family === 'bitcoin'
+        ? resolveBitcoinMoveSource({
+            from,
+            to,
+            mainAddress,
+            privateAddress,
+            privateAvailable: bitcoinPrivateReady,
+            balanceRaw: sourceRaw ?? '0'
+          })
+        : mainnetConfidentialChain && mainAddress
+          ? {
+              availableRaw: sourceRaw ?? '0',
+              sender: from === 'private' && privateAddress ? privateAddress : mainAddress,
+              recipient: to === 'private' && privateAddress ? privateAddress : mainAddress,
+              executionMode: (from === 'private' && privateAddress ? 'private' : 'main') as
+                | 'main'
+                | 'private',
+              sourceLabel: from === 'private' ? ('Private' as const) : ('Public' as const)
+            }
+          : null
   const supportedPair =
     (from === 'public' && to === 'private') || (from === 'private' && to === 'public')
   const shieldPair =
@@ -1023,11 +1065,22 @@ function TransferForm() {
     privateAddress &&
     mainAddress !== privateAddress
   )
+  const bitcoinClusterPair = Boolean(
+    isClusterTransferRoute(from, to) &&
+    selected?.chain.chain.family === 'bitcoin' &&
+    currentNetwork === 'mainnet' &&
+    bitcoinPrivateReady &&
+    managedAsset &&
+    mainAddress &&
+    privateAddress &&
+    mainAddress !== privateAddress
+  )
+  const externalClusterPair = solanaClusterPair || bitcoinClusterPair
   const clusterPair =
     (isClusterTransferRoute(from, to) &&
       (selected?.chain.chain.family === 'evm' ||
         (selected?.chain.chain.family === 'near' && mainnetConfidentialChain))) ||
-    solanaClusterPair
+    externalClusterPair
   const clusterSelected = method === 'cluster' && clusterPair
   const fundingRoute = Boolean(shieldPair || clusterSelected)
   useEffect(() => {
@@ -1078,12 +1131,16 @@ function TransferForm() {
   ])
   const solanaShieldDestination =
     from === 'shield' && selected?.chain.chain.family === 'solana' ? selected : null
+  const bitcoinShieldDestination =
+    from === 'shield' && selected?.chain.chain.family === 'bitcoin' ? selected : null
   const destinationChoices =
     destinationOptions.length > 0
       ? [...new Map(destinationOptions.map(item => [item.chain.chain.id, item])).values()]
       : solanaShieldDestination
         ? [solanaShieldDestination]
-        : []
+        : bitcoinShieldDestination
+          ? [bitcoinShieldDestination]
+          : []
   const destinationNetworkOptions: ChainSelectorOption[] = destinationChoices.map(item => ({
     id: item.chain.chain.id,
     name: item.chain.chain.displayName,
@@ -1142,7 +1199,10 @@ function TransferForm() {
     to,
     currentShieldBalances
   ])
-  const targetAsset = from === 'shield' ? (destination ?? solanaShieldDestination) : selected
+  const targetAsset =
+    from === 'shield'
+      ? (destination ?? solanaShieldDestination ?? bitcoinShieldDestination)
+      : selected
   const targetNetwork = activeAccount?.networks.find(
     item => item.chain.id === targetAsset?.chain.chain.id
   )
@@ -1197,7 +1257,7 @@ function TransferForm() {
         })
       : null
   const solanaClusterMaximumRaw = (() => {
-    if (!solanaClusterPair || !sourceRaw) return null
+    if (!externalClusterPair || !sourceRaw) return null
     if (selected?.asset.asset.kind !== 'native') return sourceRaw
     if (!solanaClusterFeeRaw || !/^\d+$/.test(solanaClusterFeeRaw)) return null
     const remaining = BigInt(sourceRaw) - BigInt(solanaClusterFeeRaw)
@@ -1209,7 +1269,7 @@ function TransferForm() {
           balanceRaw: shieldSourceRaw,
           decimals: selected.asset.metadata.decimals,
           isNative: from !== 'shield' && selected.asset.asset.kind === 'native',
-          maximumRaw: solanaClusterPair && from !== 'shield' ? solanaClusterMaximumRaw : null
+          maximumRaw: externalClusterPair && from !== 'shield' ? solanaClusterMaximumRaw : null
         })
       : null
   const maxAmount =
@@ -1321,7 +1381,7 @@ function TransferForm() {
     clusterEstimate.value && clusterNetworkFee
       ? { ...clusterEstimate.value, sourceNetworkFee: clusterNetworkFee }
       : clusterEstimate.value
-  const quotedSolanaFee = solanaClusterPair
+  const quotedSolanaFee = externalClusterPair
     ? (clusterEstimate.value?.sourceNetworkFee?.raw ?? null)
     : null
   if (quotedSolanaFee !== solanaClusterFeeRaw) setSolanaClusterFeeRaw(quotedSolanaFee)
@@ -1367,6 +1427,15 @@ function TransferForm() {
     setMethod('cluster')
   }, [clusterPair, clusterAvailable, clusterUnavailable, method])
   useEffect(() => {
+    if (bitcoinClusterPair) {
+      const next = selectBitcoinMoveMethod({
+        method,
+        clusterQuoteFailed: clusterUnavailable,
+        directQuoteFailed: directUnavailable
+      })
+      if (next !== method) setMethod(next)
+      return
+    }
     if (method === 'cluster' && clusterUnavailable && (directQuoted || solanaClusterPair)) {
       userPickedMethod.current = false
       setMethod('directly')
@@ -1447,7 +1516,9 @@ function TransferForm() {
     )
       return
     const family = selected.chain.chain.family
-    if (family !== 'evm' && family !== 'near' && family !== 'solana') return
+    if (family !== 'evm' && family !== 'near' && family !== 'solana' && family !== 'bitcoin') {
+      return
+    }
     navigate(
       direction === 'main-to-private'
         ? buildAddToPrivateMovePath({
@@ -1537,12 +1608,12 @@ function TransferForm() {
     return domain === 'private' ? privateAddress : mainAddress
   }
   const maxDisabled = fundingRoute
-    ? (!eligible && !solanaClusterPair) ||
+    ? (!eligible && !externalClusterPair) ||
       !managedAsset ||
       shieldConnection !== 'connected' ||
       !shieldAvailable ||
       BigInt(shieldAvailable.amountRaw) === 0n ||
-      (solanaClusterPair &&
+      (externalClusterPair &&
         selected?.asset.asset.kind === 'native' &&
         solanaClusterMaximumRaw === null)
     : !eligible ||
@@ -1618,7 +1689,9 @@ function TransferForm() {
         asset: selected.asset,
         chain: selected.chain,
         managed: managedAsset,
-        ...(from === 'shield' || solanaClusterPair ? {} : { feeSelection }),
+        ...(from === 'shield' || externalClusterPair || selected!.chain.chain.family === 'bitcoin'
+          ? {}
+          : { feeSelection }),
         ...(from === 'shield' && destination ? { destination } : {}),
         dedupKey
       })
@@ -1650,6 +1723,14 @@ function TransferForm() {
     } catch (error) {
       if (scopeStillCurrent()) {
         const message = error instanceof Error ? error.message : ''
+        if (message.includes('Bitcoin private deposit signing is unavailable')) {
+          setShieldError('Bitcoin private deposit signing is unavailable')
+          return
+        }
+        if (message.startsWith('Confidential funding') || message.startsWith('Bitcoin ')) {
+          setShieldError(message)
+          return
+        }
         const classifiedMessage = classifyError(error).userMessage
         const userMessage =
           message === 'Gas limit is below the estimated gas required'
@@ -2625,7 +2706,13 @@ function TransferForm() {
                   key={domain}
                   type="button"
                   onClick={() => domainPicker && selectDomain(domain, domainPicker)}
-                  disabled={!pickerIsActive || !address}
+                  disabled={
+                    !pickerIsActive ||
+                    !address ||
+                    (domain === 'private' &&
+                      selected?.chain.chain.family === 'bitcoin' &&
+                      !bitcoinMove.privateChainIds.includes(selected.chain.chain.id))
+                  }
                   aria-label={`Select ${domainLabel(domain)} account`}
                   aria-pressed={pickerIsActive && (domainPicker === 'from' ? from : to) === domain}
                   className={cn(

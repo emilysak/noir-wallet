@@ -151,8 +151,10 @@ export {
   assertBitcoinSigningSummaryMatchesPrepared,
   computeBitcoinSigningPayloadFingerprint,
   createBitcoinSigningSummary,
+  createBitcoinPeaSigningPreparePayload,
   createBitcoinSigningPreparePayload,
   KEYSTONE_BITCOIN_SIGNING_TTL_MS,
+  type BitcoinPeaSigningPreparePayload,
   type BitcoinSigningPreparePayload
 } from './bitcoin-signing-summary-validator'
 export {

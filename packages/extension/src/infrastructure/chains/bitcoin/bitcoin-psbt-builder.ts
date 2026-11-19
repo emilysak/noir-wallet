@@ -1,5 +1,13 @@
 import * as secp256k1 from '@bitcoinerlab/secp256k1'
-import { address, initEccLib, networks, payments, Psbt, Transaction } from 'bitcoinjs-lib'
+import {
+  address,
+  crypto as bitcoinCrypto,
+  initEccLib,
+  networks,
+  payments,
+  Psbt,
+  Transaction
+} from 'bitcoinjs-lib'
 import { Buffer } from 'buffer'
 import type { DerivedBitcoinAddress } from '@/core/chains/bitcoin'
 import {
@@ -19,6 +27,7 @@ import {
   parseBitcoinPublicKey,
   type BitcoinChangeOutputPosition,
   type BitcoinCoinSelection,
+  type BitcoinPreviousTransaction,
   type BitcoinSpendableUtxo,
   type BuildBitcoinPsbtInput,
   type PreparedBitcoinPsbt
@@ -350,13 +359,17 @@ function keyOrigin(
   }
 }
 
+function requiresPreviousTransaction(addressType: BitcoinCoinSelection['addressType']): boolean {
+  return addressType !== 'p2tr'
+}
+
 function parsePreviousTransactions(
   value: unknown,
   selection: BitcoinCoinSelection
 ): ReadonlyMap<string, Transaction> {
-  if (selection.addressType !== 'p2pkh') {
+  if (!requiresPreviousTransaction(selection.addressType)) {
     if (value !== undefined) {
-      failInvalidBitcoinTransaction('Previous transactions are only valid for P2PKH inputs')
+      failInvalidBitcoinTransaction('Previous transactions are only valid for non-Taproot inputs')
     }
     return new Map()
   }
@@ -365,7 +378,7 @@ function parsePreviousTransactions(
     value.length === 0 ||
     value.length > BITCOIN_MAXIMUM_SELECTION_UTXOS
   ) {
-    failInvalidBitcoinTransaction('P2PKH inputs require previous transactions')
+    failInvalidBitcoinTransaction('Bitcoin inputs require previous transactions')
   }
   const transactions = new Map<string, Transaction>()
   for (const candidate of value) {
@@ -420,22 +433,37 @@ function addInput(
     utxo.derivationPath,
     masterFingerprint
   )
-  if (selection.addressType === 'p2pkh') {
-    const previous = previousTransactions.get(utxo.transactionId)
-    const output = previous?.outs[utxo.outputIndex]
-    if (
-      !previous ||
+  const previous = previousTransactions.get(utxo.transactionId)
+  const output = previous?.outs[utxo.outputIndex]
+  if (
+    selection.addressType !== 'p2tr' &&
+    (!previous ||
       !output ||
       output.value !== Number(BigInt(utxo.valueSats)) ||
-      !output.script.equals(script)
-    ) {
-      failInvalidBitcoinTransaction('Bitcoin previous transaction output does not match discovery')
-    }
+      !output.script.equals(script))
+  ) {
+    failInvalidBitcoinTransaction('Bitcoin previous transaction output does not match discovery')
+  }
+  if (selection.addressType === 'p2pkh') {
     psbt.addInput({
       hash: utxo.transactionId,
       index: utxo.outputIndex,
       sequence: BITCOIN_RBF_SEQUENCE,
-      nonWitnessUtxo: previous.toBuffer(),
+      nonWitnessUtxo: previous!.toBuffer(),
+      ...origin
+    })
+    return
+  }
+  if (selection.addressType === 'p2wpkh' || selection.addressType === 'p2sh-p2wpkh') {
+    psbt.addInput({
+      hash: utxo.transactionId,
+      index: utxo.outputIndex,
+      sequence: BITCOIN_RBF_SEQUENCE,
+      witnessUtxo: {
+        script,
+        value: Number(BigInt(utxo.valueSats))
+      },
+      nonWitnessUtxo: previous!.toBuffer(),
       ...origin
     })
     return
@@ -539,6 +567,215 @@ export function buildBitcoinPsbt(input: BuildBitcoinPsbtInput): PreparedBitcoinP
     recipient: selection.recipient,
     recipientOutputIndex,
     changeAddress: changeAddress?.address ?? null,
+    changeOutputIndex,
+    selectedTotalSats: selection.selectedTotalSats,
+    amountSats: selection.amountSats,
+    feeSats: selection.feeSats,
+    changeSats: selection.changeSats,
+    estimatedVbytes: selection.estimatedVbytes,
+    feeRateSatsPerVbyte: selection.feeRateSatsPerVbyte
+  })
+}
+
+export interface BuildBitcoinPrivateExecutionPsbtInput {
+  readonly selection: BitcoinCoinSelection
+  readonly publicKey: string
+  readonly lockTime: number
+  readonly previousTransactions: readonly BitcoinPreviousTransaction[]
+  readonly privateExecutionAddress: string
+  readonly publicReceiveAddress: string
+  readonly changeOutputPosition: BitcoinChangeOutputPosition | null
+}
+
+function importedKeyFingerprint(publicKey: Buffer): Buffer {
+  return bitcoinCrypto.hash160(publicKey).subarray(0, 4)
+}
+
+function importedKeyOrigin(publicKey: string, fingerprint: Buffer) {
+  return {
+    bip32Derivation: [
+      {
+        masterFingerprint: fingerprint,
+        pubkey: publicKeyBuffer(publicKey),
+        path: 'm'
+      }
+    ]
+  }
+}
+
+export function buildBitcoinPrivateExecutionPsbt(
+  input: BuildBitcoinPrivateExecutionPsbtInput
+): PreparedBitcoinPsbt {
+  ensureBitcoinEcc()
+  if (
+    !hasExactKeys(input, [
+      'selection',
+      'publicKey',
+      'lockTime',
+      'previousTransactions',
+      'privateExecutionAddress',
+      'publicReceiveAddress',
+      'changeOutputPosition'
+    ])
+  ) {
+    failInvalidBitcoinTransaction('Invalid Bitcoin private execution PSBT input')
+  }
+  const selection = input.selection
+  if (selection.addressType !== 'p2wpkh') {
+    failInvalidBitcoinTransaction('Bitcoin private execution spends Native SegWit')
+  }
+  const privateExecutionAddress = parseBitcoinAddress(
+    input.privateExecutionAddress,
+    selection.chainId,
+    'p2wpkh'
+  )
+  const publicReceiveAddress = parseBitcoinAddress(input.publicReceiveAddress, selection.chainId)
+  if (privateExecutionAddress === publicReceiveAddress) {
+    failInvalidBitcoinTransaction('Bitcoin private execution address is unavailable')
+  }
+  if (selection.recipient === publicReceiveAddress) {
+    failInvalidBitcoinTransaction('Bitcoin private transfer cannot pay the public address')
+  }
+  const publicKey = parseBitcoinPublicKey(input.publicKey)
+  assertPublicKeyMatchesAddress(publicKey, privateExecutionAddress, selection.chainId, 'p2wpkh')
+  const changeSats = BigInt(selection.changeSats)
+  const changeOutputPosition = input.changeOutputPosition
+  if (
+    (changeSats > 0n && changeOutputPosition !== 'first' && changeOutputPosition !== 'last') ||
+    (changeSats === 0n && changeOutputPosition !== null)
+  ) {
+    failInvalidBitcoinTransaction('Bitcoin change output does not match the coin selection')
+  }
+  const network = bitcoinNetwork(selection.chainId)
+  const privateScript = address.toOutputScript(privateExecutionAddress, network)
+  const publicScript = address.toOutputScript(publicReceiveAddress, network)
+  if (privateScript.equals(publicScript)) {
+    failInvalidBitcoinTransaction('Bitcoin private execution address is unavailable')
+  }
+  const previousTransactions = new Map<string, Transaction>()
+  if (
+    !Array.isArray(input.previousTransactions) ||
+    input.previousTransactions.length === 0 ||
+    input.previousTransactions.length > BITCOIN_MAXIMUM_SELECTION_UTXOS
+  ) {
+    failInvalidBitcoinTransaction('Bitcoin private execution inputs require previous transactions')
+  }
+  for (const candidate of input.previousTransactions) {
+    if (
+      !hasExactKeys(candidate, ['transactionId', 'rawTransactionHex']) ||
+      typeof candidate.transactionId !== 'string' ||
+      typeof candidate.rawTransactionHex !== 'string'
+    ) {
+      failInvalidBitcoinTransaction('Invalid Bitcoin previous transaction')
+    }
+    let transaction: Transaction
+    try {
+      transaction = Transaction.fromHex(candidate.rawTransactionHex)
+    } catch {
+      failInvalidBitcoinTransaction('Invalid Bitcoin previous transaction')
+    }
+    if (
+      transaction.getId() !== candidate.transactionId ||
+      previousTransactions.has(candidate.transactionId)
+    ) {
+      failInvalidBitcoinTransaction('Bitcoin previous transaction does not match its ID')
+    }
+    previousTransactions.set(candidate.transactionId, transaction)
+  }
+  for (const utxo of selection.selectedUtxos) {
+    if (utxo.address === publicReceiveAddress || utxo.address !== privateExecutionAddress) {
+      failInvalidBitcoinTransaction(
+        utxo.address === publicReceiveAddress
+          ? 'Bitcoin private transfer cannot spend the public address'
+          : 'Bitcoin private transfer input is not the private execution address'
+      )
+    }
+    const previous = previousTransactions.get(utxo.transactionId)
+    const output = previous?.outs[utxo.outputIndex]
+    const spendsPublicAddress = Boolean(output && output.script.equals(publicScript))
+    if (
+      !previous ||
+      !output ||
+      output.value !== Number(BigInt(utxo.valueSats)) ||
+      !output.script.equals(privateScript) ||
+      spendsPublicAddress
+    ) {
+      failInvalidBitcoinTransaction(
+        spendsPublicAddress
+          ? 'Bitcoin private transfer cannot spend the public address'
+          : 'Bitcoin private transfer input is not the private execution address'
+      )
+    }
+  }
+
+  const fingerprint = importedKeyFingerprint(publicKeyBuffer(publicKey))
+  const origin = importedKeyOrigin(publicKey, fingerprint)
+  const psbt = new Psbt({ network })
+  psbt
+    .setVersion(2)
+    .setLocktime(parseBitcoinIndex(input.lockTime, 'Bitcoin lock time', MAXIMUM_LOCK_TIME))
+  for (const utxo of selection.selectedUtxos) {
+    const previous = previousTransactions.get(utxo.transactionId)
+    if (!previous) {
+      failInvalidBitcoinTransaction(
+        'Bitcoin private transfer input is not the private execution address'
+      )
+    }
+    // preparePeaBitcoinPsbt signs this as an imported key. A BIP84 origin is
+    // rejected, and a P2WPKH input without the full previous transaction is too.
+    psbt.addInput({
+      hash: utxo.transactionId,
+      index: utxo.outputIndex,
+      sequence: BITCOIN_RBF_SEQUENCE,
+      nonWitnessUtxo: previous.toBuffer(),
+      witnessUtxo: {
+        script: privateScript,
+        value: Number(BigInt(utxo.valueSats))
+      },
+      ...origin
+    })
+  }
+  const recipientOutput = Object.freeze({
+    address: selection.recipient,
+    value: Number(BigInt(selection.amountSats))
+  })
+  const changeOutput =
+    changeSats === 0n
+      ? null
+      : Object.freeze({
+          address: privateExecutionAddress,
+          value: Number(changeSats),
+          ...origin
+        })
+  if (changeOutputPosition === 'first' && changeOutput) psbt.addOutput(changeOutput)
+  psbt.addOutput(recipientOutput)
+  if (changeOutputPosition === 'last' && changeOutput) psbt.addOutput(changeOutput)
+  if (
+    psbt.txOutputs.some(output => output.script.equals(publicScript)) ||
+    psbt.data.inputs.some(input => input.witnessUtxo?.script.equals(publicScript))
+  ) {
+    failInvalidBitcoinTransaction('Bitcoin private transfer cannot pay the public address')
+  }
+
+  const unsignedTransaction = Transaction.fromBuffer(psbt.data.globalMap.unsignedTx.toBuffer())
+  const recipientOutputIndex = changeOutputPosition === 'first' ? 1 : 0
+  const changeOutputIndex =
+    changeOutputPosition === null ? null : changeOutputPosition === 'first' ? 0 : 1
+  return Object.freeze({
+    schemaVersion: 1,
+    chainId: selection.chainId,
+    accountIndex: selection.accountIndex,
+    addressType: 'p2wpkh',
+    psbtBase64: psbt.toBase64(),
+    unsignedTransactionId: unsignedTransaction.getId(),
+    transactionVersion: 2,
+    lockTime: psbt.locktime,
+    rbf: true,
+    inputCount: selection.selectedUtxos.length,
+    outputCount: changeOutput === null ? 1 : 2,
+    recipient: selection.recipient,
+    recipientOutputIndex,
+    changeAddress: changeSats === 0n ? null : privateExecutionAddress,
     changeOutputIndex,
     selectedTotalSats: selection.selectedTotalSats,
     amountSats: selection.amountSats,

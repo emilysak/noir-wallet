@@ -56,7 +56,10 @@ import {
   resolveIntentsEvmAssets,
   resolveIntentsEvmChainId
 } from '@/core/services/intents-evm-assets'
-import type { BitcoinSupportedAddressType } from '@/core/chains/bitcoin'
+import {
+  parseSupportedBitcoinAddress,
+  type BitcoinSupportedAddressType
+} from '@/core/chains/bitcoin'
 import { resolveIntentsWalletAsset } from '@/core/services/intents-wallet-assets'
 import { NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS } from '@/core/services/confidential-funding/native-confidential-protocol-assets'
 import { WNEAR_NEAR_ASSET } from '@/config/intents'
@@ -92,6 +95,7 @@ export type WalletOwnedQuoteAsset = Readonly<
   | (WalletOwnedQuoteAssetBase & {
       readonly family: 'bitcoin'
       readonly bitcoinAddressType: BitcoinSupportedAddressType
+      readonly executionMode?: 'private'
     })
 >
 
@@ -479,6 +483,31 @@ function selectDisplayedNearPrivateBalance(asset: PortfolioAssetView): Portfolio
   return projectAccountBalance(asset, asset.balance.privateRaw ?? '0')
 }
 
+// A missing Bitcoin privateRaw is an empty PEA balance. This projection
+// cannot spend the public receive balance.
+function selectDisplayedBitcoinPrivateBalance(asset: PortfolioAssetView): PortfolioAssetView {
+  return projectAccountBalance(asset, asset.balance?.privateRaw ?? '0')
+}
+
+function selectBitcoinPrivateExecutionAddress(
+  source: Extract<WalletOwnedQuoteAsset, { family: 'bitcoin' }>,
+  privateExecutionAddress: string | undefined
+): string | null {
+  if (!privateExecutionAddress) return null
+  try {
+    const derived = parseSupportedBitcoinAddress(
+      privateExecutionAddress,
+      source.chain.chain.id,
+      'p2wpkh'
+    )
+    // Keep the derived address string. Do not fold case onto the public refund address.
+    if (derived !== privateExecutionAddress || derived === source.refundAddress) return null
+    return derived
+  } catch {
+    return null
+  }
+}
+
 function isSolanaExecutionAddress(value: string): boolean {
   try {
     parseSolanaPublicKey(value)
@@ -534,6 +563,18 @@ export function selectWalletOwnedQuoteAssetExecution(
       asset: selectDisplayedNearPrivateBalance(source.asset),
       networkFeeAsset: selectDisplayedNearPrivateBalance(source.networkFeeAsset),
       refundAddress: privateExecutionAddress
+    })
+  }
+  if (source.family === 'bitcoin') {
+    if (mode !== 'private') return source
+    const refundAddress = selectBitcoinPrivateExecutionAddress(source, privateExecutionAddress)
+    if (!refundAddress) return null
+    return Object.freeze({
+      ...source,
+      asset: selectDisplayedBitcoinPrivateBalance(source.asset),
+      networkFeeAsset: selectDisplayedBitcoinPrivateBalance(source.networkFeeAsset),
+      refundAddress,
+      executionMode: 'private' as const
     })
   }
   if (source.family !== 'evm') return mode === 'main' ? source : null
@@ -962,7 +1003,8 @@ export function createQuoteDepositTransferClient(options: {
         },
         {
           bitcoinAddressType: input.source.bitcoinAddressType,
-          ...(input.feeTier === undefined ? {} : { feeTier: input.feeTier })
+          ...(input.feeTier === undefined ? {} : { feeTier: input.feeTier }),
+          ...(input.source.executionMode === 'private' ? { executionMode: 'private' as const } : {})
         }
       )
       try {
@@ -1049,7 +1091,8 @@ export function createQuoteDepositTransferClient(options: {
           nearIntentsBinding: input.nearIntentsBinding,
           rheaSwapBinding: input.rheaSwapBinding,
           bitcoinAddressType: input.source.bitcoinAddressType,
-          ...(input.feeTier === undefined ? {} : { feeTier: input.feeTier })
+          ...(input.feeTier === undefined ? {} : { feeTier: input.feeTier }),
+          ...(input.source.executionMode === 'private' ? { executionMode: 'private' as const } : {})
         }
       )
       return Object.freeze({ family: 'bitcoin' as const, source: input.source, review })

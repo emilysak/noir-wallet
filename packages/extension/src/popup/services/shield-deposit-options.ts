@@ -1,4 +1,4 @@
-import { getSolanaNetworkConfig } from '@/config/networks'
+import { getBitcoinNetworkConfig, getSolanaNetworkConfig } from '@/config/networks'
 import { getActiveChainEndpointSettings } from '@/core/chains/chain-endpoint-settings'
 import { resolveEvmNetworkCatalog } from '@/core/chains/evm-runtime-config'
 import {
@@ -19,6 +19,7 @@ import type { SwapToken } from '@/core/services/intents-api'
 import { resolveManagedIntentsCatalogAsset } from './intents-asset-manager-client'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import { parseZcashAddress } from '@/core/address-book/address-book'
+import { parseSupportedBitcoinAddress } from '@/core/chains/bitcoin'
 import { parseNearAccountId } from '@/core/chains/near'
 import { parseSolanaPublicKey } from '@/core/chains/solana'
 import {
@@ -61,6 +62,9 @@ export function depositTokenChainId(token: SwapToken): string | null {
   if (blockchain === 'zec' || blockchain === 'zcash') return getZcashChainId('mainnet')
   if (blockchain === 'sol' || blockchain === 'solana')
     return getSolanaNetworkConfig('mainnet').chainId
+  if (DEFAULT_NETWORK === 'mainnet' && (blockchain === 'btc' || blockchain === 'bitcoin')) {
+    return getBitcoinNetworkConfig('mainnet').chainId
+  }
   if (DEFAULT_NETWORK === 'mainnet' && blockchain === 'near') {
     return resolveIntentsWalletAsset(token, 'mainnet')?.chainId ?? null
   }
@@ -82,7 +86,8 @@ export function depositSourceNetworks(): readonly ChainDefinition[] {
         chain.family === 'evm' ||
         chain.family === 'zcash' ||
         chain.family === 'near' ||
-        chain.family === 'solana'
+        chain.family === 'solana' ||
+        chain.family === 'bitcoin'
     )
 }
 
@@ -164,6 +169,13 @@ export function defaultDepositRefundAddress(
   ) {
     return accountNetwork.privateExecutionAddress
   }
+  if (network?.family === 'bitcoin') {
+    return (
+      accountNetwork?.addresses.find(address => address.preferredForReceive)?.value ??
+      accountNetwork?.addresses.find(address => address.privacy === 'transparent')?.value ??
+      ''
+    )
+  }
   if (network?.family === 'solana') {
     const mainAddress =
       accountNetwork?.addresses.find(address => address.preferredForReceive)?.value ??
@@ -222,6 +234,14 @@ export function depositRefundAddressError(
       return null
     } catch {
       return 'Enter a valid NEAR account'
+    }
+  }
+  if (network.family === 'bitcoin') {
+    try {
+      parseSupportedBitcoinAddress(value, network.id)
+      return null
+    } catch {
+      return 'Enter a valid Bitcoin address'
     }
   }
   return 'Select a supported network'

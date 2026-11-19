@@ -1695,6 +1695,28 @@ test.describe('Runtime message security', () => {
       feeTier: 'low',
       bitcoinAddressType: 'p2tr'
     })
+    expect(
+      parseTrustedExtensionRuntimeMessage({
+        type: 'PREPARE_BITCOIN_TRANSFER',
+        intent: bitcoinQuoteIntent,
+        nearIntentsBinding,
+        bitcoinAddressType: 'p2wpkh',
+        executionMode: 'private'
+      })
+    ).toEqual({
+      type: 'PREPARE_BITCOIN_TRANSFER',
+      intent: bitcoinQuoteIntent,
+      nearIntentsBinding,
+      bitcoinAddressType: 'p2wpkh',
+      executionMode: 'private'
+    })
+    expect(() =>
+      parseTrustedExtensionRuntimeMessage({
+        type: 'PREPARE_BITCOIN_TRANSFER',
+        intent: bitcoinQuoteIntent,
+        executionMode: 'public'
+      })
+    ).toThrow(/schema/i)
     expect(() =>
       parseTrustedExtensionRuntimeMessage({
         type: 'PREPARE_BITCOIN_TRANSFER',

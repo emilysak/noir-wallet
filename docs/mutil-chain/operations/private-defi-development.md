@@ -1,6 +1,6 @@
 # Confidential DeFi Development and Troubleshooting
 
-This guide covers local setup, data sources, recovery, and diagnosis for mnemonic and imported EVM private-key accounts using a Global PEA, Confidential balances, internal transfers, Confidential Send/Swap, and dApp Confidential asset transfers. Hardware accounts and private keys imported for other chain families do not support Confidential execution. The shared account capability is defined in `packages/extension/src/core/chains/evm/execution-capability.ts`; funding boundaries are enforced in `packages/extension/src/core/services/confidential-funding/` and the routes named below.
+This guide covers local setup, data sources, recovery, and diagnosis for mnemonic and imported EVM private-key accounts using a Global PEA, Confidential balances, internal transfers, Confidential Send/Swap, and dApp Confidential asset transfers. Hardware accounts cannot run Confidential execution. Imported keys for a non-EVM family do not sign Confidential intents. A software or imported Bitcoin account can still fund and receive native BTC through its selected public address and one P2WPKH private execution address; the intent itself remains signed by the EVM account. The shared account capability is defined in `packages/extension/src/core/chains/evm/execution-capability.ts`; funding boundaries are enforced in `packages/extension/src/core/services/confidential-funding/` and the routes named below.
 
 ## 1. Account and Balance Model
 
@@ -13,6 +13,8 @@ This guide covers local setup, data sources, recovery, and diagnosis for mnemoni
 | Directly spendable Confidential balance | Only the Global PEA's `privateOnchainRaw`.                                                                                                       |
 
 The UI separates Public / Private usage modes from Public / Shield / Private asset categories. Internal names such as `private`, `PrivateExecution`, and `privateOnchainRaw` do not make abstract balances spendable from the PEA.
+
+Bitcoin uses those same three displayed domains. Public is the selected receive address. Private is one P2WPKH PEA derived in WASM, separate from the EVM Global PEA and from the public balance. Shield is the confidential balance of `nep141:btc.omft.near`, credited to the EVM signer. A deposit pays the quote's `bc1` address from the selected Bitcoin address, and change returns to that same address. Withdrawals and Cluster intents use the existing `erc191` session. A missing PEA does not spend the public address.
 
 Directly and Shield balances use the RHEA/1Click services below. Cluster additionally uses the configured RHEA `/v3/private` service to schedule signed withdrawals and reconcile orders. Its history queries require a separate wallet JWT obtained through a strictly validated read-only sign-in challenge; a scheduler acknowledgement does not establish destination settlement.
 

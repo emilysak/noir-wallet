@@ -5,7 +5,7 @@ import type {
   ConfidentialPortfolioView
 } from '@/core/portfolio'
 import type { AssetRegistry } from '@/core/chains/registry'
-import { getZcashChainId } from '@/core/chains/registry'
+import { getBitcoinChainId, getZcashChainId } from '@/core/chains/registry'
 import type { SwapToken } from '@/core/services/intents-api'
 import { isDeprecatedIntentsToken } from '@/core/services/intents-evm-assets'
 import type { IntentsManagedAsset } from '@/core/services/intents-managed-assets'
@@ -26,12 +26,23 @@ export function filterConfidentialPortfolioMappings(
   network: Network
 ): readonly ConfidentialPortfolioAssetMapping[] {
   const zcashAssetId = `${getZcashChainId(network)}/slip44:133`
+  const bitcoinAssetId = `${getBitcoinChainId(network)}/slip44:0`
   return mappings.filter(
     mapping =>
       mapping.assetId.startsWith('eip155:') ||
       mapping.assetId.startsWith('near:') ||
       mapping.assetId.startsWith('solana:') ||
+      mapping.assetId === bitcoinAssetId ||
       mapping.assetId === zcashAssetId
+  )
+}
+
+function keepsConfidentialBalanceSeparate(assetId: string): boolean {
+  return (
+    assetId.startsWith('near:') ||
+    assetId.startsWith('solana:') ||
+    assetId.startsWith(`${getBitcoinChainId('mainnet')}/`) ||
+    assetId.startsWith(`${getBitcoinChainId('testnet')}/`)
   )
 }
 
@@ -176,8 +187,9 @@ function mergeAsset(
   const confidentialRaw = isDeprecatedIntentsToken({ assetId: mapping.protocolAssetId })
     ? '0'
     : (getConfidentialAvailableForAsset(balances, mapping.protocolAssetId) ?? '0')
-  // NEAR and Solana keep the protocol amount on confidentialRaw. Their on-chain split stays main + private.
-  if (asset.asset.id.startsWith('near:') || asset.asset.id.startsWith('solana:')) {
+  // NEAR, Solana, and Bitcoin keep the 1Click amount on confidentialRaw.
+  // Their on-chain split stays main + private.
+  if (keepsConfidentialBalanceSeparate(asset.asset.id)) {
     return Object.freeze({
       ...asset,
       balance: Object.freeze({

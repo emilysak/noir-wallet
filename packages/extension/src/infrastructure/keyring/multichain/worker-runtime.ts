@@ -27,12 +27,14 @@ import {
   assertRawBitcoinAccountMatches,
   assertRawEd25519AccountMatches,
   assertRawEvmAccountMatches,
+  bitcoinPeaRequestJson,
   globalPeaRequestJson,
   nearPeaRequestJson,
   solanaPeaRequestJson,
   MAX_BIP32_INDEX,
   MAX_UINT64,
   parseRawBitcoinAccount,
+  parseRawBitcoinPeaAccount,
   parseRawCreatedWallet,
   parseRawEncryptedVault,
   parseRawEd25519Account,
@@ -53,6 +55,7 @@ import {
   type RawBitcoinNetwork,
   type RawDerivedAccount,
   type RawDerivedBitcoinAccount,
+  type RawDerivedBitcoinPeaAccount,
   type RawDerivedEd25519Account,
   type RawDerivedPeaAccount,
   type RawPeaExecutionAccount,
@@ -99,6 +102,7 @@ interface PendingSigning {
   readonly account:
     | RawDerivedAccount
     | RawDerivedBitcoinAccount
+    | RawDerivedBitcoinPeaAccount
     | RawDerivedEd25519Account
     | RawDerivedPeaAccount
     | RawPeaExecutionAccount
@@ -239,6 +243,11 @@ function parseAccountDerivation(value: unknown):
       readonly accountIndex: number
     }
   | {
+      readonly family: 'bitcoin-pea'
+      readonly chainId: string
+      readonly accountIndex: number
+    }
+  | {
       readonly family: 'evm'
       readonly chainId: string
       readonly addressIndex: number
@@ -275,7 +284,7 @@ function parseAccountDerivation(value: unknown):
   const record = readRecord(value, 'account.derive-public payload')
   const family = readLiteral(
     record.family,
-    ['evm', 'pea', 'solana-pea', 'near-pea', 'bitcoin', 'solana', 'near'],
+    ['evm', 'pea', 'solana-pea', 'near-pea', 'bitcoin-pea', 'bitcoin', 'solana', 'near'],
     'account family'
   )
   if (family === 'evm') {
@@ -328,6 +337,21 @@ function parseAccountDerivation(value: unknown):
     assertExactKeys(record, ['family', 'accountIndex'], [], 'derive payload')
     return Object.freeze({
       family,
+      accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_BIP32_INDEX)
+    })
+  }
+  if (family === 'bitcoin-pea') {
+    assertExactKeys(record, ['family', 'chainId', 'accountIndex'], [], 'derive payload')
+    const chainId = readString(record.chainId, 'chainId', 64)
+    if (
+      chainId !== 'bip122:000000000019d6689c085ae165831e93' &&
+      chainId !== 'bip122:000000000933ea01ad0ee984209779ba'
+    ) {
+      throw new KeyringError('UNSUPPORTED_CHAIN')
+    }
+    return Object.freeze({
+      family,
+      chainId,
       accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_BIP32_INDEX)
     })
   }
@@ -837,6 +861,19 @@ export class MultichainWorkerRuntime {
     })
   }
 
+  private requireBitcoinPeaParent(
+    session: CredentialSession,
+    accountIndex: number,
+    chainId: string
+  ): void {
+    if (session.kind !== 'private_key') return
+    const network = chainId === 'bip122:000000000019d6689c085ae165831e93' ? 'mainnet' : 'testnet'
+    if (session.chainFamily !== 'bip122' || session.bitcoinNetwork !== network) {
+      throw new KeyringError('UNSUPPORTED_CHAIN')
+    }
+    if (accountIndex !== 0) throw new KeyringError('INVALID_COMMAND')
+  }
+
   private derivePublicAccount(command: KeyringCommand) {
     const binding = requireCredentialBinding(command)
     const session = this.requireSession(binding)
@@ -931,6 +968,24 @@ export class MultichainWorkerRuntime {
         value => parseRawNearPeaAccount(value, derivation.accountIndex)
       )
     }
+    if (derivation.family === 'bitcoin-pea') {
+      this.requireBitcoinPeaParent(session, derivation.accountIndex, derivation.chainId)
+      return callRaw(
+        command,
+        () =>
+          this.engine.derivePeaAccount(
+            session.rawSessionId,
+            bitcoinPeaRequestJson(derivation.accountIndex, derivation.chainId)
+          ),
+        value =>
+          parseRawBitcoinPeaAccount(
+            value,
+            derivation.accountIndex,
+            derivation.chainId,
+            session.kind === 'private_key'
+          )
+      )
+    }
     if (derivation.batch) {
       const accounts = callRaw(
         command,
@@ -1016,6 +1071,7 @@ export class MultichainWorkerRuntime {
 
     let solanaPeaBinding: SolanaPeaSigningBinding | undefined
     let nearPeaBinding: NearPeaSigningBinding | undefined
+    let bitcoinPeaAccount: RawDerivedBitcoinPeaAccount | undefined
     if (payload.kind === 'pea-solana-transaction' || payload.kind === 'pea-solana-message') {
       const pea = callRaw(
         command,
@@ -1088,6 +1144,51 @@ export class MultichainWorkerRuntime {
         expectedPublicKey: pea.publicKey,
         mainAddress: main.address
       })
+    }
+    if (payload.kind === 'pea-bitcoin-psbt') {
+      this.requireBitcoinPeaParent(session, payload.accountIndex, payload.chainId)
+      const pea = callRaw(
+        command,
+        () =>
+          this.engine.derivePeaAccount(
+            session.rawSessionId,
+            bitcoinPeaRequestJson(payload.accountIndex, payload.chainId)
+          ),
+        value =>
+          parseRawBitcoinPeaAccount(
+            value,
+            payload.accountIndex,
+            payload.chainId,
+            session.kind === 'private_key'
+          )
+      )
+      const main = callRaw(
+        command,
+        () =>
+          this.engine.deriveBitcoinAccount(
+            session.rawSessionId,
+            payload.chainId,
+            'p2wpkh',
+            payload.accountIndex,
+            false,
+            0
+          ),
+        value => {
+          const account = parseRawBitcoinAccount(value)
+          assertRawBitcoinAccountMatches(
+            account,
+            payload.chainId,
+            'p2wpkh',
+            payload.accountIndex,
+            false,
+            0,
+            session.kind === 'private_key'
+          )
+          return account
+        }
+      )
+      if (pea.address === main.address) throw new KeyringError('SIGNER_MISMATCH')
+      bitcoinPeaAccount = pea
     }
 
     let raw: unknown
@@ -1167,6 +1268,13 @@ export class MultichainWorkerRuntime {
           payload.accountIndex,
           payload.psbt
         )
+      } else if (payload.kind === 'pea-bitcoin-psbt') {
+        raw = this.engine.preparePeaBitcoinPsbt(
+          session.rawSessionId,
+          bitcoinPeaRequestJson(payload.accountIndex, payload.chainId),
+          payload.chainId,
+          payload.psbt
+        )
       } else if (payload.kind === 'pea-solana-transaction') {
         raw = this.engine.preparePeaSolanaTransaction(
           session.rawSessionId,
@@ -1235,7 +1343,8 @@ export class MultichainWorkerRuntime {
         bitcoinAccount,
         session.kind === 'private_key',
         solanaPeaBinding,
-        nearPeaBinding
+        nearPeaBinding,
+        bitcoinPeaAccount
       )
     } catch {
       this.rejectRawRequest(session.rawSessionId, raw)
@@ -1294,6 +1403,7 @@ export class MultichainWorkerRuntime {
           raw = this.engine.confirmEvmTypedData(pending.rawSessionId, pending.rawRequestId)
           break
         case 'bitcoin-psbt':
+        case 'pea-bitcoin-psbt':
           raw = this.engine.confirmBitcoinPsbt(pending.rawSessionId, pending.rawRequestId)
           break
         case 'bitcoin-bip322-message':

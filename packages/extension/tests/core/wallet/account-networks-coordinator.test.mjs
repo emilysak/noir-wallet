@@ -602,4 +602,120 @@ test.describe('Account networks coordinator', () => {
       (await multiCoin.readCatalog()).accounts[0].networks.map(network => network.chainId)
     ).toEqual([evmChainId, bitcoinChainId])
   })
+
+  test('projects one Bitcoin PEA on read and rejects a mismatched derivation', async () => {
+    const requests = []
+    const bitcoinPeaAddress = 'tb1qhshj2sek7ff9e7gkhq6hsm9sdq8lr8u0dakdzc'
+    const coordinator = new AccountNetworksCoordinator({
+      repository: repository(),
+      chains,
+      bitcoinPeaDerivation: {
+        async deriveBitcoinPea(keyDomainId, accountIndex, chainId) {
+          requests.push({ keyDomainId, accountIndex, chainId })
+          return { address: bitcoinPeaAddress }
+        }
+      }
+    })
+
+    const bitcoin = (await coordinator.readCatalog()).accounts[0].networks.find(
+      network => network.chainId === bitcoinChainId
+    )
+    expect(requests).toEqual([{ keyDomainId: walletId, accountIndex: 0, chainId: bitcoinChainId }])
+    expect(bitcoin.privateExecutionAddress).toBe(bitcoinPeaAddress)
+    expect(bitcoin.addresses.map(address => address.scheme)).toEqual(['bitcoin-p2wpkh'])
+
+    const hardwareRequests = []
+    const hardware = new AccountNetworksCoordinator({
+      repository: repository({
+        ...snapshot(),
+        keyDomains: snapshot().keyDomains.map(keyDomain => ({
+          ...keyDomain,
+          source: {
+            kind: 'hardware',
+            vendor: 'ledger',
+            firmwareProfile: 'multi-app',
+            capabilities: ['bitcoin']
+          }
+        }))
+      }),
+      chains,
+      bitcoinPeaDerivation: {
+        async deriveBitcoinPea(...args) {
+          hardwareRequests.push(args)
+          return { address: bitcoinPeaAddress }
+        }
+      }
+    })
+    const hardwareBitcoin = (await hardware.readCatalog()).accounts[0].networks.find(
+      network => network.chainId === bitcoinChainId
+    )
+    expect(hardwareRequests).toEqual([])
+    expect(hardwareBitcoin.privateExecutionAddress).toBeUndefined()
+
+    const importedRequests = []
+    const importedSnapshot = snapshot()
+    const imported = new AccountNetworksCoordinator({
+      repository: repository({
+        ...importedSnapshot,
+        keyDomains: importedSnapshot.keyDomains.map(keyDomain => ({
+          ...keyDomain,
+          source: { kind: 'private-key', chainFamily: 'bip122', bitcoinNetwork: 'testnet' }
+        }))
+      }),
+      chains,
+      bitcoinPeaDerivation: {
+        async deriveBitcoinPea(keyDomainId, accountIndex, chainId) {
+          importedRequests.push({ keyDomainId, accountIndex, chainId })
+          return { address: bitcoinPeaAddress }
+        }
+      }
+    })
+    expect(
+      (await imported.readCatalog()).accounts[0].networks.find(
+        network => network.chainId === bitcoinChainId
+      ).privateExecutionAddress
+    ).toBe(bitcoinPeaAddress)
+    expect(importedRequests).toEqual([
+      { keyDomainId: walletId, accountIndex: 0, chainId: bitcoinChainId }
+    ])
+
+    const nonzero = snapshot()
+    const skipped = []
+    const importedNonzero = new AccountNetworksCoordinator({
+      repository: repository({
+        ...nonzero,
+        keyDomains: nonzero.keyDomains.map(keyDomain => ({
+          ...keyDomain,
+          source: { kind: 'private-key', chainFamily: 'bip122', bitcoinNetwork: 'testnet' }
+        })),
+        accounts: nonzero.accounts.map(account => ({ ...account, accountIndex: 1 }))
+      }),
+      chains,
+      bitcoinPeaDerivation: {
+        async deriveBitcoinPea() {
+          skipped.push('called')
+          return { address: bitcoinPeaAddress }
+        }
+      }
+    })
+    expect(
+      (await importedNonzero.readCatalog()).accounts[0].networks.find(
+        network => network.chainId === bitcoinChainId
+      ).privateExecutionAddress
+    ).toBeUndefined()
+    expect(skipped).toEqual([])
+
+    const mismatched = new AccountNetworksCoordinator({
+      repository: repository(),
+      chains,
+      bitcoinPeaDerivation: {
+        async deriveBitcoinPea() {
+          throw new Error('Derived Bitcoin PEA account is invalid')
+        }
+      }
+    })
+    await expect(mismatched.readCatalog()).rejects.toThrow(
+      /Derived Bitcoin PEA account is invalid/
+    )
+  })
 })
