@@ -210,13 +210,16 @@ export function selectBitcoinCoins(input: SelectBitcoinCoinsInput): BitcoinCoinS
     ) {
       failInvalidBitcoinTransaction('Bitcoin UTXO does not match the selected account')
     }
-    const root = bitcoinAccountRootFromPath(
-      utxo.derivationPath,
-      chainId,
-      addressType,
-      utxo.change,
-      utxo.addressIndex
-    )
+    const root =
+      utxo.derivationPath === 'm'
+        ? 'm'
+        : bitcoinAccountRootFromPath(
+            utxo.derivationPath,
+            chainId,
+            addressType,
+            utxo.change,
+            utxo.addressIndex
+          )
     if (accountRoot !== undefined && accountRoot !== root) {
       failInvalidBitcoinTransaction('Bitcoin UTXOs belong to different accounts')
     }

@@ -1,3 +1,4 @@
+export { supportsBitcoinPrivateExecution } from './execution-capability'
 export {
   BITCOIN_ADDRESS_POLICY,
   resolveBitcoinImportDiscoverySupport,

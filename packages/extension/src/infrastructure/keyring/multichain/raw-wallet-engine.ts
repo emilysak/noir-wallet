@@ -1,3 +1,6 @@
+import { ripemd160 } from '@noble/hashes/ripemd160'
+import { sha256 } from '@noble/hashes/sha256'
+
 export const RAW_BITCOIN_ADDRESS_TYPES = Object.freeze([
   'p2pkh',
   'p2sh_p2wpkh',
@@ -82,6 +85,12 @@ export interface RawWalletEngine {
     addressType: RawBitcoinAddressType,
     accountIndex: number,
     psbt: string
+  ): unknown
+  preparePeaBitcoinPsbt(
+    sessionId: number,
+    peaRequestJson: string,
+    chainId: string,
+    psbtBase64: string
   ): unknown
   confirmBitcoinPsbt(sessionId: number, requestId: number): unknown
   prepareBitcoinMessage(sessionId: number, request: unknown): unknown
@@ -433,6 +442,93 @@ export function nearPeaRequestJson(accountIndex: number): string {
   return JSON.stringify({ version: 2, family: 'near', parent: { accountIndex } })
 }
 
+const BITCOIN_PEA_MAINNET = 'bip122:000000000019d6689c085ae165831e93'
+const BITCOIN_PEA_TESTNET = 'bip122:000000000933ea01ad0ee984209779ba'
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+const BECH32_GENERATORS = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+
+/**
+ * Bitcoin PEA requests are fixed to P2WPKH. The wallet's public script-type
+ * preference is not a KDF input and must not appear in this JSON.
+ */
+export function bitcoinPeaRequestJson(accountIndex: number, chainId: string): string {
+  if (!Number.isSafeInteger(accountIndex) || accountIndex < 0 || accountIndex > MAX_BIP32_INDEX) {
+    throw new Error('Bitcoin PEA accountIndex is invalid')
+  }
+  if (chainId !== BITCOIN_PEA_MAINNET && chainId !== BITCOIN_PEA_TESTNET) {
+    throw new Error('Bitcoin PEA chainId is invalid')
+  }
+  return JSON.stringify({
+    version: 2,
+    family: 'bitcoin',
+    parent: { accountIndex },
+    addressType: 'p2wpkh',
+    chainId
+  })
+}
+
+function bech32Polymod(values: readonly number[]): number {
+  let checksum = 1
+  for (const value of values) {
+    const high = checksum >>> 25
+    checksum = ((checksum & 0x1ffffff) << 5) ^ value
+    for (let index = 0; index < BECH32_GENERATORS.length; index += 1) {
+      if (((high >>> index) & 1) !== 0) checksum ^= BECH32_GENERATORS[index]
+    }
+  }
+  return checksum >>> 0
+}
+
+function expandBech32Hrp(hrp: string): number[] {
+  return [
+    ...[...hrp].map(character => character.charCodeAt(0) >>> 5),
+    0,
+    ...[...hrp].map(character => character.charCodeAt(0) & 31)
+  ]
+}
+
+function convertBits(data: Uint8Array, fromBits: number, toBits: number): number[] {
+  let accumulator = 0
+  let bits = 0
+  const max = (1 << toBits) - 1
+  const result: number[] = []
+  for (const value of data) {
+    accumulator = (accumulator << fromBits) | value
+    bits += fromBits
+    while (bits >= toBits) {
+      bits -= toBits
+      result.push((accumulator >>> bits) & max)
+    }
+  }
+  if (bits > 0) result.push((accumulator << (toBits - bits)) & max)
+  return result
+}
+
+function encodeBech32(hrp: string, data: readonly number[]): string {
+  const polymod = bech32Polymod([...expandBech32Hrp(hrp), ...data, 0, 0, 0, 0, 0, 0]) ^ 1
+  const checksum = Array.from({ length: 6 }, (_, index) => (polymod >>> (5 * (5 - index))) & 31)
+  return `${hrp}1${[...data, ...checksum].map(value => BECH32_CHARSET[value]).join('')}`
+}
+
+function decodeCompressedPublicKey(value: string): Uint8Array {
+  if (!/^0x0[23][0-9a-f]{64}$/.test(value)) {
+    throw new Error('Bitcoin PEA public key is invalid')
+  }
+  const bytes = new Uint8Array(33)
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(value.slice(2 + index * 2, 4 + index * 2), 16)
+  }
+  return bytes
+}
+
+/** P2WPKH address of a compressed secp256k1 public key. Used to reject a swapped WASM address. */
+function bitcoinP2wpkhAddressForPublicKey(publicKey: string, chainId: string): string {
+  const hrp = chainId === BITCOIN_PEA_MAINNET ? 'bc' : chainId === BITCOIN_PEA_TESTNET ? 'tb' : null
+  if (hrp === null) throw new Error('Bitcoin PEA chainId is invalid')
+  const program = ripemd160(sha256(decodeCompressedPublicKey(publicKey)))
+  return encodeBech32(hrp, [0, ...convertBits(program, 8, 5)])
+}
+
 export interface RawDerivedSolanaPeaAccount {
   readonly address: string
   readonly publicKey: string
@@ -528,6 +624,92 @@ export function parseRawNearPeaAccount(
     parent: Object.freeze({ accountIndex: parentIndex }),
     family: readLiteral(record.family, ['near'], `${label}.family`),
     addressScheme: readLiteral(record.addressScheme, ['near'], `${label}.addressScheme`)
+  })
+}
+
+export interface RawDerivedBitcoinPeaAccount {
+  readonly address: string
+  readonly publicKey: string
+  readonly curve: 'secp256k1'
+  readonly derivationScheme: 'pea_v2'
+  readonly parent: Readonly<{ readonly accountIndex: number }>
+  readonly family: 'bitcoin'
+  readonly chainId: string
+  readonly addressScheme: 'bitcoin_p2wpkh'
+  readonly addressType: 'p2wpkh'
+  readonly bitcoinNetwork: 'mainnet' | 'testnet'
+}
+
+export function parseRawBitcoinPeaAccount(
+  value: unknown,
+  accountIndex: number,
+  chainId: string,
+  imported = false
+): RawDerivedBitcoinPeaAccount {
+  const label = 'DerivedBitcoinPeaAccount'
+  if (imported && accountIndex !== 0) {
+    throw new Error('Derived Bitcoin PEA account is invalid')
+  }
+  const record = readRecord(value, label)
+  assertExactKeys(
+    record,
+    [
+      'address',
+      'publicKey',
+      'curve',
+      'derivationScheme',
+      'parent',
+      'chainId',
+      'family',
+      'addressScheme',
+      'addressType',
+      'bitcoinNetwork'
+    ],
+    [],
+    label
+  )
+  const parent = readRecord(record.parent, `${label}.parent`)
+  assertExactKeys(parent, ['accountIndex'], [], `${label}.parent`)
+  const parentIndex = readSafeInteger(
+    parent.accountIndex,
+    `${label}.parent.accountIndex`,
+    MAX_BIP32_INDEX
+  )
+  const responseChainId = readString(record.chainId, `${label}.chainId`, 64)
+  const bitcoinNetwork = readLiteral(
+    record.bitcoinNetwork,
+    ['mainnet', 'testnet'],
+    `${label}.bitcoinNetwork`
+  )
+  const expectedNetwork = chainId === BITCOIN_PEA_MAINNET ? 'mainnet' : 'testnet'
+  const publicKey = readHex(record.publicKey, `${label}.publicKey`, { bytes: 33 })
+  const address = readString(record.address, `${label}.address`, 90)
+  let derivedAddress = ''
+  try {
+    derivedAddress = bitcoinP2wpkhAddressForPublicKey(publicKey, chainId)
+  } catch {
+    throw new Error('Derived Bitcoin PEA account is invalid')
+  }
+  if (
+    responseChainId !== chainId ||
+    (chainId !== BITCOIN_PEA_MAINNET && chainId !== BITCOIN_PEA_TESTNET) ||
+    bitcoinNetwork !== expectedNetwork ||
+    parentIndex !== accountIndex ||
+    address !== derivedAddress
+  ) {
+    throw new Error('Derived Bitcoin PEA account is invalid')
+  }
+  return Object.freeze({
+    address,
+    publicKey,
+    curve: readLiteral(record.curve, ['secp256k1'], `${label}.curve`),
+    derivationScheme: readLiteral(record.derivationScheme, ['pea_v2'], `${label}.derivationScheme`),
+    parent: Object.freeze({ accountIndex: parentIndex }),
+    family: readLiteral(record.family, ['bitcoin'], `${label}.family`),
+    chainId: responseChainId,
+    addressScheme: readLiteral(record.addressScheme, ['bitcoin_p2wpkh'], `${label}.addressScheme`),
+    addressType: readLiteral(record.addressType, ['p2wpkh'], `${label}.addressType`),
+    bitcoinNetwork
   })
 }
 

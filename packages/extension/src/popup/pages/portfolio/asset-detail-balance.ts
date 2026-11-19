@@ -1,4 +1,5 @@
 import Big from '@/lib/big'
+import { BITCOIN_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { excludeDeprecatedConfidentialAssets } from '@/core/services/confidential-funding/confidential-funding-portfolio'
 import type { PortfolioAssetView, PortfolioBalanceView, PortfolioReadModel } from '@/core/portfolio'
 import { formatBaseUnitDecimalAmount } from '@/lib/number-format'
@@ -26,12 +27,17 @@ export function getAssetDetailCategories(
   }
   const evm = asset.asset.chainId.startsWith('eip155:')
   const solana = asset.asset.chainId.startsWith('solana:')
+  const bitcoin =
+    (asset.asset.chainId === BITCOIN_CHAIN_IDS.mainnet ||
+      asset.asset.chainId === BITCOIN_CHAIN_IDS.testnet) &&
+    asset.asset.id === `${asset.asset.chainId}/slip44:0`
   const zcash = getAssetShieldProvider(asset) === 'zcash-shield'
   const raw: Record<AssetDomain, string | null> = {
     all: asset.balance.totalRaw,
     public: getAssetDomainRaw(asset, 'public'),
     shield: zcash ? getAssetDomainRaw(asset, 'shield') : null,
-    private: evm || solana ? getAssetDomainRaw(asset, 'private') : null
+    private:
+      evm || solana || (bitcoin && privateEligible) ? getAssetDomainRaw(asset, 'private') : null
   }
   let shieldPriceUsd: string | undefined
 
@@ -66,7 +72,10 @@ export function getAssetDetailCategories(
   if ((evm || solana) && (privateEligible || (raw.shield !== null && BigInt(raw.shield) > 0n))) {
     domains.push('shield')
   }
-  if ((evm || solana) && (privateEligible || (raw.private !== null && BigInt(raw.private) > 0n))) {
+  if (
+    (evm || solana || (bitcoin && privateEligible)) &&
+    (privateEligible || (raw.private !== null && BigInt(raw.private) > 0n))
+  ) {
     domains.push('private')
   }
 

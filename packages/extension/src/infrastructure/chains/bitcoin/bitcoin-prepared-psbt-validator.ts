@@ -1,4 +1,11 @@
-import { address, networks, payments, Psbt, Transaction } from 'bitcoinjs-lib'
+import {
+  address,
+  crypto as bitcoinCrypto,
+  networks,
+  payments,
+  Psbt,
+  Transaction
+} from 'bitcoinjs-lib'
 import { Buffer } from 'buffer'
 import {
   BITCOIN_MAINNET_CHAIN_ID,
@@ -194,6 +201,119 @@ export function parsePreparedBitcoinPsbt(value: PreparedBitcoinPsbt): {
     return failSigned()
   }
 
+  const importedExecution = psbt.data.inputs.every(
+    input => input.bip32Derivation?.[0]?.path === 'm'
+  )
+  if (
+    psbt.data.inputs.some(input => input.bip32Derivation?.[0]?.path === 'm') &&
+    !importedExecution
+  ) {
+    return failSigned()
+  }
+  if (importedExecution) {
+    if (addressType !== 'p2wpkh') return failSigned()
+    let importedTotal = 0n
+    let importedFingerprint: Buffer | null = null
+    let importedPublicKey: Buffer | null = null
+    for (let inputIndex = 0; inputIndex < psbt.data.inputs.length; inputIndex += 1) {
+      const input = psbt.data.inputs[inputIndex]
+      const derivation = input.bip32Derivation?.[0]
+      if (
+        !input ||
+        !hasOwnExactKeys(input, ['witnessUtxo', 'nonWitnessUtxo', 'bip32Derivation']) ||
+        input.bip32Derivation?.length !== 1 ||
+        !derivation ||
+        derivation.path !== 'm' ||
+        derivation.masterFingerprint.length !== 4 ||
+        !input.witnessUtxo ||
+        !input.nonWitnessUtxo
+      ) {
+        return failSigned()
+      }
+      const fingerprint = bitcoinCrypto.hash160(derivation.pubkey).subarray(0, 4)
+      if (!fingerprint.equals(derivation.masterFingerprint)) return failSigned()
+      if (importedFingerprint === null) importedFingerprint = derivation.masterFingerprint
+      if (!importedFingerprint.equals(derivation.masterFingerprint)) return failSigned()
+      if (importedPublicKey === null) importedPublicKey = derivation.pubkey
+      if (!importedPublicKey.equals(derivation.pubkey)) return failSigned()
+      const payment = payments.p2wpkh({
+        pubkey: derivation.pubkey,
+        network: bitcoinNetwork(chainId)
+      })
+      const expectedScript = payment.output
+      if (!expectedScript || !input.witnessUtxo.script.equals(expectedScript)) return failSigned()
+      let previous: Transaction
+      try {
+        previous = Transaction.fromBuffer(input.nonWitnessUtxo)
+      } catch {
+        return failSigned()
+      }
+      const transactionInput = psbt.txInputs[inputIndex]
+      if (previous.getId() !== Buffer.from(transactionInput.hash).reverse().toString('hex')) {
+        return failSigned()
+      }
+      const previousOutput = previous.outs[transactionInput.index]
+      if (
+        !previousOutput ||
+        previousOutput.value !== input.witnessUtxo.value ||
+        !previousOutput.script.equals(input.witnessUtxo.script)
+      ) {
+        return failSigned()
+      }
+      importedTotal += BigInt(input.witnessUtxo.value)
+    }
+    if (importedTotal !== selectedTotalSats || !importedPublicKey) return failSigned()
+    if (changeOutputIndex !== null) {
+      const output = psbt.data.outputs[changeOutputIndex]
+      const derivation = output?.bip32Derivation?.[0]
+      if (
+        !output ||
+        !hasOwnExactKeys(output, ['bip32Derivation']) ||
+        output.bip32Derivation?.length !== 1 ||
+        !derivation ||
+        derivation.path !== 'm' ||
+        !importedFingerprint ||
+        !derivation.masterFingerprint.equals(importedFingerprint) ||
+        !derivation.pubkey.equals(importedPublicKey)
+      ) {
+        return failSigned()
+      }
+      const payment = payments.p2wpkh({
+        pubkey: derivation.pubkey,
+        network: bitcoinNetwork(chainId)
+      })
+      if (!bufferEquals(psbt.txOutputs[changeOutputIndex].script, payment.output))
+        return failSigned()
+    }
+    const recipientOutput = psbt.data.outputs[recipientOutputIndex]
+    if (!recipientOutput || !hasOwnExactKeys(recipientOutput, [])) return failSigned()
+    if (changeOutputIndex !== null) {
+      const changeOutput = psbt.data.outputs[changeOutputIndex]
+      if (!changeOutput || !hasOwnExactKeys(changeOutput, ['bip32Derivation'])) return failSigned()
+    }
+    return {
+      prepared: Object.freeze({
+        ...value,
+        chainId,
+        accountIndex,
+        addressType,
+        lockTime,
+        inputCount,
+        outputCount,
+        recipient,
+        recipientOutputIndex,
+        changeAddress,
+        changeOutputIndex,
+        selectedTotalSats: selectedTotalSats.toString(),
+        amountSats: amountSats.toString(),
+        feeSats: feeSats.toString(),
+        changeSats: changeSats.toString(),
+        feeRateSatsPerVbyte
+      }),
+      psbt
+    }
+  }
+
   let inputTotal = 0n
   let masterFingerprint: Buffer | null = null
   const purpose =
@@ -218,9 +338,9 @@ export function parsePreparedBitcoinPsbt(value: PreparedBitcoinPsbt): {
       addressType === 'p2pkh'
         ? ['nonWitnessUtxo', 'bip32Derivation']
         : addressType === 'p2sh-p2wpkh'
-          ? ['witnessUtxo', 'bip32Derivation', 'redeemScript']
+          ? ['witnessUtxo', 'nonWitnessUtxo', 'bip32Derivation', 'redeemScript']
           : addressType === 'p2wpkh'
-            ? ['witnessUtxo', 'bip32Derivation']
+            ? ['witnessUtxo', 'nonWitnessUtxo', 'bip32Derivation']
             : ['witnessUtxo', 'tapBip32Derivation', 'tapInternalKey']
     if (
       !hasOwnExactKeys(input, expectedInputKeys) ||
@@ -234,7 +354,9 @@ export function parsePreparedBitcoinPsbt(value: PreparedBitcoinPsbt): {
           input.tapBip32Derivation[0].leafHashes.length !== 0 ||
           !bufferEquals(input.tapInternalKey, input.tapBip32Derivation[0].pubkey))) ||
       (addressType === 'p2pkh' && input.witnessUtxo !== undefined) ||
-      (addressType !== 'p2pkh' && (!input.witnessUtxo || input.nonWitnessUtxo !== undefined)) ||
+      (addressType === 'p2tr' && (input.nonWitnessUtxo !== undefined || !input.witnessUtxo)) ||
+      ((addressType === 'p2wpkh' || addressType === 'p2sh-p2wpkh') &&
+        (!input.witnessUtxo || !input.nonWitnessUtxo)) ||
       (addressType !== 'p2sh-p2wpkh' && input.redeemScript !== undefined) ||
       !derivation ||
       derivation.masterFingerprint.length !== 4 ||
@@ -289,6 +411,27 @@ export function parsePreparedBitcoinPsbt(value: PreparedBitcoinPsbt): {
       if (!input.witnessUtxo) return failSigned()
       spendValue = input.witnessUtxo.value
       spendScript = input.witnessUtxo.script
+      if (addressType === 'p2wpkh' || addressType === 'p2sh-p2wpkh') {
+        if (!input.nonWitnessUtxo) return failSigned()
+        let previous: Transaction
+        try {
+          previous = Transaction.fromBuffer(input.nonWitnessUtxo)
+        } catch {
+          return failSigned()
+        }
+        const transactionInput = psbt.txInputs[inputIndex]
+        if (previous.getId() !== Buffer.from(transactionInput.hash).reverse().toString('hex')) {
+          return failSigned()
+        }
+        const previousOutput = previous.outs[transactionInput.index]
+        if (
+          !previousOutput ||
+          previousOutput.value !== spendValue ||
+          !previousOutput.script.equals(spendScript)
+        ) {
+          return failSigned()
+        }
+      }
     }
     if (!spendScript.equals(expectedScript)) return failSigned()
     inputTotal += BigInt(spendValue)

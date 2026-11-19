@@ -49,13 +49,27 @@ export function parseBitcoinSpendableUtxo(value: BitcoinSpendableUtxo): BitcoinS
     failInvalidBitcoinTransaction('Invalid Bitcoin change branch')
   const address = parseBitcoinAddress(value.address, chainId, addressType)
   const derivationPath = value.derivationPath
-  bitcoinAccountRootFromPath(derivationPath, chainId, addressType, value.change, addressIndex)
-  if (
-    addressType !== 'p2wpkh' &&
-    derivationPath !==
-      expectedBitcoinDerivationPath(chainId, addressType, accountIndex, value.change, addressIndex)
-  ) {
-    failInvalidBitcoinTransaction('Invalid Bitcoin derivation path')
+  // A Bitcoin PEA is one imported P2WPKH key. Its coin-selection path is "m",
+  // not a public BIP84 receive address.
+  if (derivationPath === 'm') {
+    if (addressType !== 'p2wpkh' || value.change || addressIndex !== 0) {
+      failInvalidBitcoinTransaction('Invalid Bitcoin derivation path')
+    }
+  } else {
+    bitcoinAccountRootFromPath(derivationPath, chainId, addressType, value.change, addressIndex)
+    if (
+      addressType !== 'p2wpkh' &&
+      derivationPath !==
+        expectedBitcoinDerivationPath(
+          chainId,
+          addressType,
+          accountIndex,
+          value.change,
+          addressIndex
+        )
+    ) {
+      failInvalidBitcoinTransaction('Invalid Bitcoin derivation path')
+    }
   }
   if (typeof value.transactionId !== 'string' || !/^[0-9a-f]{64}$/.test(value.transactionId)) {
     failInvalidBitcoinTransaction('Invalid Bitcoin transaction ID')

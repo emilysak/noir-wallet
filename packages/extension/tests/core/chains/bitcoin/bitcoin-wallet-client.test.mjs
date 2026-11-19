@@ -1,7 +1,7 @@
 import * as secp256k1 from '@bitcoinerlab/secp256k1'
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
-import { address, initEccLib, networks, payments, Psbt } from 'bitcoinjs-lib'
+import { address, initEccLib, networks, payments, Psbt, Transaction } from 'bitcoinjs-lib'
 
 import {
   createAssetRegistry,
@@ -41,6 +41,10 @@ function keyMaterial(digit) {
 function context(selfTransfer = false) {
   const sender = keyMaterial(1)
   const recipient = selfTransfer ? sender : keyMaterial(2)
+  const funding = new Transaction()
+  funding.version = 2
+  funding.addInput(Buffer.alloc(32), 0xffffffff)
+  funding.addOutput(address.toOutputScript(sender.address, networks.bitcoin), 50300)
   const selection = selectBitcoinCoins({
     chainId,
     accountIndex: 0,
@@ -58,7 +62,7 @@ function context(selfTransfer = false) {
         address: sender.address,
         derivationPath: "m/84'/0'/0'/0/0",
         publicKey: `0x${sender.publicKey.toString('hex')}`,
-        transactionId: 'b'.repeat(64),
+        transactionId: funding.getId(),
         outputIndex: 0,
         valueSats: '50300',
         blockHeight: 900_000
@@ -68,7 +72,8 @@ function context(selfTransfer = false) {
   const prepared = buildBitcoinPsbt({
     selection,
     masterFingerprint: '0x01020304',
-    lockTime: 900_001
+    lockTime: 900_001,
+    previousTransactions: [{ transactionId: funding.getId(), rawTransactionHex: funding.toHex() }]
   })
   const graph = createBitcoinTransferGraph({
     prepared,

@@ -1548,9 +1548,10 @@ export function MultichainSend({
             )
           ) : selection?.chain.chain.family === 'bitcoin' ? (
             <BitcoinSendForm
-              key={`${sendEntryKey}:${selection.asset.asset.id}`}
+              key={`${sendEntryKey}:${selection.asset.asset.id}:${searchParams.get('mode') === 'private' ? 'private' : 'main'}`}
               selection={selection}
               priceUsd={availableUsdPrice(selection.asset, assetPrices)}
+              executionMode={searchParams.get('mode') === 'private' ? 'private' : 'main'}
               onSubmitted={value => setSubmission({ family: 'bitcoin', value })}
             />
           ) : selection?.chain.chain.family === 'solana' ? (

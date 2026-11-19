@@ -1,7 +1,9 @@
+import type { SigningSummary } from '@/core/keyring/domain'
 import type { PortfolioAssetView, PortfolioChainView } from '@/core/portfolio'
 import type { SwapToken } from '@/core/services/intents-api'
-import { resolveRheaPrivateTransferToken } from '@/core/services/rhea-swap'
+import { RHEA_SWAP_CHAIN_CATALOG, resolveRheaPrivateTransferToken } from '@/core/services/rhea-swap'
 import type { ConfidentialFundingPreview } from '@/core/services/confidential-funding'
+import { assertBitcoinPayableDepositAddress } from '@/core/services/confidential-funding/bitcoin-confidential-deposit'
 import { findShieldCatalogToken } from './shield-transfer'
 import { formatBaseUnitDecimalAmount, formatFeeAmount } from '@/lib/number-format'
 import { evmWalletClient, type EvmFeeEstimate } from './evm-wallet-client'
@@ -56,7 +58,9 @@ export async function estimateDirectMove(input: {
   if (!match) {
     if (
       input.chain.chain.network?.kind === 'mainnet' &&
-      (input.chain.chain.family === 'near' || input.chain.chain.family === 'solana')
+      (input.chain.chain.family === 'near' ||
+        input.chain.chain.family === 'solana' ||
+        input.chain.chain.family === 'bitcoin')
     ) {
       return estimateConfidentialChainMove(input)
     }
@@ -178,11 +182,95 @@ export function findDirectConfidentialChainToken<T extends SwapToken>(
   return findShieldCatalogToken(asset, tokens, 'mainnet')
 }
 
-async function estimateConfidentialChainMove(
-  input: Parameters<typeof estimateDirectMove>[0]
-): Promise<MoveMethodEstimate> {
-  const tokenListChainId = input.chain.chain.family === 'near' ? 900001 : 501
-  const catalog = await rheaSwapClient.listTokens({
+function confidentialChainTokenListId(family: string): number | null {
+  if (family !== 'near' && family !== 'solana' && family !== 'bitcoin') return null
+  return (
+    RHEA_SWAP_CHAIN_CATALOG.find(chain => chain.walletFamily === family)?.tokenListChainId ?? null
+  )
+}
+
+type ConfidentialChainMoveInput = Parameters<typeof estimateDirectMove>[0]
+type ConfidentialChainQuoteClient = Pick<
+  typeof rheaSwapClient,
+  'listTokens' | 'quote' | 'prepare' | 'discard'
+>
+
+const BITCOIN_DEPOSIT_EXECUTION = 'bitcoin-transfer'
+const BITCOIN_MOVE_DEPOSIT_ERROR = 'Bitcoin move must pay the quote deposit address.'
+
+export interface BitcoinDirectMoveQuote {
+  readonly failed: boolean
+  readonly routeMissing: boolean
+  readonly executionKind: string | null
+  readonly depositAddress: string | null
+}
+
+export type BitcoinDirectMoveSettlement =
+  | {
+      readonly kind: 'deposit'
+      readonly sourceAddress: string
+      readonly depositAddress: string
+      readonly outputs: readonly [{ readonly address: string; readonly purpose: 'deposit' }]
+    }
+  | { readonly kind: 'stop'; readonly error: string }
+
+export function settleBitcoinDirectMoveQuote(input: {
+  readonly chainId: string
+  readonly sourceAddress: string
+  readonly counterpartyAddress: string
+  readonly quote: BitcoinDirectMoveQuote | null
+}): BitcoinDirectMoveSettlement {
+  const stop = (error: string): BitcoinDirectMoveSettlement =>
+    Object.freeze({ kind: 'stop', error })
+  if (!input.quote || input.quote.failed || input.quote.routeMissing) {
+    return stop('Move route unavailable')
+  }
+  if (input.quote.executionKind !== BITCOIN_DEPOSIT_EXECUTION || !input.quote.depositAddress) {
+    return stop(BITCOIN_MOVE_DEPOSIT_ERROR)
+  }
+  let depositAddress: string
+  try {
+    depositAddress = assertBitcoinPayableDepositAddress(input.quote.depositAddress, input.chainId)
+  } catch (error) {
+    return stop(error instanceof Error ? error.message : BITCOIN_MOVE_DEPOSIT_ERROR)
+  }
+  // The other wallet address is never an output. Change stays with the source signer.
+  if (depositAddress === input.sourceAddress || depositAddress === input.counterpartyAddress) {
+    return stop(BITCOIN_MOVE_DEPOSIT_ERROR)
+  }
+  const settlement: BitcoinDirectMoveSettlement = {
+    kind: 'deposit',
+    sourceAddress: input.sourceAddress,
+    depositAddress,
+    outputs: [{ address: depositAddress, purpose: 'deposit' }]
+  }
+  return settlement
+}
+
+export function assertBitcoinDirectMovePreparedOutputs(input: {
+  readonly depositAddress: string
+  readonly amountRaw: string
+  readonly summary: SigningSummary
+}): void {
+  const outputs = input.summary.schema === 'bitcoin.psbt.v1' ? input.summary.fields.outputs : []
+  const recipients = outputs.filter(output => output.classification === 'recipient')
+  const recipient = recipients.length === 1 ? recipients[0] : null
+  if (
+    !recipient ||
+    recipient.address !== input.depositAddress ||
+    recipient.amountSats !== input.amountRaw
+  ) {
+    throw new Error(BITCOIN_MOVE_DEPOSIT_ERROR)
+  }
+}
+
+async function quoteConfidentialChainMove(
+  input: ConfidentialChainMoveInput,
+  client: Pick<ConfidentialChainQuoteClient, 'listTokens' | 'quote'>
+) {
+  const tokenListChainId = confidentialChainTokenListId(input.chain.chain.family)
+  if (tokenListChainId === null) throw new Error('Move route unavailable')
+  const catalog = await client.listTokens({
     direction: 'from',
     tokenListChainIds: [tokenListChainId]
   })
@@ -198,7 +286,7 @@ async function estimateConfidentialChainMove(
     decimals: token.decimals,
     isNative: token.isNative
   }
-  const quote = await rheaSwapClient.quote(
+  const quote = await client.quote(
     {
       fromChain: token.rheaChainId,
       toChain: token.rheaChainId,
@@ -212,16 +300,58 @@ async function estimateConfidentialChainMove(
     },
     input.executionMode === 'private' ? 'private-transfer' : 'confidential-funding'
   )
+  return { quote, tokenListChainId }
+}
+
+async function estimateConfidentialChainMove(
+  input: ConfidentialChainMoveInput
+): Promise<MoveMethodEstimate> {
+  const quoted = await quoteConfidentialChainMove(input, rheaSwapClient)
   try {
     input.signal.throwIfAborted()
     return {
-      expiresAt: Math.min(quote.expiresAt ?? Infinity, Date.now() + 30_000),
-      routeFeeRaw: routeFee(input.amountRaw, quote.estimatedOut),
+      expiresAt: Math.min(quoted.quote.expiresAt ?? Infinity, Date.now() + 30_000),
+      routeFeeRaw: routeFee(input.amountRaw, quoted.quote.estimatedOut),
       time: '—',
       timeScope: 'Network only'
     }
   } finally {
-    await rheaSwapClient.discard(quote.quoteHandle).catch(() => {})
+    await rheaSwapClient.discard(quoted.quote.quoteHandle).catch(() => {})
+  }
+}
+
+export async function settleBitcoinDirectMove(
+  input: ConfidentialChainMoveInput,
+  client: ConfidentialChainQuoteClient = rheaSwapClient
+): Promise<BitcoinDirectMoveSettlement> {
+  if (input.chain.chain.family !== 'bitcoin' || input.chain.chain.network?.kind !== 'mainnet') {
+    return Object.freeze({ kind: 'stop', error: 'Move route unavailable' })
+  }
+  let quoteHandle: string | null = null
+  try {
+    const quoted = await quoteConfidentialChainMove(input, client)
+    quoteHandle = quoted.quote.quoteHandle
+    input.signal.throwIfAborted()
+    const review = await client.prepare(quoteHandle)
+    input.signal.throwIfAborted()
+    return settleBitcoinDirectMoveQuote({
+      chainId: input.chain.chain.id,
+      sourceAddress: input.sender,
+      counterpartyAddress: input.recipient,
+      quote: {
+        failed: false,
+        routeMissing: false,
+        executionKind: review.execution.kind,
+        depositAddress: review.execution.target
+      }
+    })
+  } catch (error) {
+    if (input.signal.aborted) throw error
+    const message =
+      error instanceof Error && error.message ? error.message : 'Move route unavailable'
+    return Object.freeze({ kind: 'stop', error: message })
+  } finally {
+    if (quoteHandle) await client.discard(quoteHandle).catch(() => {})
   }
 }
 

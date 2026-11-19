@@ -43,7 +43,13 @@ import { parseAccountId } from '@/core/accounts/domain'
 import { parseKeyDomainId } from '@/core/keyring/domain'
 import type { AssetRegistry } from '@/core/chains/registry'
 import { parseAssetId, parseChainId } from '@/core/chains/registry'
-import { getZcashChainId } from '@/core/chains/registry'
+import { getBitcoinChainId, getZcashChainId } from '@/core/chains/registry'
+import {
+  assertBitcoinDepositAddress,
+  assertBitcoinPayableDepositAddress,
+  isBitcoinConfidentialChain
+} from '@/core/services/confidential-funding/bitcoin-confidential-deposit'
+import type { BitcoinConfidentialDepositClient } from '@/core/services/confidential-funding/bitcoin-confidential-deposit'
 import {
   CONFIDENTIAL_WITHDRAW_DEFAULT_COUNT,
   CONFIDENTIAL_SESSION_REQUIRED_ERROR,
@@ -355,13 +361,35 @@ function quoteDeadline(quote: ConfidentialQuote): number {
   return value
 }
 
+const BRIDGE_LEG_MINIMUM_RAW = /try at least ([0-9]+)/i
+
 function minimumAmountError(error: unknown): boolean {
   return (
     error instanceof ConfidentialFundingApiError &&
     error.status !== null &&
     error.status >= 400 &&
     error.status < 500 &&
-    /minimum|min(?:imum)? amount|too small|below/i.test(error.message)
+    /minimum|min(?:imum)? amount|too small|too low|try at least|below/i.test(error.message)
+  )
+}
+
+/** The smallest cluster leg is total * 80 / (100 * count). Invert that so every leg clears the bridge floor. */
+function clusterTotalMinimumRaw(legMinimumRaw: string, count: number): string {
+  return ((BigInt(legMinimumRaw) * 100n * BigInt(count) + 79n) / 80n).toString()
+}
+
+function scaleSplitBridgeMinimum(error: unknown, count: number): unknown {
+  if (!(error instanceof ConfidentialFundingApiError)) return error
+  const match = BRIDGE_LEG_MINIMUM_RAW.exec(error.message)
+  const legMinimum = match?.[1]
+  if (!legMinimum) return error
+  const total = clusterTotalMinimumRaw(legMinimum, count)
+  if (total === legMinimum) return error
+  return new ConfidentialFundingApiError(
+    error.message.replace(match[0], `try at least ${total}`),
+    error.status,
+    error.ambiguous,
+    error.businessCode
   )
 }
 
@@ -438,7 +466,9 @@ function validQuoteTimeEstimateSeconds(value: unknown): value is number {
 function readConfidentialChainNetworkFee(value: unknown): string | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
-  if (record.family !== 'near' && record.family !== 'solana') return null
+  if (record.family !== 'near' && record.family !== 'solana' && record.family !== 'bitcoin') {
+    return null
+  }
   if (typeof record.networkFeeRaw !== 'string' || !/^[1-9][0-9]*$/.test(record.networkFeeRaw)) {
     return null
   }
@@ -556,13 +586,15 @@ function reviewFromPlan(
   })
 }
 
-type ExternalDepositOriginFamily = 'evm' | 'zcash' | 'near' | 'solana'
+type ExternalDepositOriginFamily = 'evm' | 'zcash' | 'near' | 'solana' | 'bitcoin'
 
 function externalDepositOriginFamily(
   chain: ReturnType<typeof parseChainId>,
   network: Network
 ): ExternalDepositOriginFamily | null {
   if (chain.id === getZcashChainId(network)) return 'zcash'
+  // Other bip122 chains, including a non-Bitcoin genesis, are not deposit origins.
+  if (chain.id === getBitcoinChainId(network)) return 'bitcoin'
   if (chain.namespace === 'eip155') return 'evm'
   if (chain.namespace === 'near') return 'near'
   if (chain.namespace === 'solana') return 'solana'
@@ -576,6 +608,9 @@ function externalDepositTokenChainId(
 ): string | null {
   const blockchain = token.blockchain.trim().toLowerCase()
   if (blockchain === 'zec' || blockchain === 'zcash') return getZcashChainId(network)
+  if (network === 'mainnet' && (blockchain === 'btc' || blockchain === 'bitcoin')) {
+    return getBitcoinChainId('mainnet')
+  }
   if (
     network === 'mainnet' &&
     (blockchain === 'near' || blockchain === 'sol' || blockchain === 'solana')
@@ -614,6 +649,14 @@ function assertExternalDepositRefundAddress(
     }
     return
   }
+  if (family === 'bitcoin') {
+    try {
+      assertBitcoinDepositAddress(address, getBitcoinChainId(network))
+    } catch {
+      throw new Error('External Shield deposit refund address is invalid')
+    }
+    return
+  }
   if (!isAddress(address) || /^0x0{40}$/i.test(address)) {
     throw new Error('External Shield deposit refund address is invalid')
   }
@@ -644,6 +687,14 @@ function assertExternalDepositQuoteAddress(
     }
     return
   }
+  if (family === 'bitcoin') {
+    try {
+      assertBitcoinPayableDepositAddress(address, getBitcoinChainId(network))
+    } catch {
+      throw new Error('External Shield quote has an invalid deposit address')
+    }
+    return
+  }
   if (!isAddress(address) || /^0x0{40}$/i.test(address)) {
     throw new Error('External Shield quote has an invalid deposit address')
   }
@@ -668,6 +719,8 @@ function confidentialSigningChainId(
   if (source.namespace === 'eip155') return source.id
   if (destination.namespace === 'near' || destination.namespace === 'solana') return destination.id
   if (source.namespace === 'near' || source.namespace === 'solana') return source.id
+  // generate-intent allows nep413, erc191, raw_ed25519, webauthn, ton_connect, sep53, and tip191.
+  // bitcoin and bip322 are rejected, so Bitcoin stays on the EVM erc191 signer.
   if (!network) throw new Error('Confidential funding requires an EVM signing chain')
   return parseChainId(getEvmNetworkConfig(network).chainId).id
 }
@@ -696,6 +749,73 @@ function sameFundingAddress(left: string, right: string): boolean {
     : left === right
 }
 
+function bitcoinDomainAddress(
+  domain: 'public' | 'private',
+  addresses: {
+    readonly publicAddress: string
+    readonly privateExecutionAddress: string
+  }
+): string {
+  return domain === 'private' ? addresses.privateExecutionAddress : addresses.publicAddress
+}
+
+function isBitcoinDepositSigningUnavailable(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message === 'Bitcoin deposit signing is unavailable' ||
+      error.message === 'Bitcoin private deposit signing is unavailable')
+  )
+}
+
+// A private Bitcoin deposit spends the PEA. The public receive address and the EVM signer do not.
+function privateBitcoinDepositSpend(
+  addresses:
+    | {
+        readonly publicAddress?: string
+        readonly privateExecutionAddress?: string
+      }
+    | null
+    | undefined,
+  identityAddress: string,
+  chainId: ChainId
+): {
+  readonly sourceAddress: string
+  readonly counterpartyAddress: string
+} {
+  const publicAddress = addresses?.publicAddress
+  const privateExecutionAddress = addresses?.privateExecutionAddress
+  if (
+    typeof publicAddress !== 'string' ||
+    typeof privateExecutionAddress !== 'string' ||
+    privateExecutionAddress.length === 0 ||
+    privateExecutionAddress === publicAddress ||
+    privateExecutionAddress === identityAddress
+  ) {
+    throw new Error('Bitcoin private deposit signing is unavailable')
+  }
+  let parsedPublic: string
+  let parsedPrivate: string
+  try {
+    parsedPublic = assertBitcoinDepositAddress(publicAddress, chainId)
+    parsedPrivate = assertBitcoinDepositAddress(privateExecutionAddress, chainId)
+  } catch {
+    throw new Error('Bitcoin private deposit signing is unavailable')
+  }
+  if (parsedPrivate === parsedPublic || parsedPrivate === identityAddress) {
+    throw new Error('Bitcoin private deposit signing is unavailable')
+  }
+  return Object.freeze({
+    sourceAddress: parsedPrivate,
+    counterpartyAddress: parsedPublic
+  })
+}
+
+function isNativeBitcoinAsset(assets: AssetRegistry, assetId: string, chainId: string): boolean {
+  if (assetId !== `${chainId}/slip44:0`) return false
+  const entry = assets.get(assetId)
+  return entry?.asset.kind === 'native' && entry.asset.chainId === chainId
+}
+
 function isMainnetConfidentialPair(
   sourceId: string,
   destinationId: string,
@@ -716,9 +836,10 @@ function withdrawSigningChainId(plan: {
     plan.destination.chainId,
     plan.network
   )
-  return confidentialSignerFamily(signing) === 'evm'
-    ? parseChainId(plan.destination.chainId).id
-    : signing
+  if (confidentialSignerFamily(signing) !== 'evm') return signing
+  const destinationId = parseChainId(plan.destination.chainId).id
+  // generate-intent rejects bitcoin and bip322, so a Bitcoin withdraw stays on erc191.
+  return isBitcoinConfidentialChain(destinationId) ? signing : destinationId
 }
 
 export function directApprovalIntent(plan: ConfidentialFundingPlan): unknown {
@@ -1052,6 +1173,9 @@ export class ConfidentialFundingCoordinator {
     }
     if (originFamily === 'near' && quote.quoteRequest.refundTo !== input.refundAddress) {
       throw new Error('External Shield quote changed its refund address')
+    }
+    if (originFamily === 'bitcoin' && quote.quoteRequest.refundTo !== input.refundAddress) {
+      throw new Error('External Shield quote changed its Bitcoin refund address')
     }
     assertExternalDepositQuoteAddress(originFamily, quote.quote.depositAddress, input.network)
     if (
@@ -1585,6 +1709,10 @@ export class ConfidentialFundingCoordinator {
     else await this.scheduleMonitoring()
   }
 
+  attachBitcoinDepositClient(client: BitcoinConfidentialDepositClient | null): void {
+    this.options.signer.setBitcoinDepositClient(client)
+  }
+
   async preview(value: PrepareConfidentialFundingInput): Promise<ConfidentialFundingPreview> {
     const input = this.parseInput(value)
     if (
@@ -1624,11 +1752,7 @@ export class ConfidentialFundingCoordinator {
     if (input.operation === 'cluster') {
       return this.previewCluster(input, sourceIdentity, destinationIdentity, sourceSigningChain)
     }
-    const recipient =
-      input.externalRecipient ??
-      (input.destinationDomain === 'private'
-        ? destinationIdentity.peaAddress
-        : destinationIdentity.address)
+    const recipient = await this.destinationFundingAddress(input, destinationIdentity)
     const binding = {
       originAsset: input.source.protocolAssetId,
       destinationAsset: input.destination.protocolAssetId,
@@ -1670,20 +1794,117 @@ export class ConfidentialFundingCoordinator {
     })
   }
 
+  private async destinationFundingAddress(
+    input: PrepareConfidentialFundingInput,
+    destinationIdentity: ConfidentialSigningIdentity
+  ): Promise<string> {
+    if (input.externalRecipient) return input.externalRecipient
+    const destinationDomain = input.destinationDomain
+    if (
+      input.operation === 'withdraw' &&
+      (destinationDomain === 'public' || destinationDomain === 'private') &&
+      isBitcoinConfidentialChain(input.destination.chainId)
+    ) {
+      const addresses = await this.options.signer.resolveBitcoinFundingAddresses(
+        parseChainId(input.destination.chainId).id,
+        destinationIdentity
+      )
+      return bitcoinDomainAddress(destinationDomain, addresses)
+    }
+    return destinationDomain === 'private'
+      ? destinationIdentity.peaAddress
+      : destinationIdentity.address
+  }
+
+  private async resolvePrivateBitcoinDepositSpend(
+    identity: ConfidentialSigningIdentity,
+    chainId: ChainId
+  ): Promise<{ readonly sourceAddress: string; readonly counterpartyAddress: string }> {
+    let addresses: {
+      readonly publicAddress: string
+      readonly privateExecutionAddress: string
+    }
+    try {
+      addresses = await this.options.signer.resolveBitcoinFundingAddresses(chainId, identity)
+    } catch (error) {
+      if (isBitcoinDepositSigningUnavailable(error)) {
+        throw new Error('Bitcoin private deposit signing is unavailable')
+      }
+      throw error
+    }
+    return privateBitcoinDepositSpend(addresses, identity.address, chainId)
+  }
+
+  private async clusterFundingAddresses(
+    input: Extract<PrepareConfidentialFundingInput, { operation: 'cluster' }>,
+    sourceIdentity: ConfidentialSigningIdentity,
+    destinationIdentity: ConfidentialSigningIdentity
+  ): Promise<{
+    readonly bitcoin?: {
+      readonly publicAddress: string
+      readonly privateExecutionAddress: string
+    }
+    readonly sourceAddress: string
+    readonly destinationAddress: string
+  }> {
+    if (
+      isBitcoinConfidentialChain(input.source.chainId) &&
+      input.source.chainId === input.destination.chainId
+    ) {
+      if (input.sourceDomain === 'shield') {
+        throw new Error('Confidential funding route is invalid')
+      }
+      const chainId = parseChainId(input.source.chainId).id
+      let bitcoin: {
+        readonly publicAddress: string
+        readonly privateExecutionAddress: string
+      }
+      try {
+        bitcoin = await this.options.signer.resolveBitcoinFundingAddresses(chainId, sourceIdentity)
+      } catch (error) {
+        if (input.sourceDomain === 'private' && isBitcoinDepositSigningUnavailable(error)) {
+          throw new Error('Bitcoin private deposit signing is unavailable')
+        }
+        throw error
+      }
+      if (input.sourceDomain === 'private') {
+        const spend = privateBitcoinDepositSpend(bitcoin, sourceIdentity.address, chainId)
+        bitcoin = Object.freeze({
+          publicAddress: spend.counterpartyAddress,
+          privateExecutionAddress: spend.sourceAddress
+        })
+      }
+      return Object.freeze({
+        bitcoin,
+        sourceAddress: bitcoinDomainAddress(input.sourceDomain, bitcoin),
+        destinationAddress: bitcoinDomainAddress(input.destinationDomain, bitcoin)
+      })
+    }
+    return Object.freeze({
+      sourceAddress:
+        input.sourceDomain === 'private'
+          ? fundingAddress(sourceIdentity.peaAddress)
+          : sourceIdentity.address,
+      destinationAddress:
+        input.destinationDomain === 'private'
+          ? destinationIdentity.peaAddress
+          : destinationIdentity.address
+    })
+  }
+
   private async previewCluster(
     input: Extract<PrepareConfidentialFundingInput, { operation: 'cluster' }>,
     sourceIdentity: ConfidentialSigningIdentity,
     destinationIdentity: ConfidentialSigningIdentity,
     sourceSigningChain: ChainId
   ): Promise<ConfidentialFundingPreview> {
-    const sourceAddress =
-      input.sourceDomain === 'private'
-        ? fundingAddress(sourceIdentity.peaAddress)
-        : sourceIdentity.address
-    const destinationAddress =
-      input.destinationDomain === 'private'
-        ? destinationIdentity.peaAddress
-        : destinationIdentity.address
+    const domainAddresses = await this.clusterFundingAddresses(
+      input,
+      sourceIdentity,
+      destinationIdentity
+    )
+    const sourceAddress = domainAddresses.sourceAddress
+    const destinationAddress = domainAddresses.destinationAddress
     const depositBinding = {
       originAsset: input.source.protocolAssetId,
       destinationAsset: input.source.protocolAssetId,
@@ -2111,15 +2332,21 @@ export class ConfidentialFundingCoordinator {
           input.source.protocolAssetId
         ) ?? '0')
       : '0'
-    const sourceAddress =
-      input.sourceDomain === 'private'
+    const bitcoinDeposit =
+      isDeposit && input.network === 'mainnet' && isBitcoinConfidentialChain(input.source.chainId)
+    const bitcoinChainId = bitcoinDeposit ? parseChainId(input.source.chainId).id : null
+    const bitcoinSpend =
+      bitcoinDeposit && bitcoinChainId
+        ? input.sourceDomain === 'private'
+          ? await this.resolvePrivateBitcoinDepositSpend(sourceIdentity, bitcoinChainId)
+          : await this.options.signer.resolveBitcoinPublicSpendAddress(bitcoinChainId)
+        : null
+    const sourceAddress = bitcoinSpend
+      ? bitcoinSpend.sourceAddress
+      : input.sourceDomain === 'private'
         ? fundingAddress(sourceIdentity.peaAddress)
         : sourceIdentity.address
-    const destinationAddress =
-      input.externalRecipient ??
-      (input.destinationDomain === 'private'
-        ? destinationIdentity.peaAddress
-        : destinationIdentity.address)
+    const destinationAddress = await this.destinationFundingAddress(input, destinationIdentity)
     const isSwap = input.operation === 'swap'
     if (!isDeposit) {
       this.assertUnreservedBalance(
@@ -2178,6 +2405,14 @@ export class ConfidentialFundingCoordinator {
           recipient: quote.quote.depositAddress,
           amountRaw: input.source.amountRaw,
           sourceDomain: input.sourceDomain === 'private' ? 'private' : 'public',
+          ...(bitcoinSpend
+            ? {
+                bitcoinSourceAddress: bitcoinSpend.sourceAddress,
+                ...(bitcoinSpend.counterpartyAddress === undefined
+                  ? {}
+                  : { bitcoinCounterpartyAddress: bitcoinSpend.counterpartyAddress })
+              }
+            : {}),
           ...(input.feeSelection
             ? { feeSelection: input.feeSelection }
             : { feeTier: input.feeTier })
@@ -2299,14 +2534,13 @@ export class ConfidentialFundingCoordinator {
         input.source.amountRaw,
         baseline
       )
-    const sourceAddress =
-      input.sourceDomain === 'private'
-        ? fundingAddress(sourceIdentity.peaAddress)
-        : sourceIdentity.address
-    const destinationAddress =
-      input.destinationDomain === 'private'
-        ? destinationIdentity.peaAddress
-        : destinationIdentity.address
+    const domainAddresses = await this.clusterFundingAddresses(
+      input,
+      sourceIdentity,
+      destinationIdentity
+    )
+    const sourceAddress = domainAddresses.sourceAddress
+    const destinationAddress = domainAddresses.destinationAddress
     const depositQuote = requiresDeposit
       ? await this.options.api.quote({
           referral: fundingReferral(input),
@@ -2342,6 +2576,19 @@ export class ConfidentialFundingCoordinator {
       )
       if (!depositQuote.quote.depositAddress)
         throw new Error('Confidential deposit quote has no destination')
+      if (domainAddresses.bitcoin) {
+        const depositAddress = assertBitcoinPayableDepositAddress(
+          depositQuote.quote.depositAddress,
+          input.source.chainId
+        )
+        // A quote that pays either wallet Bitcoin address is not a relay deposit.
+        if (
+          depositAddress === domainAddresses.bitcoin.publicAddress ||
+          depositAddress === domainAddresses.bitcoin.privateExecutionAddress
+        ) {
+          throw new Error('Bitcoin deposit output pays another wallet address')
+        }
+      }
     }
     const spendRaw = depositQuote?.quote.amountOut ?? input.source.amountRaw
     const previews = await this.prepareWithdrawPreviews({
@@ -2361,6 +2608,15 @@ export class ConfidentialFundingCoordinator {
           recipient: depositQuote.quote.depositAddress,
           amountRaw: input.source.amountRaw,
           sourceDomain: input.sourceDomain === 'private' ? 'private' : 'public',
+          ...(domainAddresses.bitcoin
+            ? {
+                bitcoinSourceAddress: domainAddresses.sourceAddress,
+                bitcoinCounterpartyAddress: bitcoinDomainAddress(
+                  input.destinationDomain,
+                  domainAddresses.bitcoin
+                )
+              }
+            : {}),
           ...(input.feeSelection
             ? { feeSelection: input.feeSelection }
             : { feeTier: input.feeTier })
@@ -3283,8 +3539,40 @@ export class ConfidentialFundingCoordinator {
       destinationChain.id,
       value.network
     )
+    const bitcoinChainId = value.network === 'mainnet' ? getBitcoinChainId('mainnet') : null
+    const bitcoinPair =
+      bitcoinChainId !== null &&
+      sourceChain.id === bitcoinChainId &&
+      destinationChain.id === bitcoinChainId
+    const oppositeBitcoinDomains =
+      (value.sourceDomain === 'public' && value.destinationDomain === 'private') ||
+      (value.sourceDomain === 'private' && value.destinationDomain === 'public')
+    const nativeBitcoinPair =
+      value.source.assetId === value.destination.assetId &&
+      value.source.protocolAssetId === value.destination.protocolAssetId &&
+      isNativeBitcoinAsset(this.options.assets, value.source.assetId, sourceChain.id) &&
+      isNativeBitcoinAsset(this.options.assets, value.destination.assetId, destinationChain.id)
+    const bitcoinShieldWithdraw =
+      bitcoinPair &&
+      value.operation === 'withdraw' &&
+      value.sourceDomain === 'shield' &&
+      (value.destinationDomain === 'public' || value.destinationDomain === 'private') &&
+      nativeBitcoinPair
+    const bitcoinDeposit =
+      bitcoinPair &&
+      value.operation === 'deposit' &&
+      (value.sourceDomain === 'public' || value.sourceDomain === 'private') &&
+      value.destinationDomain === 'shield'
+    // Shield stays a single deposit or withdraw. Cluster is public ↔ private native BTC only.
+    const bitcoinCluster =
+      bitcoinPair && value.operation === 'cluster' && oppositeBitcoinDomains && nativeBitcoinPair
     const sourceAllowed =
-      sourceIsEvm || (shieldSpend && sourceChain.id === zcashChainId) || sameMainnetConfidential
+      sourceIsEvm ||
+      (shieldSpend && sourceChain.id === zcashChainId) ||
+      sameMainnetConfidential ||
+      bitcoinShieldWithdraw ||
+      bitcoinDeposit ||
+      bitcoinCluster
     const destinationAllowed =
       destinationIsEvm ||
       sameMainnetConfidential ||
@@ -3294,14 +3582,20 @@ export class ConfidentialFundingCoordinator {
         destinationChain.id === zcashChainId) ||
       (value.operation === 'swap' &&
         value.destinationDomain === 'shield' &&
-        destinationChain.id === zcashChainId)
+        destinationChain.id === zcashChainId) ||
+      bitcoinShieldWithdraw ||
+      bitcoinDeposit ||
+      bitcoinCluster
     if (
       !sourceAllowed ||
       !destinationAllowed ||
       (!sourceIsEvm &&
         !destinationIsEvm &&
         !sameMainnetConfidential &&
-        !(shieldSpend && destinationChain.id === zcashChainId))
+        !(shieldSpend && destinationChain.id === zcashChainId) &&
+        !bitcoinShieldWithdraw &&
+        !bitcoinDeposit &&
+        !bitcoinCluster)
     ) {
       throw new Error('Confidential funding requires an EVM signing chain')
     }
@@ -3456,7 +3750,13 @@ export class ConfidentialFundingCoordinator {
       return await attempt(CONFIDENTIAL_WITHDRAW_DEFAULT_COUNT)
     } catch (error) {
       if (!minimumAmountError(error)) throw error
-      return attempt(2)
+      try {
+        return await attempt(2)
+      } catch (retryError) {
+        if (!minimumAmountError(retryError)) throw retryError
+        // The bridge floor is for one split. Report the total the user must enter.
+        throw scaleSplitBridgeMinimum(retryError, 2)
+      }
     }
   }
 
@@ -4922,37 +5222,109 @@ export class ConfidentialFundingCoordinator {
     }
   }
 
+  private usesBitcoinAccountAddress(plan: ConfidentialFundingPlan): boolean {
+    return (
+      plan.source.chainId === plan.destination.chainId &&
+      isBitcoinConfidentialChain(plan.source.chainId) &&
+      (plan.operation === 'cluster' ||
+        (plan.operation === 'withdraw' && plan.externalRecipient === undefined))
+    )
+  }
+
+  private async bitcoinAccountAddressMismatch(
+    plan: ConfidentialFundingPlan,
+    identity: ConfidentialSigningIdentity
+  ): Promise<boolean> {
+    const addresses = await this.options.signer.resolveBitcoinFundingAddresses(
+      parseChainId(plan.source.chainId).id,
+      identity
+    )
+    const addressFor = (domain: ConfidentialFundingPlan['sourceDomain']) =>
+      domain === 'private'
+        ? addresses.privateExecutionAddress
+        : domain === 'public'
+          ? addresses.publicAddress
+          : undefined
+    if (plan.operation === 'cluster') {
+      return (
+        plan.source.address !== addressFor(plan.sourceDomain) ||
+        plan.destination.address !== addressFor(plan.destinationDomain)
+      )
+    }
+    return (
+      !sameFundingAddress(plan.source.address, identity.address) ||
+      plan.destination.address !== addressFor(plan.destinationDomain)
+    )
+  }
+
+  // Shield credit stays on the EVM signer. Compare the Bitcoin spend address as derived.
+  private async bitcoinDepositAddressMismatch(
+    plan: ConfidentialFundingPlan,
+    identity: ConfidentialSigningIdentity
+  ): Promise<boolean> {
+    if (!sameFundingAddress(plan.destination.address, identity.address)) return true
+    let addresses: {
+      readonly publicAddress?: string
+      readonly privateExecutionAddress?: string
+    }
+    try {
+      addresses = await this.options.signer.resolveBitcoinFundingAddresses(
+        parseChainId(plan.source.chainId).id,
+        identity
+      )
+    } catch (error) {
+      if (isBitcoinDepositSigningUnavailable(error)) return true
+      throw error
+    }
+    const expected =
+      plan.sourceDomain === 'private'
+        ? addresses.privateExecutionAddress
+        : plan.sourceDomain === 'public'
+          ? addresses.publicAddress
+          : undefined
+    return typeof expected !== 'string' || expected.length === 0 || plan.source.address !== expected
+  }
+
   private async requirePlanIdentity(plan: ConfidentialFundingPlan) {
     const identity = await this.options.signer.resolveIdentity(
       confidentialSigningChainId(plan.source.chainId, plan.destination.chainId, plan.network)
     )
+    const bitcoinAccountRoute = this.usesBitcoinAccountAddress(plan)
+    const bitcoinMismatch = bitcoinAccountRoute
+      ? await this.bitcoinAccountAddressMismatch(plan, identity)
+      : false
     if (
       identity.context.chainAccount.scope.keyDomainId !== plan.keyDomainId ||
       identity.context.chainAccount.scope.accountId !== plan.accountId ||
       !sameFundingAddress(identity.address, plan.signerId) ||
       identity.addressIndex !== plan.addressIndex ||
+      bitcoinMismatch ||
       (plan.operation === undefined
         ? !sameFundingAddress(identity.peaAddress, plan.destination.address)
         : plan.operation === 'deposit'
-          ? !sameFundingAddress(
-              plan.source.address,
-              plan.sourceDomain === 'private' ? identity.peaAddress : identity.address
-            )
+          ? isBitcoinConfidentialChain(plan.source.chainId)
+            ? await this.bitcoinDepositAddressMismatch(plan, identity)
+            : !sameFundingAddress(
+                plan.source.address,
+                plan.sourceDomain === 'private' ? identity.peaAddress : identity.address
+              )
           : plan.operation === 'swap'
             ? !sameFundingAddress(plan.source.address, identity.address) ||
               !sameFundingAddress(plan.destination.address, identity.address)
-            : plan.externalRecipient
-              ? !isValidExternalRecipient(
-                  plan.externalRecipient,
-                  plan.destination.chainId,
-                  plan.network
-                ) ||
-                !sameFundingAddress(plan.externalRecipient, plan.destination.address) ||
-                !sameFundingAddress(plan.source.address, identity.address)
-              : !sameFundingAddress(
-                  plan.destination.address,
-                  plan.destinationDomain === 'private' ? identity.peaAddress : identity.address
-                ))
+            : bitcoinAccountRoute
+              ? false
+              : plan.externalRecipient
+                ? !isValidExternalRecipient(
+                    plan.externalRecipient,
+                    plan.destination.chainId,
+                    plan.network
+                  ) ||
+                  !sameFundingAddress(plan.externalRecipient, plan.destination.address) ||
+                  !sameFundingAddress(plan.source.address, identity.address)
+                : !sameFundingAddress(
+                    plan.destination.address,
+                    plan.destinationDomain === 'private' ? identity.peaAddress : identity.address
+                  ))
     ) {
       throw new Error('Active Wallet Account changed before private funding completed')
     }
@@ -4986,9 +5358,14 @@ export class ConfidentialFundingCoordinator {
     readonly sourceDomain: 'public' | 'private'
     readonly feeSelection?: EvmFeeSelection
     readonly feeTier?: NetworkFeeTier
+    readonly bitcoinSourceAddress?: string
+    readonly bitcoinCounterpartyAddress?: string
   }) {
     const chainId = parseChainId(input.chainId).id
     if (parseChainId(chainId).namespace !== 'eip155') {
+      if (isBitcoinConfidentialChain(chainId)) {
+        assertBitcoinPayableDepositAddress(input.recipient, chainId)
+      }
       const asset = this.options.assets.get(input.assetId)
       if (!asset) throw new Error('Confidential funding asset is unavailable')
       const signing = await this.options.signer.prepareChainDeposit({
@@ -5001,7 +5378,13 @@ export class ConfidentialFundingCoordinator {
         decimals: asset.metadata.decimals,
         recipient: input.recipient,
         amountRaw: input.amountRaw,
-        sourceDomain: input.sourceDomain
+        sourceDomain: input.sourceDomain,
+        ...(input.bitcoinSourceAddress === undefined
+          ? {}
+          : { bitcoinSourceAddress: input.bitcoinSourceAddress }),
+        ...(input.bitcoinCounterpartyAddress === undefined
+          ? {}
+          : { bitcoinCounterpartyAddress: input.bitcoinCounterpartyAddress })
       })
       return Object.freeze({
         commandId: signing.commandId,

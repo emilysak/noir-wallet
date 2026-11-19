@@ -157,6 +157,22 @@ test('applies Private execution to an EVM or Solana source that has a Private ac
       privateSourceAvailable: true
     })
   ).toBe('main')
+  expect(
+    resolveSwapExecutionSourceMode({
+      requestedMode: 'private',
+      isPrivateFunding: false,
+      sourceFamily: 'bitcoin',
+      privateSourceAvailable: false
+    })
+  ).toBe('private')
+  expect(
+    resolveSwapExecutionSourceMode({
+      requestedMode: 'main',
+      isPrivateFunding: false,
+      sourceFamily: 'bitcoin',
+      privateSourceAvailable: false
+    })
+  ).toBe('main')
 })
 
 test('binds Private execution confidentiality into the live quote identity', () => {
@@ -212,6 +228,48 @@ test('binds Private execution confidentiality into the live quote identity', () 
       refundAddress: solanaPrivate,
       recipientAddress: solanaPrivate,
       privateRecipientAddress: solanaPrivate.toLowerCase(),
+      confidentiality: 'basic',
+      blocked: false
+    })
+  ).toBeNull()
+
+  const bitcoinPrivate = 'bc1qprivatepea'
+  const bitcoinToken = Object.freeze({
+    ...quoteToken,
+    assetId: 'nep141:btc.omft.near',
+    blockchain: 'btc',
+    decimals: 8,
+    symbol: 'BTC',
+    rheaChainId: 'btc'
+  })
+  expect(
+    buildLiveSwapQuoteRequest({
+      tokenIn: bitcoinToken,
+      tokenOut: bitcoinToken,
+      amountIn: '0.01',
+      slippage: 1,
+      refundAddress: bitcoinPrivate,
+      recipientAddress: bitcoinPrivate,
+      privateRecipientAddress: bitcoinPrivate,
+      confidentiality: 'basic',
+      blocked: false
+    })?.request
+  ).toMatchObject({
+    fromChain: 'btc',
+    toChain: 'btc',
+    sender: bitcoinPrivate,
+    recipient: bitcoinPrivate,
+    confidentiality: 'basic'
+  })
+  expect(
+    buildLiveSwapQuoteRequest({
+      tokenIn: bitcoinToken,
+      tokenOut: bitcoinToken,
+      amountIn: '0.01',
+      slippage: 1,
+      refundAddress: bitcoinPrivate,
+      recipientAddress: bitcoinPrivate.toUpperCase(),
+      privateRecipientAddress: bitcoinPrivate,
       confidentiality: 'basic',
       blocked: false
     })

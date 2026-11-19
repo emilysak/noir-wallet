@@ -1,4 +1,7 @@
-import type { BitcoinSupportedAddressType } from '@/core/chains/bitcoin'
+import {
+  supportsBitcoinPrivateExecution,
+  type BitcoinSupportedAddressType
+} from '@/core/chains/bitcoin'
 import type { SigningSummary } from '@/core/keyring/domain'
 import {
   parseNearIntentsTransactionBinding,
@@ -6,6 +9,8 @@ import {
   parseNetworkFeeTier,
   parseTransactionId,
   parseTransactionSegmentId,
+  type NearIntentsTransactionBinding,
+  type RheaSwapTransactionBinding,
   type TransactionAccountScope,
   type TransactionGraph
 } from '@/core/transactions/domain'
@@ -26,7 +31,10 @@ import {
 import { accountContextTransition } from './account-context-transition'
 
 export interface BackgroundBitcoinTransferControllerOptions {
-  readonly preparation: Pick<BitcoinTransferPreparationCoordinator, 'prepare'>
+  readonly preparation: Pick<BitcoinTransferPreparationCoordinator, 'prepare' | 'preparePrivate'>
+  readonly resolvePrivateExecutionAccount?: (
+    context: ActiveBitcoinDiscoveryContext
+  ) => Promise<Readonly<{ readonly address: string; readonly publicKey: string }> | undefined>
   readonly orchestrator: Pick<
     BitcoinTransferOrchestrator,
     | 'prepare'
@@ -74,6 +82,35 @@ export interface BackgroundBitcoinTransferReview {
 }
 
 const DEFAULT_ADDRESS_TYPE: BitcoinSupportedAddressType = 'p2wpkh'
+
+function parseBitcoinExecutionMode(value: unknown): 'main' | 'private' {
+  if (value === undefined || value === 'main') return 'main'
+  if (value === 'private') return 'private'
+  throw new Error('Invalid Bitcoin transfer execution mode')
+}
+
+type BitcoinQuoteBinding =
+  | { readonly nearIntentsBinding: NearIntentsTransactionBinding }
+  | { readonly rheaSwapBinding: RheaSwapTransactionBinding }
+
+function parseSingleBitcoinQuoteBinding(
+  nearIntentsBindingValue: unknown,
+  rheaSwapBindingValue: unknown
+): BitcoinQuoteBinding | undefined {
+  if (nearIntentsBindingValue !== undefined && rheaSwapBindingValue !== undefined) {
+    throw new Error('Bitcoin transfer cannot bind multiple swap protocols')
+  }
+  if (nearIntentsBindingValue !== undefined) {
+    return {
+      nearIntentsBinding: parseNearIntentsTransactionBinding(nearIntentsBindingValue)
+    }
+  }
+  if (rheaSwapBindingValue !== undefined) {
+    return { rheaSwapBinding: parseRheaSwapTransactionBinding(rheaSwapBindingValue) }
+  }
+  return undefined
+}
+
 function toBackgroundReview(
   value: PreparedBitcoinTransferApproval
 ): BackgroundBitcoinTransferReview {
@@ -117,11 +154,23 @@ export class BackgroundBitcoinTransferController {
     feeTierValue?: unknown,
     addressTypeValue?: unknown,
     feeRateSatsPerVbyteValue?: unknown,
-    rheaSwapBindingValue?: unknown
+    rheaSwapBindingValue?: unknown,
+    executionModeValue?: unknown
   ): Promise<BackgroundBitcoinTransferReview> {
     return accountContextTransition.runActiveOperation(async () => {
       const context = await this.requireActiveContext()
+      const executionMode = parseBitcoinExecutionMode(executionModeValue)
       const intent = parseBitcoinTransferIntent(intentValue, context.chainAccount.scope.chainId)
+      if (executionMode === 'private') {
+        return this.preparePrivate(
+          context,
+          intent,
+          feeTierValue,
+          feeRateSatsPerVbyteValue,
+          nearIntentsBindingValue,
+          rheaSwapBindingValue
+        )
+      }
       const nearIntentsBinding =
         nearIntentsBindingValue === undefined
           ? undefined
@@ -185,6 +234,74 @@ export class BackgroundBitcoinTransferController {
         })
       )
     })
+  }
+
+  private async preparePrivate(
+    context: ActiveBitcoinDiscoveryContext,
+    intent: ReturnType<typeof parseBitcoinTransferIntent>,
+    feeTierValue: unknown,
+    feeRateSatsPerVbyteValue: unknown,
+    nearIntentsBindingValue?: unknown,
+    rheaSwapBindingValue?: unknown
+  ): Promise<BackgroundBitcoinTransferReview> {
+    if (
+      context.keyDomainSource.kind === 'hardware' ||
+      !supportsBitcoinPrivateExecution(
+        context.keyDomainSource,
+        context.accountIndex,
+        context.chainAccount.scope.chainId
+      )
+    ) {
+      throw new Error('Bitcoin private send is unavailable for this account')
+    }
+    const privateAccount = await this.options.resolvePrivateExecutionAccount?.(context)
+    if (!privateAccount?.address || !privateAccount.publicKey) {
+      throw new Error('Bitcoin private execution address is unavailable')
+    }
+    const quoteBinding = parseSingleBitcoinQuoteBinding(
+      nearIntentsBindingValue,
+      rheaSwapBindingValue
+    )
+    const feeTier = parseNetworkFeeTier(feeTierValue ?? 'standard')
+    const feeRateSatsPerVbyte =
+      feeRateSatsPerVbyteValue === undefined
+        ? undefined
+        : parseBitcoinFeeRate(feeRateSatsPerVbyteValue)
+    await this.options.orchestrator.cancelExpiredApprovalsForScope(context.chainAccount.scope)
+    const id = this.createId()
+    const transactionId = parseTransactionId(`transaction:bitcoin:${id}`)
+    const segmentId = parseTransactionSegmentId(`segment:bitcoin:${id}`)
+    const plan = await this.options.preparation.preparePrivate({
+      chainAccount: context.chainAccount,
+      accountIndex: context.accountIndex,
+      transactionId,
+      recipient: intent.recipient,
+      amount: intent.amount,
+      privateExecutionAddress: privateAccount.address,
+      publicKey: privateAccount.publicKey,
+      publicReceiveAddress: context.chainAccount.identity.value,
+      ...(feeRateSatsPerVbyteValue === undefined
+        ? { feeTargetBlocks: bitcoinFeeTargetBlocks(feeTier) }
+        : { feeRateSatsPerVbyte })
+    })
+    if (plan.signerAddress !== privateAccount.address) {
+      throw new Error('Bitcoin private execution address does not match the signer')
+    }
+    return toBackgroundReview(
+      await this.options.orchestrator.prepare({
+        chainAccount: context.chainAccount,
+        transactionId,
+        segmentId,
+        prepared: plan.prepared,
+        signerAddress: plan.signerAddress,
+        changeReservation: plan.changeReservation,
+        inputReservation: plan.inputReservation,
+        requiredConfirmations: this.options.requiredConfirmations,
+        ...quoteBinding,
+        signingMode: 'internal',
+        signingFamily: 'bitcoin-pea'
+      })
+    )
   }
 
   async approve(

@@ -15,7 +15,8 @@ import {
   isPrivateFundingDestinationChain,
   parsePublicPrivateEvmSendDraft,
   parsePublicPrivateEvmSwapRoute,
-  resolveEvmNativeMaximumAmount
+  resolveEvmNativeMaximumAmount,
+  resolvePrivateFundingSourceChainId
 } from '../../../../src/popup/pages/transactions/evm-send-validation.ts'
 import { EvmWalletClientError } from '../../../../src/popup/services/evm-wallet-client.ts'
 import { resolveAccountAvailableRaw } from '../../../../src/popup/services/transfer-availability.ts'
@@ -374,8 +375,81 @@ test.describe('EVM send validation', () => {
     expect(isPrivateFundingDestinationChain('1')).toBe(true)
     expect(isPrivateFundingDestinationChain('near')).toBe(true)
     expect(isPrivateFundingDestinationChain('solana')).toBe(true)
-    expect(isPrivateFundingDestinationChain('btc')).toBe(false)
+    expect(isPrivateFundingDestinationChain('btc')).toBe(true)
     expect(isPrivateFundingDestinationChain('zcash')).toBe(false)
+  })
+
+  test('routes mainnet Bitcoin balance transfers through Swap review', () => {
+    const bitcoin = RHEA_SWAP_CHAIN_CATALOG.find(chain => chain.walletFamily === 'bitcoin')
+    const bitcoinChainId = 'bip122:000000000019d6689c085ae165831e93'
+    const bitcoinAsset = `${bitcoinChainId}/slip44:0`
+    const publicAddress = 'bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu'
+    const addBitcoin = new URL(
+      buildAddToPrivateMovePath({
+        family: 'bitcoin',
+        assetId: bitcoinAsset,
+        chainId: bitcoinChainId,
+        amount: '0.01'
+      }),
+      'https://wallet.invalid'
+    )
+    expect(bitcoin.apiChainId).toBe('btc')
+    expect(Object.fromEntries(addBitcoin.searchParams)).toEqual({
+      privateDestination: '1',
+      balanceTransfer: '1',
+      destinationChain: 'btc',
+      destinationAsset: bitcoinAsset,
+      source: bitcoinAsset,
+      amount: '0.01',
+      review: '1'
+    })
+    const moveBitcoin = new URL(
+      buildMoveToMainMovePath({
+        family: 'bitcoin',
+        assetId: bitcoinAsset,
+        mainAddress: publicAddress,
+        amount: '0.01',
+        maximum: true
+      }),
+      'https://wallet.invalid'
+    )
+    expect(Object.fromEntries(moveBitcoin.searchParams)).toEqual({
+      privateTransfer: '1',
+      balanceTransfer: '1',
+      source: bitcoinAsset,
+      recipient: publicAddress,
+      amount: '0.01',
+      review: '1',
+      maximum: '1'
+    })
+    expect(
+      resolvePrivateFundingSourceChainId('btc', [
+        { chain: { id: 'near:mainnet', family: 'near' } },
+        { chain: { id: bitcoinChainId, family: 'bitcoin' } }
+      ])
+    ).toBe(bitcoinChainId)
+    expect(
+      resolvePrivateFundingSourceChainId('btc', [{ chain: { id: 'btc', family: 'btc' } }])
+    ).toBeUndefined()
+    expect(
+      resolvePrivateFundingSourceChainId('1', [{ chain: { id: 'eip155:1', family: 'evm' } }])
+    ).toBe('eip155:1')
+    expect(() =>
+      buildAddToPrivateMovePath({
+        family: 'bitcoin',
+        assetId: bitcoinAsset,
+        chainId: 'bip122:000000000933ea01ad0ee984209779ba',
+        amount: '0.01'
+      })
+    ).toThrow('Invalid Bitcoin chain route')
+    expect(() =>
+      buildMoveToMainMovePath({
+        family: 'bitcoin',
+        assetId: bitcoinAsset,
+        mainAddress: 'alice.near',
+        amount: '0.01'
+      })
+    ).toThrow('Invalid Main Bitcoin address route')
   })
 
   test('rejects malformed one-click transfer amounts', () => {

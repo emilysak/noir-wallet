@@ -882,6 +882,37 @@ test.describe('pinned Multichain WASM in the real MV3 extension', () => {
     )
   })
 
+  test('derives the published Bitcoin P2WPKH privacy execution account', async ({ popup }) => {
+    test.setTimeout(180_000)
+    await waitForBackgroundWalletInitialization(popup)
+    const vault = expectSuccess(
+      await execute<VaultValue>(popup, 'credential.import', {
+        mnemonic: 'test test test test test test test test test test test junk',
+        password: PASSWORD
+      })
+    )
+    expectSuccess(await execute(popup, 'credential.unlock', { vault, password: PASSWORD }))
+    const pea = expectSuccess(
+      await execute(popup, 'account.derive-public', {
+        family: 'bitcoin-pea',
+        chainId: BITCOIN_MAINNET,
+        accountIndex: 0
+      })
+    )
+    expect(pea).toMatchObject({
+      address: 'bc1qhshj2sek7ff9e7gkhq6hsm9sdq8lr8u0dakdzc',
+      publicKey: '0x0337f142f69980b7a8d7294949e02220b9f9ff98f363d247487c15518184363851',
+      curve: 'secp256k1',
+      derivationScheme: 'pea_v2',
+      parent: { accountIndex: 0 },
+      family: 'bitcoin',
+      chainId: BITCOIN_MAINNET,
+      addressScheme: 'bitcoin_p2wpkh',
+      addressType: 'p2wpkh',
+      bitcoinNetwork: 'mainnet'
+    })
+  })
+
   test('imports one mnemonic and runs multichain derive/sign flows', async ({ popup }) => {
     test.setTimeout(180_000)
     await waitForBackgroundWalletInitialization(popup)

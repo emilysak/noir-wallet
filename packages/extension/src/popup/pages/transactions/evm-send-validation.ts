@@ -1,7 +1,9 @@
 import { getNearNetworkConfig, getSolanaNetworkConfig } from '@/config/networks'
 import { ZEC_ZCASH_ASSET } from '@/config/intents'
 import { parseZcashAddress } from '@/core/address-book/address-book'
+import { parseSupportedBitcoinAddress } from '@/core/chains/bitcoin'
 import { parseNearAccountId } from '@/core/chains/near'
+import { getBitcoinChainId, parseChainId } from '@/core/chains/registry'
 import { parseSolanaPublicKey } from '@/core/chains/solana'
 import { RHEA_SWAP_CHAIN_CATALOG } from '@/core/services/rhea-swap'
 import { EvmWalletClientError } from '@/popup/services/evm-wallet-client'
@@ -70,28 +72,35 @@ export function buildMoveToMainEvmPath(input: {
   return `/swap?${query.toString()}`
 }
 
-type ConfidentialMoveFamily = 'evm' | 'near' | 'solana'
+type ConfidentialMoveFamily = 'evm' | 'near' | 'solana' | 'bitcoin'
+type NonEvmConfidentialMoveFamily = Exclude<ConfidentialMoveFamily, 'evm'>
 
-function confidentialMoveApiChainId(family: 'near' | 'solana'): string {
+function confidentialMoveRouteError(family: NonEvmConfidentialMoveFamily): string {
+  if (family === 'near') return 'Invalid NEAR chain route'
+  if (family === 'solana') return 'Invalid Solana chain route'
+  return 'Invalid Bitcoin chain route'
+}
+
+function confidentialMoveApiChainId(family: NonEvmConfidentialMoveFamily): string {
   const apiChainId = RHEA_SWAP_CHAIN_CATALOG.find(
     chain => chain.walletFamily === family
   )?.apiChainId
   // Swap compares destinationChain with rheaChainId, which is this api id.
   // The numeric token-list ids are not rheaChainId.
   if (!apiChainId || /^\d+$/.test(apiChainId)) {
-    throw new Error(family === 'near' ? 'Invalid NEAR chain route' : 'Invalid Solana chain route')
+    throw new Error(confidentialMoveRouteError(family))
   }
   return apiChainId
 }
 
-function assertConfidentialMoveChain(family: 'near' | 'solana', chainId: string): void {
+function assertConfidentialMoveChain(family: NonEvmConfidentialMoveFamily, chainId: string): void {
   const expected =
     family === 'near'
       ? getNearNetworkConfig('mainnet').chainId
-      : getSolanaNetworkConfig('mainnet').chainId
-  if (chainId !== expected) {
-    throw new Error(family === 'near' ? 'Invalid NEAR chain route' : 'Invalid Solana chain route')
-  }
+      : family === 'solana'
+        ? getSolanaNetworkConfig('mainnet').chainId
+        : getBitcoinChainId('mainnet')
+  if (chainId !== expected) throw new Error(confidentialMoveRouteError(family))
 }
 
 function assertNearMoveAddress(address: string): void {
@@ -111,14 +120,41 @@ function assertSolanaMoveAddress(address: string): void {
   }
 }
 
+function assertBitcoinMoveAddress(address: string): void {
+  try {
+    if (
+      parseSupportedBitcoinAddress(address, parseChainId(getBitcoinChainId('mainnet')).id) !==
+      address
+    ) {
+      throw new Error('invalid')
+    }
+  } catch {
+    throw new Error('Invalid Main Bitcoin address route')
+  }
+}
+
 export function isPrivateFundingDestinationChain(chainId: string | null | undefined): boolean {
   if (!chainId) return false
   if (/^\d+$/.test(chainId)) return true
   return RHEA_SWAP_CHAIN_CATALOG.some(
     chain =>
       chain.apiChainId === chainId &&
-      (chain.walletFamily === 'near' || chain.walletFamily === 'solana')
+      (chain.walletFamily === 'near' ||
+        chain.walletFamily === 'solana' ||
+        chain.walletFamily === 'bitcoin')
   )
+}
+
+export function resolvePrivateFundingSourceChainId(
+  apiChainId: string,
+  networks: readonly { readonly chain: { readonly id: string; readonly family: string } }[]
+): string | undefined {
+  if (/^\d+$/.test(apiChainId)) return `eip155:${apiChainId}`
+  const family = RHEA_SWAP_CHAIN_CATALOG.find(
+    chain => chain.apiChainId === apiChainId
+  )?.walletFamily
+  if (!family) return undefined
+  return networks.find(network => network.chain.family === family)?.chain.id
 }
 
 export function buildAddToPrivateMovePath(input: {
@@ -159,7 +195,8 @@ export function buildMoveToMainMovePath(input: {
   }
   assertRoutableAssetId(input.assetId)
   if (input.family === 'near') assertNearMoveAddress(input.mainAddress)
-  else assertSolanaMoveAddress(input.mainAddress)
+  else if (input.family === 'solana') assertSolanaMoveAddress(input.mainAddress)
+  else assertBitcoinMoveAddress(input.mainAddress)
   const query = new URLSearchParams({
     privateTransfer: '1',
     balanceTransfer: '1',

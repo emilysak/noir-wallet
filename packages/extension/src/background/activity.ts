@@ -39,7 +39,13 @@ import { ACTIVITY_HISTORY_CACHE_ITEM_LIMIT, ActivityHistoryCache } from './activ
 import { getBitcoinAccountPreferences } from './bitcoin-account-preferences'
 import type { BitcoinSupportedAddressType } from '@/core/chains/bitcoin'
 import { credentialSession } from './credential-session'
+import { readBitcoinPrivateExecutionAddress } from './bitcoin-private-execution-address'
 import { loadActiveSolanaTransferContext } from './solana-transfer'
+import {
+  BITCOIN_PRIVATE_ACTIVITY_CACHE_PARTITION,
+  bitcoinActivityReferencesPrivateExecution,
+  partitionBitcoinPrivateExecutionActivity
+} from '@/infrastructure/chains/bitcoin/bitcoin-private-activity'
 import { parseSolanaPublicKey } from '@/infrastructure/chains/solana'
 import { ChromeConfidentialFundingStore } from './confidential-funding-store'
 
@@ -266,10 +272,20 @@ export function createBackgroundActivityCoordinator(
   )
   const bitcoinDiscovery = bitcoinHistory ? new IndexedDbBitcoinDiscoveryRepository() : undefined
 
+  const loadBitcoinPrivateAddress = (scope: ActivityScope) =>
+    bitcoinHistory
+      ? readBitcoinPrivateExecutionAddress({
+          keyDomainId: scope.keyDomainId,
+          accountId: scope.accountId,
+          chainId: bitcoinNetwork.chainId
+        })
+      : Promise.resolve(undefined)
+
   const loadBitcoinItems = async (
     scope: ActivityScope,
     fallbackItems: readonly ActivityItem[],
-    addressType: BitcoinSupportedAddressType
+    addressType: BitcoinSupportedAddressType,
+    privateAddress: string | undefined
   ): Promise<readonly ActivityItem[]> => {
     if (!bitcoinDiscovery || !bitcoinHistory) return Object.freeze([])
     try {
@@ -289,8 +305,10 @@ export function createBackgroundActivityCoordinator(
         accountIndex: context.accountIndex
       })
       if (!state) return Object.freeze([])
-      const selectedObservations = state.observations.filter(observation =>
-        isActiveBitcoinAddressObservation(observation, addressType)
+      const selectedObservations = state.observations.filter(
+        observation =>
+          isActiveBitcoinAddressObservation(observation, addressType) &&
+          (!privateAddress || observation.derived.address !== privateAddress)
       )
       const observations = [...selectedObservations].sort(
         (left, right) =>
@@ -306,14 +324,48 @@ export function createBackgroundActivityCoordinator(
           .slice(0, BITCOIN_ACTIVITY_HISTORY_LIMITS.addresses)
           .map(observation => observation.derived.address)
       })
-      return mergeBoundedActivityItems(fallbackItems, fresh)
+      return partitionBitcoinPrivateExecutionActivity(
+        mergeBoundedActivityItems(fallbackItems, fresh),
+        privateAddress
+      ).sharedItems
     } catch (error) {
       logger.warn(
         `Bitcoin activity refresh failed: ${formatLogError(error)}`,
         scope.keyDomainId,
         scope.accountId
       )
-      return fallbackItems
+      return partitionBitcoinPrivateExecutionActivity(fallbackItems, privateAddress).sharedItems
+    }
+  }
+
+  const loadBitcoinPrivateItems = async (
+    scope: ActivityScope,
+    fallbackItems: readonly ActivityItem[],
+    privateAddress: string | undefined
+  ): Promise<readonly ActivityItem[]> => {
+    if (!bitcoinHistory || !privateAddress) return Object.freeze([])
+    const retained = partitionBitcoinPrivateExecutionActivity(
+      fallbackItems,
+      privateAddress
+    ).privateItems
+    try {
+      const fresh = await bitcoinHistory.readAddressActivity({
+        scope,
+        ownedAddresses: [privateAddress],
+        historyAddresses: [privateAddress]
+      })
+      return partitionBitcoinPrivateExecutionActivity(
+        mergeBoundedActivityItems(retained, fresh),
+        privateAddress,
+        new Set(fresh.map(item => item.id))
+      ).privateItems
+    } catch (error) {
+      logger.warn(
+        `Bitcoin private activity refresh failed: ${formatLogError(error)}`,
+        scope.keyDomainId,
+        scope.accountId
+      )
+      return retained
     }
   }
 
@@ -593,7 +645,11 @@ export function createBackgroundActivityCoordinator(
       accountId: scope.accountId
     })
     const cachePartition = bitcoinActivityCachePartition(addressType)
+    const privateAddress = await loadBitcoinPrivateAddress(scope)
     const activeCache = await historyCache.read(scope, cachePartition).catch(() => null)
+    const privateCache = privateAddress
+      ? await historyCache.read(scope, BITCOIN_PRIVATE_ACTIVITY_CACHE_PARTITION).catch(() => null)
+      : null
     const cachedEvm = await loadCachedEvmItems(scope, accountMode).catch(
       (): {
         readonly items: readonly ActivityItem[]
@@ -608,7 +664,17 @@ export function createBackgroundActivityCoordinator(
       })
     )
     const activeItems = activeCache?.items ?? []
-    const cachedItems = mergeBoundedActivityItems(activeItems, cachedEvm.items, 10_000)
+    const publicActiveItems = partitionBitcoinPrivateExecutionActivity(
+      activeItems,
+      privateAddress
+    ).sharedItems
+    const cachedItems = mergeBoundedActivityItems(
+      accountMode === 'main'
+        ? publicActiveItems
+        : mergeBoundedActivityItems(publicActiveItems, privateCache?.items ?? [], 10_000),
+      cachedEvm.items,
+      10_000
+    )
     const currentTime = Date.now()
     const supportedChainIds = Object.freeze([
       ...(bitcoinHistory ? [bitcoinNetwork.chainId] : []),
@@ -635,13 +701,36 @@ export function createBackgroundActivityCoordinator(
       )
         ? PENDING_ACTIVITY_REFRESH_TTL_MS
         : ACTIVITY_REFRESH_TTL_MS
-      return (
+      const publicStale =
         refreshedAt === undefined ||
         refreshedAt > currentTime ||
         currentTime - refreshedAt >= refreshTtl
+      if (chainId !== bitcoinNetwork.chainId || !privateAddress) return publicStale
+      const privateRefreshedAt = privateCache?.refreshedAtByChainId[chainId]
+      const privateTtl = (privateCache?.items ?? []).some(
+        item =>
+          item.status !== 'final' &&
+          item.status !== 'failed' &&
+          activityItemIncludesChain(item, chainId)
+      )
+        ? PENDING_ACTIVITY_REFRESH_TTL_MS
+        : ACTIVITY_REFRESH_TTL_MS
+      return (
+        publicStale ||
+        privateRefreshedAt === undefined ||
+        privateRefreshedAt > currentTime ||
+        currentTime - privateRefreshedAt >= privateTtl
       )
     })
-    if (staleChainIds.length === 0) return cachedItems
+    if (staleChainIds.length === 0) {
+      return accountMode === 'private'
+        ? cachedItems.filter(
+            item =>
+              item.accountMode === 'private' ||
+              !activityItemIncludesChain(item, bitcoinNetwork.chainId)
+          )
+        : cachedItems
+    }
     const staleChainIdSet = new Set<string>(staleChainIds)
     const refreshScopeKey = `${scope.keyDomainId}:${scope.accountId}:${cachePartition}:`
     const refreshKey = `${refreshScopeKey}${accountMode}:${[...staleChainIds].sort().join(',')}:${historyPageCount}`
@@ -656,30 +745,41 @@ export function createBackgroundActivityCoordinator(
     }
 
     const refresh = (async () => {
-      const cachedBitcoinItems = filterItemsForChain(activeItems, bitcoinNetwork.chainId)
+      const cachedBitcoinItems = filterItemsForChain(publicActiveItems, bitcoinNetwork.chainId)
       const cachedSolanaItems = filterItemsForChainFamily(activeItems, 'solana')
       const cachedNearItems = filterItemsForChainFamily(activeItems, 'near')
-      const [bitcoinItems, evmItems, solanaItems, nearItems] = await Promise.all([
-        staleChainIdSet.has(bitcoinNetwork.chainId)
-          ? loadBitcoinItems(scope, cachedBitcoinItems, addressType)
-          : Object.freeze([]),
-        loadEvmItems(
-          scope,
-          accountMode,
-          staleChainIdSet,
-          cachedEvm.items,
-          historyPageCount,
-          cachedEvm.hasMoreKeys
-        ),
-        staleChainIdSet.has(solanaNetwork.chainId)
-          ? loadSolanaItems(scope, cachedSolanaItems)
-          : Object.freeze([]),
-        staleChainIdSet.has(nearNetwork.chainId)
-          ? loadNearItems(scope, cachedNearItems)
-          : Object.freeze([])
-      ])
+      const [bitcoinItems, bitcoinPrivateItems, evmItems, solanaItems, nearItems] =
+        await Promise.all([
+          staleChainIdSet.has(bitcoinNetwork.chainId)
+            ? loadBitcoinItems(scope, cachedBitcoinItems, addressType, privateAddress)
+            : Object.freeze([]),
+          staleChainIdSet.has(bitcoinNetwork.chainId)
+            ? loadBitcoinPrivateItems(scope, privateCache?.items ?? [], privateAddress)
+            : Object.freeze([]),
+          loadEvmItems(
+            scope,
+            accountMode,
+            staleChainIdSet,
+            cachedEvm.items,
+            historyPageCount,
+            cachedEvm.hasMoreKeys
+          ),
+          staleChainIdSet.has(solanaNetwork.chainId)
+            ? loadSolanaItems(scope, cachedSolanaItems)
+            : Object.freeze([]),
+          staleChainIdSet.has(nearNetwork.chainId)
+            ? loadNearItems(scope, cachedNearItems)
+            : Object.freeze([])
+        ])
+      const privateHistoryIds = new Set(bitcoinPrivateItems.map(item => item.id))
+      const visibleBitcoinItems = bitcoinItems.filter(
+        item =>
+          !privateHistoryIds.has(item.id) &&
+          (!privateAddress || !bitcoinActivityReferencesPrivateExecution(item, privateAddress))
+      )
       const refreshedItems = Object.freeze([
-        ...bitcoinItems,
+        ...visibleBitcoinItems,
+        ...bitcoinPrivateItems,
         ...evmItems,
         ...solanaItems,
         ...nearItems
@@ -705,17 +805,57 @@ export function createBackgroundActivityCoordinator(
             retainedNonEvmItems,
             refreshedItems.filter(item => !isEvmActivityItem(item))
           )
+          const partitionedBitcoin = staleChainIdSet.has(bitcoinNetwork.chainId)
+            ? partitionBitcoinPrivateExecutionActivity(
+                nonEvmItems,
+                privateAddress,
+                privateHistoryIds
+              )
+            : Object.freeze({
+                sharedItems: nonEvmItems,
+                privateItems: Object.freeze([])
+              })
+          if (accountMode === 'main') {
+            committedItems = partitionBitcoinPrivateExecutionActivity(
+              committedItems,
+              privateAddress,
+              privateHistoryIds
+            ).sharedItems
+          } else if (accountMode === 'private') {
+            committedItems = committedItems.filter(
+              item =>
+                item.accountMode === 'private' ||
+                !activityItemIncludesChain(item, bitcoinNetwork.chainId)
+            )
+          }
           const refreshedAtByChainId = Object.freeze({
             ...(latest?.refreshedAtByChainId ?? activeCache?.refreshedAtByChainId ?? {}),
             ...Object.fromEntries(staleChainIds.map(chainId => [chainId, refreshedAt]))
           })
           await historyCache
-            .write(scope, refreshedAtByChainId, nonEvmItems, cachePartition)
+            .write(scope, refreshedAtByChainId, partitionedBitcoin.sharedItems, cachePartition)
             .catch(error => {
               console.warn(
                 `[Activity] History cache write failed: ${error instanceof Error ? error.name : 'UnknownError'}`
               )
             })
+          if (privateAddress && staleChainIdSet.has(bitcoinNetwork.chainId)) {
+            await historyCache
+              .write(
+                scope,
+                Object.freeze({
+                  ...(privateCache?.refreshedAtByChainId ?? {}),
+                  [bitcoinNetwork.chainId]: refreshedAt
+                }),
+                partitionedBitcoin.privateItems,
+                BITCOIN_PRIVATE_ACTIVITY_CACHE_PARTITION
+              )
+              .catch(error => {
+                console.warn(
+                  `[Activity] Private history cache write failed: ${error instanceof Error ? error.name : 'UnknownError'}`
+                )
+              })
+          }
         })
       supplementalCacheWrites.set(cacheWriteKey, cacheWrite)
       await cacheWrite
@@ -742,9 +882,23 @@ export function createBackgroundActivityCoordinator(
       accountId: scope.accountId
     })
     const partition = bitcoinActivityCachePartition(addressType)
+    const privateAddress = await loadBitcoinPrivateAddress(scope)
     const snapshot = await historyCache.read(scope, partition).catch(() => null)
+    const privateSnapshot = privateAddress
+      ? await historyCache.read(scope, BITCOIN_PRIVATE_ACTIVITY_CACHE_PARTITION).catch(() => null)
+      : null
+    const sharedItems = partitionBitcoinPrivateExecutionActivity(
+      snapshot?.items ?? [],
+      privateAddress
+    ).sharedItems
     const evm = await loadCachedEvmItems(scope, accountMode).catch(() => ({ items: [] }))
-    return mergeBoundedActivityItems(snapshot?.items ?? [], evm.items, 10_000)
+    return mergeBoundedActivityItems(
+      accountMode === 'main'
+        ? sharedItems
+        : mergeBoundedActivityItems(sharedItems, privateSnapshot?.items ?? [], 10_000),
+      evm.items,
+      10_000
+    )
   }
 
   const loadSupplementalHasMore = async (
@@ -812,6 +966,8 @@ export function createBackgroundActivityCoordinator(
         .filter(observation => isActiveBitcoinAddressObservation(observation, addressType))
         .map(observation => observation.derived.address)
     )
+    const privateAddress = await loadBitcoinPrivateAddress(scope)
+    if (privateAddress) ownedAddresses.add(privateAddress)
     return filterLocalGraphsForActiveBitcoinAddress(
       projectedGraphs,
       bitcoinNetwork.chainId,
@@ -860,6 +1016,8 @@ export function createBackgroundActivityCoordinator(
           }
         }
       }
+      const bitcoinPrivateAddress = await loadBitcoinPrivateAddress(scope)
+      if (bitcoinPrivateAddress) addresses.push(bitcoinPrivateAddress)
       const solana = await loadActiveSolanaTransferContext(storageRepository, solanaNetwork.chainId)
       if (
         solana &&

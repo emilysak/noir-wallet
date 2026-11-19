@@ -129,6 +129,36 @@ test.describe('Account networks Popup client', () => {
     expect(Object.isFrozen(catalog.accounts[0].networks)).toBe(true)
   })
 
+  test('accepts one Bitcoin P2WPKH private execution address beside the public scripts', async () => {
+    const pea = 'tb1qk34t7nv7zarwxw7v88828h58ds5uft0nrsg5ws'
+    const account = result().result.accounts[0]
+    const networks = account.networks.map(network =>
+      network.chainId === 'bip122:000000000933ea01ad0ee984209779ba'
+        ? { ...network, privateExecutionAddress: pea }
+        : network
+    )
+    const catalog = await createAccountNetworksClient(
+      async () => result({ accounts: [{ ...account, networks }] }),
+      chains
+    ).getCatalog()
+    const bitcoin = catalog.accounts[0].networks.find(network => network.chain.family === 'bitcoin')
+
+    expect(bitcoin.privateExecutionAddress).toBe(pea)
+    expect(bitcoin.addresses.map(address => address.value)).not.toContain(pea)
+
+    const taproot = account.networks.map(network =>
+      network.chainId === 'bip122:000000000933ea01ad0ee984209779ba'
+        ? { ...network, privateExecutionAddress: bitcoinTaprootAddress }
+        : network
+    )
+    await expect(
+      createAccountNetworksClient(
+        async () => result({ accounts: [{ ...account, networks: taproot }] }),
+        chains
+      ).getCatalog()
+    ).rejects.toMatchObject({ code: 'invalid-response' })
+  })
+
   test('account catalogs retain wallet creation time and accept legacy entries without it', async () => {
     const account = result().result.accounts[0]
     const read = entry =>

@@ -97,11 +97,24 @@ function fundingTransaction(key, valueSats = 100000) {
   return transaction
 }
 
+function fundedUtxo(key, addressType, valueSats = '100000') {
+  const funding = fundingTransaction(key, Number(valueSats))
+  return {
+    funding,
+    utxo: spendable(key, addressType, valueSats, {
+      transactionId: funding.getId(),
+      outputIndex: 0
+    }),
+    previousTransactions: [{ transactionId: funding.getId(), rawTransactionHex: funding.toHex() }]
+  }
+}
+
 test('builds, validates, and finalizes a BIP-84 PSBT with explicit change key origin', () => {
   const source = keyMaterial(1, 'p2wpkh')
   const change = keyMaterial(2, 'p2wpkh')
   const recipient = keyMaterial(3, 'p2tr')
   const wrongSigner = keyMaterial(11, 'p2wpkh')
+  const funded = fundedUtxo(source, 'p2wpkh')
   const selection = selectBitcoinCoins({
     chainId: MAINNET,
     accountIndex: 0,
@@ -109,12 +122,21 @@ test('builds, validates, and finalizes a BIP-84 PSBT with explicit change key or
     recipient: recipient.address,
     amount: { mode: 'exact', valueSats: '50000' },
     feeRateSatsPerVbyte: 2,
-    utxos: [spendable(source, 'p2wpkh')]
+    utxos: [funded.utxo]
   })
+  expect(() =>
+    buildBitcoinPsbt({
+      selection,
+      masterFingerprint: MASTER_FINGERPRINT,
+      lockTime: LOCK_TIME,
+      change: { address: changeAddress(change, 'p2wpkh'), outputPosition: 'first' }
+    })
+  ).toThrow(expect.objectContaining({ code: 'invalid-intent' }))
   const prepared = buildBitcoinPsbt({
     selection,
     masterFingerprint: MASTER_FINGERPRINT,
     lockTime: LOCK_TIME,
+    previousTransactions: funded.previousTransactions,
     change: { address: changeAddress(change, 'p2wpkh'), outputPosition: 'first' }
   })
 
@@ -136,7 +158,8 @@ test('builds, validates, and finalizes a BIP-84 PSBT with explicit change key or
   expect(unsigned.version).toBe(2)
   expect(unsigned.locktime).toBe(LOCK_TIME)
   expect(unsigned.txInputs[0].sequence).toBe(0xfffffffd)
-  expect(unsigned.data.inputs[0].nonWitnessUtxo).toBeUndefined()
+  expect(unsigned.data.inputs[0].witnessUtxo).toMatchObject({ value: 100000 })
+  expect(unsigned.data.inputs[0].nonWitnessUtxo).toEqual(funded.funding.toBuffer())
   expect(unsigned.data.inputs[0].bip32Derivation).toEqual([
     expect.objectContaining({
       path: "m/84'/0'/0'/0/0",
@@ -159,8 +182,8 @@ test('builds, validates, and finalizes a BIP-84 PSBT with explicit change key or
       inputs: [
         {
           index: 0,
-          transactionId: 'ab'.repeat(32),
-          outputIndex: 1,
+          transactionId: funded.funding.getId(),
+          outputIndex: 0,
           amountSats: '100000',
           sequence: 0xfffffffd,
           scriptType: 'p2wpkh',
@@ -224,6 +247,7 @@ test('keeps the selected Ledger account root in inputs and change', () => {
   const change = keyMaterial(2, 'p2wpkh')
   const recipient = keyMaterial(3, 'p2tr')
   const root = "m/84'/0'/5'"
+  const funded = fundedUtxo(source, 'p2wpkh')
   const selection = selectBitcoinCoins({
     chainId: MAINNET,
     accountIndex: 0,
@@ -231,12 +255,13 @@ test('keeps the selected Ledger account root in inputs and change', () => {
     recipient: recipient.address,
     amount: { mode: 'exact', valueSats: '50000' },
     feeRateSatsPerVbyte: 2,
-    utxos: [{ ...spendable(source, 'p2wpkh'), derivationPath: `${root}/0/0` }]
+    utxos: [{ ...funded.utxo, derivationPath: `${root}/0/0` }]
   })
   const prepared = buildBitcoinPsbt({
     selection,
     masterFingerprint: MASTER_FINGERPRINT,
     lockTime: LOCK_TIME,
+    previousTransactions: funded.previousTransactions,
     change: {
       address: { ...changeAddress(change, 'p2wpkh'), derivationPath: `${root}/1/0` },
       outputPosition: 'first'
@@ -255,6 +280,7 @@ test('keeps the selected Ledger account root in inputs and change', () => {
       selection,
       masterFingerprint: MASTER_FINGERPRINT,
       lockTime: LOCK_TIME,
+      previousTransactions: funded.previousTransactions,
       change: { address: changeAddress(change, 'p2wpkh'), outputPosition: 'first' }
     })
   ).toThrow(/selected account/)
@@ -285,6 +311,16 @@ test('builds BIP-86 key-path metadata without requiring change', () => {
     changeOutputIndex: null,
     outputCount: 1
   })
+  expect(psbt.data.inputs[0].nonWitnessUtxo).toBeUndefined()
+  expect(psbt.data.inputs[0].witnessUtxo).toBeDefined()
+  expect(() =>
+    buildBitcoinPsbt({
+      selection,
+      masterFingerprint: MASTER_FINGERPRINT,
+      lockTime: LOCK_TIME,
+      previousTransactions: [{ transactionId: 'ab'.repeat(32), rawTransactionHex: '00' }]
+    })
+  ).toThrow(/non-Taproot/)
   expect(psbt.data.inputs[0].bip32Derivation).toBeUndefined()
   expect(psbt.data.inputs[0].tapInternalKey).toEqual(source.publicKey.subarray(1))
   expect(psbt.data.inputs[0].tapBip32Derivation).toEqual([
@@ -301,6 +337,7 @@ test('builds, signs, and finalizes a BIP-49 nested SegWit PSBT', () => {
   const source = keyMaterial(12, 'p2sh-p2wpkh')
   const change = keyMaterial(13, 'p2sh-p2wpkh')
   const recipient = keyMaterial(14, 'p2pkh')
+  const funded = fundedUtxo(source, 'p2sh-p2wpkh')
   const selection = selectBitcoinCoins({
     chainId: MAINNET,
     accountIndex: 0,
@@ -308,12 +345,13 @@ test('builds, signs, and finalizes a BIP-49 nested SegWit PSBT', () => {
     recipient: recipient.address,
     amount: { mode: 'exact', valueSats: '50000' },
     feeRateSatsPerVbyte: 2,
-    utxos: [spendable(source, 'p2sh-p2wpkh')]
+    utxos: [funded.utxo]
   })
   const prepared = buildBitcoinPsbt({
     selection,
     masterFingerprint: MASTER_FINGERPRINT,
     lockTime: LOCK_TIME,
+    previousTransactions: funded.previousTransactions,
     change: { address: changeAddress(change, 'p2sh-p2wpkh'), outputPosition: 'last' }
   })
   const psbt = Psbt.fromBase64(prepared.psbtBase64)
@@ -321,7 +359,7 @@ test('builds, signs, and finalizes a BIP-49 nested SegWit PSBT', () => {
     witnessUtxo: { value: 100000 },
     redeemScript: source.payment.redeem.output
   })
-  expect(psbt.data.inputs[0].nonWitnessUtxo).toBeUndefined()
+  expect(psbt.data.inputs[0].nonWitnessUtxo).toEqual(funded.funding.toBuffer())
   expect(psbt.data.outputs[1].redeemScript).toEqual(change.payment.redeem.output)
   psbt.signAllInputs({
     publicKey: source.publicKey,
@@ -376,6 +414,7 @@ test('rejects mismatched ownership, malformed fingerprints, and missing change r
   const source = keyMaterial(6, 'p2wpkh')
   const unrelated = keyMaterial(7, 'p2wpkh')
   const recipient = keyMaterial(8, 'p2wpkh')
+  const funded = fundedUtxo(source, 'p2wpkh')
   const selection = selectBitcoinCoins({
     chainId: MAINNET,
     accountIndex: 0,
@@ -383,11 +422,16 @@ test('rejects mismatched ownership, malformed fingerprints, and missing change r
     recipient: recipient.address,
     amount: { mode: 'exact', valueSats: '50000' },
     feeRateSatsPerVbyte: 2,
-    utxos: [spendable(source, 'p2wpkh')]
+    utxos: [funded.utxo]
   })
 
   expect(() =>
-    buildBitcoinPsbt({ selection, masterFingerprint: '0x0102030A', lockTime: LOCK_TIME })
+    buildBitcoinPsbt({
+      selection,
+      masterFingerprint: '0x0102030A',
+      lockTime: LOCK_TIME,
+      previousTransactions: funded.previousTransactions
+    })
   ).toThrow(expect.objectContaining({ code: 'invalid-intent' }))
   expect(() =>
     buildBitcoinPsbt({ selection, masterFingerprint: MASTER_FINGERPRINT, lockTime: LOCK_TIME })
@@ -402,6 +446,7 @@ test('rejects mismatched ownership, malformed fingerprints, and missing change r
       },
       masterFingerprint: MASTER_FINGERPRINT,
       lockTime: LOCK_TIME,
+      previousTransactions: funded.previousTransactions,
       change: { address: changeAddress(unrelated, 'p2wpkh'), outputPosition: 'last' }
     })
   ).toThrow(expect.objectContaining({ code: 'invalid-intent' }))
@@ -410,6 +455,7 @@ test('rejects mismatched ownership, malformed fingerprints, and missing change r
       selection,
       masterFingerprint: MASTER_FINGERPRINT,
       lockTime: LOCK_TIME,
+      previousTransactions: funded.previousTransactions,
       change: {
         address: {
           ...changeAddress(unrelated, 'p2wpkh'),
@@ -424,6 +470,7 @@ test('rejects mismatched ownership, malformed fingerprints, and missing change r
 test('rejects unsigned, signature-tampered, and transaction-tampered PSBTs', () => {
   const source = keyMaterial(9, 'p2wpkh')
   const recipient = keyMaterial(10, 'p2wpkh')
+  const funded = fundedUtxo(source, 'p2wpkh')
   const selection = selectBitcoinCoins({
     chainId: MAINNET,
     accountIndex: 0,
@@ -431,12 +478,13 @@ test('rejects unsigned, signature-tampered, and transaction-tampered PSBTs', () 
     recipient: recipient.address,
     amount: { mode: 'max' },
     feeRateSatsPerVbyte: 2,
-    utxos: [spendable(source, 'p2wpkh')]
+    utxos: [funded.utxo]
   })
   const prepared = buildBitcoinPsbt({
     selection,
     masterFingerprint: MASTER_FINGERPRINT,
-    lockTime: LOCK_TIME
+    lockTime: LOCK_TIME,
+    previousTransactions: funded.previousTransactions
   })
   expect(() => finalizeBitcoinPsbt({ prepared, signedPsbtBase64: prepared.psbtBase64 })).toThrow(
     expect.objectContaining({ code: 'invalid-signed-transaction' })

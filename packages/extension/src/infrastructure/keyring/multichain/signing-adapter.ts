@@ -40,6 +40,7 @@ import {
   type RawBitcoinAddressType,
   type RawDerivedAccount,
   type RawDerivedBitcoinAccount,
+  type RawDerivedBitcoinPeaAccount,
   type RawDerivedEd25519Account,
   type RawDerivedPeaAccount,
   type RawPeaExecutionAccount,
@@ -152,6 +153,12 @@ export type ParsedSigningPreparePayload =
       readonly psbt: string
     }
   | {
+      readonly kind: 'pea-bitcoin-psbt'
+      readonly chainId: ChainId
+      readonly accountIndex: number
+      readonly psbt: string
+    }
+  | {
       readonly kind: 'bitcoin-bip322-message'
       readonly chainId: ChainId
       readonly addressType: RawBitcoinAddressType
@@ -169,6 +176,7 @@ export interface AdaptedPreparedSigning {
   readonly account:
     | RawDerivedAccount
     | RawDerivedBitcoinAccount
+    | RawDerivedBitcoinPeaAccount
     | RawDerivedEd25519Account
     | RawDerivedPeaAccount
     | RawPeaExecutionAccount
@@ -320,6 +328,7 @@ export function parseSigningPreparePayload(value: unknown): ParsedSigningPrepare
       'evm-typed-data',
       'pea-evm-typed-data',
       'bitcoin-psbt',
+      'pea-bitcoin-psbt',
       'bitcoin-bip322-message'
     ],
     'signing.prepare kind'
@@ -367,6 +376,15 @@ export function parseSigningPreparePayload(value: unknown): ParsedSigningPrepare
       kind,
       chainId: parseChainId(record.chainId, 'bip122'),
       addressType: readLiteral(record.addressType, RAW_BITCOIN_ADDRESS_TYPES, 'addressType'),
+      accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_BIP32_INDEX),
+      psbt: readCanonicalBase64(record.psbt, 'psbt', 2 * 1024 * 1024)
+    })
+  }
+  if (kind === 'pea-bitcoin-psbt') {
+    assertExactKeys(record, ['kind', 'chainId', 'accountIndex', 'psbt'], [], 'payload')
+    return Object.freeze({
+      kind,
+      chainId: parseChainId(record.chainId, 'bip122'),
       accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_BIP32_INDEX),
       psbt: readCanonicalBase64(record.psbt, 'psbt', 2 * 1024 * 1024)
     })
@@ -928,8 +946,8 @@ function parseBitcoinOutput(value: unknown, index: number) {
 
 async function adaptBitcoinPsbt(
   raw: unknown,
-  payload: Extract<ParsedSigningPreparePayload, { kind: 'bitcoin-psbt' }>,
-  account: RawDerivedBitcoinAccount,
+  payload: Extract<ParsedSigningPreparePayload, { kind: 'bitcoin-psbt' | 'pea-bitcoin-psbt' }>,
+  account: RawDerivedBitcoinAccount | RawDerivedBitcoinPeaAccount,
   signingCommandId: SigningCommandId,
   expiresAt: number
 ): Promise<AdaptedPreparedSigning> {
@@ -957,16 +975,19 @@ async function adaptBitcoinPsbt(
     ],
     'PreparedBitcoinPsbt.summary'
   )
+  // A Bitcoin PEA signs as one imported P2WPKH key, so the PSBT summary account index is 0.
+  const addressType = payload.kind === 'pea-bitcoin-psbt' ? 'p2wpkh' : payload.addressType
+  const accountIndex = payload.kind === 'pea-bitcoin-psbt' ? 0 : payload.accountIndex
   if (
     rawSummary.chainId !== payload.chainId ||
-    rawSummary.addressType !== payload.addressType ||
-    rawSummary.accountIndex !== payload.accountIndex ||
+    rawSummary.addressType !== addressType ||
+    rawSummary.accountIndex !== accountIndex ||
     rawSummary.psbtVersion !== 0
   ) {
     throw new Error('Prepared Bitcoin PSBT summary does not match its input')
   }
   const inputs = readArray(rawSummary.inputs, 'BitcoinPsbtSummary.inputs', (item, index) =>
-    parseBitcoinInput(item, index, payload.addressType)
+    parseBitcoinInput(item, index, addressType)
   )
   const outputs = readArray(rawSummary.outputs, 'BitcoinPsbtSummary.outputs', parseBitcoinOutput)
   if (rawSummary.inputCount !== inputs.length || rawSummary.outputCount !== outputs.length) {
@@ -982,7 +1003,7 @@ async function adaptBitcoinPsbt(
   if (inputs.some(input => input.ownership === 'external')) {
     issues.push(Object.freeze({ code: 'external-input' }))
   }
-  const defaultSighash = payload.addressType === 'p2tr' ? 'SIGHASH_DEFAULT' : 'SIGHASH_ALL'
+  const defaultSighash = addressType === 'p2tr' ? 'SIGHASH_DEFAULT' : 'SIGHASH_ALL'
   if (inputs.some(input => input.sighashType !== defaultSighash)) {
     issues.push(Object.freeze({ code: 'non-default-sighash' }))
   }
@@ -1123,7 +1144,8 @@ export async function adaptPreparedSigning(
   bitcoinAccount?: RawDerivedBitcoinAccount,
   imported = false,
   solanaPea?: SolanaPeaSigningBinding,
-  nearPea?: NearPeaSigningBinding
+  nearPea?: NearPeaSigningBinding,
+  bitcoinPea?: RawDerivedBitcoinPeaAccount
 ): Promise<AdaptedPreparedSigning> {
   switch (payload.kind) {
     case 'evm-transaction':
@@ -1138,6 +1160,9 @@ export async function adaptPreparedSigning(
     case 'bitcoin-psbt':
       if (!bitcoinAccount) throw new Error('Bitcoin PSBT signer account is missing')
       return adaptBitcoinPsbt(raw, payload, bitcoinAccount, signingCommandId, expiresAt)
+    case 'pea-bitcoin-psbt':
+      if (!bitcoinPea) throw new Error('Bitcoin PEA signer account is missing')
+      return adaptBitcoinPsbt(raw, payload, bitcoinPea, signingCommandId, expiresAt)
     case 'bitcoin-bip322-message':
       return adaptBitcoinMessage(raw, payload, signingCommandId, expiresAt, imported)
     case 'solana-transaction':
@@ -1166,6 +1191,7 @@ export function adaptSignedResult(
   account:
     | RawDerivedAccount
     | RawDerivedBitcoinAccount
+    | RawDerivedBitcoinPeaAccount
     | RawDerivedEd25519Account
     | RawDerivedPeaAccount
     | RawPeaExecutionAccount
@@ -1192,7 +1218,8 @@ export function adaptSignedResult(
         address: account.address
       })
     }
-    case 'bitcoin-psbt': {
+    case 'bitcoin-psbt':
+    case 'pea-bitcoin-psbt': {
       const signed = parseRawSignedBitcoinPsbt(raw)
       return Object.freeze({
         kind: 'signed-payload',

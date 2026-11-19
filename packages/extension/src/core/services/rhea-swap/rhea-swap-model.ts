@@ -17,7 +17,11 @@ import {
   getEvmNativeProtocolAssetId
 } from '@/config/asset-market-assets'
 import { NOIR_SWAP_REFERRAL } from '@/config/intents'
-import { createInitialProductChainRegistry, getZcashChainId } from '@/core/chains/registry'
+import {
+  createInitialProductChainRegistry,
+  getBitcoinChainId,
+  getZcashChainId
+} from '@/core/chains/registry'
 
 const RAW_AMOUNT_PATTERN = /^(0|[1-9][0-9]{0,77})$/
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/
@@ -44,24 +48,40 @@ export type PrivateQuotePurpose =
   | 'private-dapp-transfer'
   | 'public-private-send'
 
-/** NEAR and Solana private Move senders are not EVM addresses. The route check binds them. */
+/** NEAR, Solana, and Bitcoin Move quotes use derived addresses, not an EVM signer. */
+function isNonEvmConfidentialMoveChain(fromChain: string): boolean {
+  return fromChain === 'near' || fromChain === 'solana' || fromChain === 'btc'
+}
+
 function isNonEvmPrivateMoveQuote(purpose: PrivateQuotePurpose, fromChain: string): boolean {
-  return purpose === 'private-transfer' && (fromChain === 'near' || fromChain === 'solana')
+  return purpose === 'private-transfer' && isNonEvmConfidentialMoveChain(fromChain)
 }
 
-/** Private Swap accepts EVM chain numbers, Solana, and NEAR. */
+function isDerivedQuoteAddressChain(apiChainId: string): boolean {
+  return apiChainId === 'solana' || apiChainId === 'near' || apiChainId === 'btc'
+}
+
+/** A Bitcoin quote address matches the derived string on mainnet or testnet. */
+function isBitcoinQuoteChain(chainId: string | undefined): boolean {
+  return chainId === getBitcoinChainId('mainnet') || chainId === getBitcoinChainId('testnet')
+}
+
+/** Private Swap accepts EVM chain numbers, Solana, NEAR, and Bitcoin. */
 export function isPrivateSwapApiChain(apiChainId: string): boolean {
-  return /^[1-9]\d*$/.test(apiChainId) || apiChainId === 'solana' || apiChainId === 'near'
+  return /^[1-9]\d*$/.test(apiChainId) || isDerivedQuoteAddressChain(apiChainId)
 }
 
-/** Solana and NEAR addresses are case-sensitive. Other quote chains keep lowercase comparison. */
+/**
+ * Solana, NEAR, and Bitcoin quote addresses match the derived string.
+ * EVM quote addresses compare in lowercase.
+ */
 export function quoteAddressesMatch(
   left: string,
   right: string | undefined,
   apiChainId: string
 ): boolean {
   if (right === undefined) return false
-  return apiChainId === 'solana' || apiChainId === 'near'
+  return isDerivedQuoteAddressChain(apiChainId)
     ? left === right
     : left.toLowerCase() === right.toLowerCase()
 }
@@ -74,6 +94,14 @@ export function isConfidentialQuoteSender(
     return (
       resolveEvmAddressRole(request.sender, `eip155:${request.fromChain}`, accounts) ===
       'confidential'
+    )
+  }
+  if (request.fromChain === 'btc') {
+    return (accounts ?? []).some(account =>
+      account.networks.some(network => {
+        const id = network.chain?.id ?? network.chainId
+        return isBitcoinQuoteChain(id) && network.privateExecutionAddress === request.sender
+      })
     )
   }
   if (request.fromChain !== 'solana' && request.fromChain !== 'near') return false
@@ -107,13 +135,13 @@ export function assertPrivateQuoteRoute(
   purpose: PrivateQuotePurpose,
   scope?: Pick<PrivateSwapAccountRoute, 'walletId' | 'accountId'>
 ): void {
-  // Named RHEA ids are not EVM chain numbers. Only Zcash public sends,
-  // NEAR/Solana funding or private Move, and NEAR or Solana Private Swap may pass.
+  // Named RHEA ids are not EVM chain numbers. Zcash public sends, NEAR/Solana/Bitcoin
+  // funding or private Move, and NEAR, Solana, or Bitcoin Private Swap may pass.
   const nonEvmFromChainAllowed =
     (purpose === 'public-private-send' && request.fromChain === 'zcash') ||
     ((purpose === 'confidential-funding' || purpose === 'private-transfer') &&
-      (request.fromChain === 'near' || request.fromChain === 'solana')) ||
-    (purpose === 'private-swap' && (request.fromChain === 'solana' || request.fromChain === 'near'))
+      isNonEvmConfidentialMoveChain(request.fromChain)) ||
+    (purpose === 'private-swap' && isDerivedQuoteAddressChain(request.fromChain))
   if (
     !account ||
     (scope && (account.walletId !== scope.walletId || account.accountId !== scope.accountId)) ||
@@ -126,12 +154,19 @@ export function assertPrivateQuoteRoute(
   }
   const nonEvmPrivateMove = isNonEvmPrivateMoveQuote(purpose, request.fromChain)
   const nonEvmPrivateSwap =
-    purpose === 'private-swap' && (request.fromChain === 'solana' || request.fromChain === 'near')
+    purpose === 'private-swap' && isDerivedQuoteAddressChain(request.fromChain)
   const sourceChainId =
     nonEvmPrivateMove || nonEvmPrivateSwap
       ? rheaQuoteWalletChainId(request.fromChain)
       : `eip155:${request.fromChain}`
-  const source = account.networks.find(network => network.chainId === sourceChainId)
+  const source =
+    purpose === 'private-swap' && request.fromChain === 'btc'
+      ? account.networks.find(
+          network =>
+            isBitcoinQuoteChain(network.chainId) &&
+            network.privateExecutionAddress === request.sender
+        )
+      : account.networks.find(network => network.chainId === sourceChainId)
   if (purpose === 'public-private-send') {
     const zcashSource =
       request.fromChain === 'zcash'
@@ -271,8 +306,10 @@ export function assertPrivateQuoteRoute(
   }
   if (purpose === 'private-swap' && !isPrivateSwapApiChain(request.toChain))
     throw new Error('Private Swap must stay in this Account.')
-  const destination = account.networks.find(
-    network => network.chainId === rheaQuoteWalletChainId(request.toChain)
+  const destination = account.networks.find(network =>
+    request.toChain === 'btc'
+      ? isBitcoinQuoteChain(network.chainId)
+      : network.chainId === rheaQuoteWalletChainId(request.toChain)
   )
   const recipient = request.recipient ?? ''
   const evmDestination = /^[1-9]\d*$/.test(request.toChain)

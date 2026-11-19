@@ -3,6 +3,7 @@ import type { IntentsManagedAsset } from '@/core/services/intents-managed-assets
 import type { SwapToken } from '@/core/services/intents-api'
 import { isDeprecatedIntentsToken } from '@/core/services/intents-evm-assets'
 import { resolveIntentsWalletAsset } from '@/core/services/intents-wallet-assets'
+import { parseSupportedBitcoinAddress } from '@/core/chains/bitcoin'
 import { parseNearAccountId } from '@/core/chains/near'
 import { parseSolanaPublicKey } from '@/core/chains/solana'
 import { findAssetPrice, type AssetPriceReadModel } from '@/core/prices'
@@ -12,6 +13,7 @@ import { formatBaseUnitDecimalAmount } from '@/lib/number-format'
 import {
   createAssetRegistry,
   createInitialProductChainRegistry,
+  getBitcoinChainId,
   getZcashChainId,
   getBundledInitialProductAssetDefinitions,
   parseAssetId
@@ -160,6 +162,7 @@ export function listShieldFundingAssets(
     getBundledInitialProductAssetDefinitions(network)
   )
   const zcashChainId = getZcashChainId(network)
+  const bitcoinChainId = getBitcoinChainId(network)
   // A Confidential ZEC holding can be spent by an EVM-only account.
   const zcashRouteChain: PortfolioChainView = Object.freeze({
     chain: productChains.resolve(zcashChainId),
@@ -167,11 +170,23 @@ export function listShieldFundingAssets(
     assets: Object.freeze([]),
     errorCodes: Object.freeze([])
   })
+  // Shield BTC is the 1Click balance. Listing it does not enable chain.bitcoin.
+  const bitcoinRouteChain: PortfolioChainView | undefined =
+    network === 'mainnet'
+      ? Object.freeze({
+          chain: productChains.resolve(bitcoinChainId),
+          status: 'ready',
+          assets: Object.freeze([]),
+          errorCodes: Object.freeze([])
+        })
+      : undefined
   const native = getAssetProtocolSourceMappings(network, bundled).flatMap(mapping => {
     const entry = bundled.get(mapping.assetId)
     const token = tokensByAssetId.get(mapping.protocolAssetId)
     return entry?.asset.kind === 'native' &&
-      (entry.asset.chainId.startsWith('eip155:') || entry.asset.chainId === zcashChainId) &&
+      (entry.asset.chainId.startsWith('eip155:') ||
+        entry.asset.chainId === zcashChainId ||
+        (network === 'mainnet' && entry.asset.chainId === bitcoinChainId)) &&
       token?.decimals === entry.metadata.decimals
       ? [
           {
@@ -213,7 +228,11 @@ export function listShieldFundingAssets(
     if (seen.has(managed.protocolAssetId)) return []
     const chain =
       chains.get(managed.chainId) ??
-      (managed.chainId === zcashChainId ? zcashRouteChain : undefined)
+      (managed.chainId === zcashChainId
+        ? zcashRouteChain
+        : managed.chainId === bitcoinChainId
+          ? bitcoinRouteChain
+          : undefined)
     const token = tokensByAssetId.get(managed.protocolAssetId)
     if (
       !chain ||
@@ -221,7 +240,9 @@ export function listShieldFundingAssets(
         chain.chain.id !== zcashChainId &&
         !(
           network === 'mainnet' &&
-          (chain.chain.family === 'near' || chain.chain.family === 'solana')
+          (chain.chain.family === 'near' ||
+            chain.chain.family === 'solana' ||
+            chain.chain.family === 'bitcoin')
         )) ||
       chain.chain.capabilities.transaction.status !== 'available' ||
       !token ||
@@ -446,7 +467,9 @@ function isShieldMoveDestination(
   if (source.chain.chain.family !== 'evm' || destination.chain.chain.family !== 'evm') {
     return (
       network === 'mainnet' &&
-      (source.chain.chain.family === 'near' || source.chain.chain.family === 'solana') &&
+      (source.chain.chain.family === 'near' ||
+        source.chain.chain.family === 'solana' ||
+        source.chain.chain.family === 'bitcoin') &&
       source.chain.chain.family === destination.chain.chain.family &&
       source.chain.chain.id === destination.chain.chain.id &&
       source.asset.asset.id === destination.asset.asset.id &&
@@ -496,7 +519,9 @@ function isShieldSendDestination(
   if (source.chain.chain.family !== 'evm' && source.chain.chain.id !== zcashChainId) {
     return (
       network === 'mainnet' &&
-      (source.chain.chain.family === 'near' || source.chain.chain.family === 'solana') &&
+      (source.chain.chain.family === 'near' ||
+        source.chain.chain.family === 'solana' ||
+        source.chain.chain.family === 'bitcoin') &&
       source.chain.chain.family === destination.chain.chain.family &&
       source.asset.asset.id === destination.asset.asset.id &&
       source.managed.protocolAssetId === destination.managed.protocolAssetId
@@ -580,6 +605,13 @@ export function isShieldWithdrawRecipient(
   if (destination.chain.chain.family === 'solana') {
     try {
       return parseSolanaPublicKey(recipient) === recipient
+    } catch {
+      return false
+    }
+  }
+  if (destination.chain.chain.family === 'bitcoin') {
+    try {
+      return parseSupportedBitcoinAddress(recipient, destination.chain.chain.id) === recipient
     } catch {
       return false
     }
@@ -731,7 +763,9 @@ export function buildShieldTransferRequest(
     (input.chain.chain.family !== 'evm' &&
       !(
         input.network === 'mainnet' &&
-        (input.chain.chain.family === 'near' || input.chain.chain.family === 'solana')
+        (input.chain.chain.family === 'near' ||
+          input.chain.chain.family === 'solana' ||
+          input.chain.chain.family === 'bitcoin')
       )) ||
     input.managed.assetId !== input.asset.asset.id ||
     input.managed.chainId !== input.chain.chain.id ||

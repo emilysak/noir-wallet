@@ -25,7 +25,7 @@ const ONECLICK_TOKENS_API = 'https://1click.chaindefuser.com/v0/tokens'
 const ONECLICK_STATUS_API = 'https://1click.chaindefuser.com/v0/status'
 const TOKEN_ICONS_API = `${config_near.indexUrl}/get_multichain_lending_tokens_data`
 const COINGECKO_MARKETS_API = 'https://api.coingecko.com/api/v3/coins/markets'
-const WALLET_TOKEN_BLOCKCHAINS = new Set(['sol', 'near'])
+const WALLET_TOKEN_BLOCKCHAINS = new Set(['sol', 'near', 'btc'])
 
 export interface SwapToken {
   assetId: string

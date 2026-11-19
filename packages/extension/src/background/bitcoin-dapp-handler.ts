@@ -530,7 +530,8 @@ export class BackgroundBitcoinDAppHandler {
     const balance = portfolio?.source.balances[0]
     if (!balance) return Object.freeze({ confirmed: 0, unconfirmed: 0, total: 0 })
     const confirmed = safeSats(balance.spendableRaw, 'confirmed balance')
-    const total = safeSats(balance.totalRaw, 'total balance')
+    // dApps stay on the public address. A PEA split keeps that total in mainRaw.
+    const total = safeSats(balance.mainRaw ?? balance.totalRaw, 'total balance')
     if (total < confirmed) throw new Error('Bitcoin total balance is below confirmed balance')
     return Object.freeze({ confirmed, unconfirmed: total - confirmed, total })
   }

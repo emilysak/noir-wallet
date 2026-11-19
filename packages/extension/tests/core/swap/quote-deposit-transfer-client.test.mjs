@@ -15,6 +15,7 @@ import { getSolanaNetworkConfig } from '../../../src/config/networks.ts'
 import { parseAssetId } from '../../../src/core/chains/registry/asset-id.ts'
 import { mergeTokenCatalogs } from '../../../src/popup/services/swap-catalog-loading.ts'
 import {
+  filterConfidentialFundingSourceTokens,
   isPreparedSwapFeeUnaffordable,
   isPrivateSwapDestinationSupported,
   resolveConfidentialFundingDestinationToken,
@@ -375,6 +376,22 @@ test.describe('quote deposit transfer client', () => {
       family: 'bitcoin'
     })
     expect(funding(bitcoin, 'btc', BITCOIN_ASSET_ID)).toBeNull()
+    const bitcoinMainnet = {
+      ...model,
+      chains: model.chains.map(chain =>
+        chain.chain.family === 'bitcoin'
+          ? { chain: { ...chain.chain, network: { kind: 'mainnet' } } }
+          : chain
+      )
+    }
+    expect(funding(bitcoin, 'btc', BITCOIN_ASSET_ID, bitcoinMainnet)).toBe(bitcoin)
+    expect(funding(bitcoin, 'btc', bitcoin.assetId, bitcoinMainnet)).toBe(bitcoin)
+    expect(
+      filterConfidentialFundingSourceTokens([bitcoin], bitcoinMainnet, targets).map(
+        token => token.assetId
+      )
+    ).toEqual([bitcoin.assetId])
+    expect(filterConfidentialFundingSourceTokens([bitcoin], model, targets)).toEqual([])
     expect(funding({ ...near, sources: ['lifi'] }, 'near', NEAR_ASSET_ID)).toBeNull()
     const contracted = {
       ...token('nep141:wrap.near', 'near', 24),
@@ -1319,6 +1336,37 @@ test.describe('quote deposit transfer client', () => {
         new Map([[EVM_CHAIN_ID, '0x1111111111111111111111111111111111111111']])
       )
     ).toBe(false)
+
+    const btc = {
+      ...token('nep141:btc.omft.near', 'btc', 8),
+      rheaChainId: 'btc',
+      sources: ['nearintents']
+    }
+    const bitcoinPrivate = 'bc1qprivatepea'
+    expect(
+      isPrivateSwapDestinationSupported(
+        btc,
+        portfolio(),
+        receiveTargets,
+        new Map([[BITCOIN_CHAIN_ID, bitcoinPrivate]])
+      )
+    ).toBe(true)
+    expect(
+      isPrivateSwapDestinationSupported(
+        btc,
+        portfolio(),
+        receiveTargets,
+        new Map([[BITCOIN_CHAIN_ID, 'bc1qsource']])
+      )
+    ).toBe(false)
+    expect(
+      isPrivateSwapDestinationSupported(
+        btc,
+        portfolio(),
+        receiveTargets,
+        new Map([[BITCOIN_CHAIN_ID, 'BC1qsource']])
+      )
+    ).toBe(true)
   })
 
   test('maps an Asset details wallet ID back to its Intents Swap source', () => {
@@ -1686,6 +1734,184 @@ test.describe('quote deposit transfer client', () => {
       ],
       ['approve', 'transaction:bitcoin:quote', 'b'.repeat(64)]
     ])
+  })
+
+  test('does not sign a private Bitcoin quote from the public address', async () => {
+    const resolved = resolveWalletOwnedQuoteAsset(
+      token('nep141:btc.omft.near', 'btc', 8),
+      portfolio(),
+      receiveTargets,
+      mappings
+    )
+    expect(resolved).toMatchObject({
+      family: 'bitcoin',
+      refundAddress: 'bc1qsource',
+      bitcoinAddressType: 'p2wpkh'
+    })
+    const balance = { availableRaw: '9000', mainRaw: '8000', privateRaw: '1000' }
+    const source = {
+      ...resolved,
+      asset: { ...resolved.asset, balance },
+      networkFeeAsset: { ...resolved.networkFeeAsset, balance }
+    }
+    const publicRefund = 'bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu'
+    const pea = 'bc1qhshj2sek7ff9e7gkhq6hsm9sdq8lr8u0dakdzc'
+    const publicSource = { ...source, refundAddress: publicRefund }
+    const depositAddress = 'bc1qdestination'
+    const counterparty = 'bc1qcounterparty'
+
+    expect(selectWalletOwnedQuoteAssetExecution(source, 'private')).toBeNull()
+    expect(selectWalletOwnedQuoteAssetExecution(publicSource, 'private', publicRefund)).toBeNull()
+    expect(
+      selectWalletOwnedQuoteAssetExecution(publicSource, 'private', publicRefund.toUpperCase())
+    ).toBeNull()
+    expect(
+      selectWalletOwnedQuoteAssetExecution(publicSource, 'private', pea.toUpperCase())
+    ).toBeNull()
+    expect(
+      selectWalletOwnedQuoteAssetExecution(
+        source,
+        'private',
+        'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr'
+      )
+    ).toBeNull()
+    expect(
+      selectWalletOwnedQuoteAssetExecution(source, 'private', '1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH')
+    ).toBeNull()
+    expect(
+      selectWalletOwnedQuoteAssetExecution(
+        source,
+        'private',
+        'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx'
+      )
+    ).toBeNull()
+    expect(selectWalletOwnedQuoteAssetExecution(publicSource, 'main', pea)).toBe(publicSource)
+    expect(
+      selectWalletOwnedQuoteAssetExecution(
+        { ...source, refundAddress: publicRefund.toUpperCase() },
+        'private',
+        publicRefund
+      )
+    ).toMatchObject({ refundAddress: publicRefund })
+
+    const selected = selectWalletOwnedQuoteAssetExecution(source, 'private', pea)
+    expect(selected).toMatchObject({
+      refundAddress: pea,
+      bitcoinAddressType: 'p2wpkh',
+      executionMode: 'private',
+      asset: { balance: { availableRaw: '1000' } },
+      networkFeeAsset: { balance: { availableRaw: '1000' } }
+    })
+    expect(selected.refundAddress).toBe(pea)
+    expect(selected.refundAddress).not.toBe(source.refundAddress)
+
+    const calls = []
+    let failPrepare = false
+    const client = createQuoteDepositTransferClient({
+      evm: {
+        prepareTransfer: async () => {
+          throw new Error('unexpected EVM prepare')
+        },
+        approveTransfer: async () => {
+          throw new Error('unexpected EVM approve')
+        },
+        rejectTransfer: async () => {
+          throw new Error('unexpected EVM reject')
+        }
+      },
+      bitcoin: {
+        prepareTransfer: async (intent, options) => {
+          calls.push(['prepare', intent, options])
+          if (failPrepare) throw new Error('Bitcoin private send cannot use a quote')
+          return {
+            graph: {
+              root: {
+                id: 'transaction:bitcoin:private-quote',
+                intent: { primaryAmount: { amountRaw: '900' } }
+              }
+            },
+            review: {
+              payloadFingerprint: { digestHex: 'b'.repeat(64) },
+              summary: { schema: 'bitcoin.psbt.v1', fields: { feeSats: '100' } }
+            }
+          }
+        },
+        approveTransfer: async () => {
+          throw new Error('unexpected approve')
+        },
+        rejectTransfer: async transactionId => {
+          calls.push(['reject', transactionId])
+          return { root: { id: transactionId } }
+        }
+      }
+    })
+    expect(calls).toEqual([])
+
+    const binding = nearIntentsBinding(selected, depositAddress, '1200')
+    expect(binding.refundAddress).toBe(pea)
+    await client.prepare({
+      source: selected,
+      depositAddress,
+      amountRaw: '1200',
+      nearIntentsBinding: binding
+    })
+    expect(calls).toEqual([
+      [
+        'prepare',
+        { recipient: depositAddress, amount: { mode: 'exact', valueSats: '1200' } },
+        {
+          nearIntentsBinding: binding,
+          rheaSwapBinding: undefined,
+          bitcoinAddressType: 'p2wpkh',
+          executionMode: 'private'
+        }
+      ]
+    ])
+
+    await expect(
+      client.estimateMaximum({ source: selected, depositAddress, feeTier: 'low' })
+    ).resolves.toMatchObject({ amountRaw: '900', networkFeeRaw: '100' })
+    expect(calls[1]).toEqual([
+      'prepare',
+      { recipient: depositAddress, amount: { mode: 'max' } },
+      { bitcoinAddressType: 'p2wpkh', feeTier: 'low', executionMode: 'private' }
+    ])
+    expect(calls[2]).toEqual(['reject', 'transaction:bitcoin:private-quote'])
+
+    const publicBinding = nearIntentsBinding(source, depositAddress, '1200')
+    expect(publicBinding.refundAddress).toBe('bc1qsource')
+    await client.prepare({
+      source,
+      depositAddress,
+      amountRaw: '1200',
+      nearIntentsBinding: publicBinding
+    })
+    expect(calls.at(-1)).toEqual([
+      'prepare',
+      { recipient: depositAddress, amount: { mode: 'exact', valueSats: '1200' } },
+      {
+        nearIntentsBinding: publicBinding,
+        rheaSwapBinding: undefined,
+        bitcoinAddressType: 'p2wpkh'
+      }
+    ])
+    expect(calls.at(-1)[2]).not.toHaveProperty('executionMode')
+
+    failPrepare = true
+    await expect(
+      client.prepare({
+        source: selected,
+        depositAddress,
+        amountRaw: '1200',
+        nearIntentsBinding: binding,
+        rheaSwapBinding: undefined
+      })
+    ).rejects.toThrow('Bitcoin private send cannot use a quote')
+    const preparedRecipients = calls
+      .filter(call => call[0] === 'prepare')
+      .map(call => call[1].recipient)
+    expect(preparedRecipients.every(recipient => recipient === depositAddress)).toBe(true)
+    expect(JSON.stringify(calls)).not.toContain(counterparty)
   })
 
   test('rejects zero, signed, fractional, and oversized base-unit amounts before routing', async () => {

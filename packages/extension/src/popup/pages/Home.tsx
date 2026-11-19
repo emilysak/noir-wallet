@@ -109,9 +109,11 @@ const solanaOperationsEnabled = resolveSolanaFeatureRuntimePolicy(
   __ENABLED_CHAIN_FEATURE_FLAGS__
 ).newOperationsEnabled
 
-const multichainPortfolioEnabled =
-  evmOperationsEnabled ||
-  resolveBitcoinFeatureRuntimePolicy(__ENABLED_CHAIN_FEATURE_FLAGS__).newOperationsEnabled
+const bitcoinOperationsEnabled = resolveBitcoinFeatureRuntimePolicy(
+  __ENABLED_CHAIN_FEATURE_FLAGS__
+).newOperationsEnabled
+
+const multichainPortfolioEnabled = evmOperationsEnabled || bitcoinOperationsEnabled
 
 export function Home() {
   const openResyncZcash = useResyncZcash()
@@ -307,11 +309,21 @@ export function Home() {
   const privateMode = !hardwareWallet && dappExecutionMode.state?.mode === 'private'
   const actionDomain =
     assetDomain === 'all' ? (modeKnown ? (privateMode ? 'private' : 'public') : null) : assetDomain
+  const bitcoinPrivateReady = Boolean(
+    bitcoinOperationsEnabled &&
+    storageV2Account &&
+    storageV2Account.walletSource.kind !== 'hardware' &&
+    storageV2Account.networks.some(
+      network => network.chain.family === 'bitcoin' && network.privateExecutionAddress
+    )
+  )
   const publicSendSource =
     assetDomain === 'public' ? selectHomeActionSource(multichainPortfolio, 'public', 'send') : null
   const swapSource =
     assetDomain === 'public' || assetDomain === 'private'
-      ? selectHomeActionSource(multichainPortfolio, assetDomain, 'swap')
+      ? selectHomeActionSource(multichainPortfolio, assetDomain, 'swap', {
+          bitcoinPrivateAvailable: bitcoinPrivateReady
+        })
       : null
   const canOpenSwapSource =
     swapSource !== null &&

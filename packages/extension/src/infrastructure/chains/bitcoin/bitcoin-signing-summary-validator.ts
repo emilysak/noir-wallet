@@ -20,6 +20,13 @@ export interface BitcoinSigningPreparePayload {
   readonly psbt: string
 }
 
+export interface BitcoinPeaSigningPreparePayload {
+  readonly kind: 'pea-bitcoin-psbt'
+  readonly chainId: PreparedBitcoinPsbt['chainId']
+  readonly accountIndex: number
+  readonly psbt: string
+}
+
 export const KEYSTONE_BITCOIN_SIGNING_TTL_MS = 10 * 60 * 1_000
 
 function ensureBitcoinEcc(): void {
@@ -44,6 +51,21 @@ export function createBitcoinSigningPreparePayload(
     kind: 'bitcoin-psbt',
     chainId: prepared.chainId,
     addressType: prepared.addressType,
+    accountIndex: prepared.accountIndex,
+    psbt: prepared.psbtBase64
+  })
+}
+
+export function createBitcoinPeaSigningPreparePayload(
+  preparedValue: PreparedBitcoinPsbt
+): BitcoinPeaSigningPreparePayload {
+  const { prepared } = parsePreparedBitcoinPsbt(preparedValue)
+  if (prepared.addressType !== 'p2wpkh') {
+    throw new Error('Bitcoin private execution signing requires Native SegWit')
+  }
+  return Object.freeze({
+    kind: 'pea-bitcoin-psbt',
+    chainId: prepared.chainId,
     accountIndex: prepared.accountIndex,
     psbt: prepared.psbtBase64
   })

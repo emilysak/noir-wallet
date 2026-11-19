@@ -1,7 +1,13 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
-import { ConfidentialFundingApi } from '../../../src/background/confidential-funding-api.ts'
+import {
+  ConfidentialFundingApi,
+  ConfidentialFundingApiError
+} from '../../../src/background/confidential-funding-api.ts'
 import { ConfidentialFundingCoordinator } from '../../../src/background/confidential-funding-coordinator.ts'
+import { ConfidentialFundingSigner } from '../../../src/background/confidential-funding-signer.ts'
+import { createBitcoinConfidentialDepositClient } from '../../../src/background/bitcoin-confidential-deposit-client.ts'
+import { setBitcoinPrivateExecutionAddressReader } from '../../../src/background/bitcoin-private-execution-address.ts'
 import { createBackgroundConfidentialFundingCoordinator } from '../../../src/background/confidential-funding.ts'
 import { userEvmAssetToDefinition } from '../../../src/core/chains/user-assets/user-evm-asset.ts'
 import { getActiveChainEndpointSettings } from '../../../src/core/chains/chain-endpoint-settings.ts'
@@ -34,11 +40,24 @@ import {
   depositSourceAssetId,
   depositStatusLabel,
   canPayShieldDeposit,
+  depositSourceNetworks,
+  depositTokenChainId,
   depositTokenForNetwork,
   formatDepositAmount,
   formatMinimumDepositPaymentAmount,
   listDepositTokenChoices
 } from '../../../src/popup/services/shield-deposit-options.ts'
+import { listShieldFundingAssets } from '../../../src/popup/services/shield-transfer.ts'
+import { getBitcoinChainId } from '../../../src/core/chains/registry/index.ts'
+import {
+  assertBitcoinDepositOutputs
+} from '../../../src/core/services/confidential-funding/bitcoin-confidential-deposit.ts'
+import {
+  buildBitcoinPsbt,
+  selectBitcoinCoins
+} from '../../../src/infrastructure/chains/bitcoin/index.ts'
+import * as secp256k1 from '@bitcoinerlab/secp256k1'
+import { initEccLib, networks, payments, Transaction } from 'bitcoinjs-lib'
 
 test('minimum deposit display rounds up without changing the exact payment amount', () => {
   const raw = '8000000000000000001'
@@ -100,6 +119,24 @@ test('uses the selected EVM private refund address while Zcash retains a transpa
   expect(depositRefundAddressError('NOT AN ACCOUNT', near)).toBe('Enter a valid NEAR account')
   expect(depositRefundAddressError(solanaPublic, solana)).toBeNull()
   expect(depositRefundAddressError('not-solana', solana)).toBe('Enter a valid Solana address')
+  const bitcoinPublic = 'bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu'
+  const bitcoinPrivate = 'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr'
+  const bitcoin = { id: getBitcoinChainId('mainnet'), family: 'bitcoin' }
+  expect(
+    defaultDepositRefundAddress(bitcoin, [
+      {
+        chain: bitcoin,
+        privateExecutionAddress: bitcoinPrivate,
+        addresses: [
+          { value: bitcoinPrivate, privacy: 'transparent', preferredForReceive: false },
+          { value: bitcoinPublic, privacy: 'transparent', preferredForReceive: true }
+        ]
+      }
+    ])
+  ).toBe(bitcoinPublic)
+  expect(depositRefundAddressError(bitcoinPublic, bitcoin)).toBeNull()
+  expect(depositRefundAddressError(bitcoinPrivate, bitcoin)).toBeNull()
+  expect(depositRefundAddressError('not-bitcoin', bitcoin)).toBe('Enter a valid Bitcoin address')
 })
 
 test('NEAR external deposits keep the EVM confidential signer and a NEAR refund address', async () => {
@@ -2135,4 +2172,1125 @@ test.describe('confidential funding safety rules', () => {
       globalThis.fetch = originalFetch
     }
   })
+})
+
+const BITCOIN_CHAIN_ID = getBitcoinChainId('mainnet')
+const BITCOIN_ASSET_ID = `${BITCOIN_CHAIN_ID}/slip44:0`
+const BITCOIN_PROTOCOL_ASSET_ID = 'nep141:btc.omft.near'
+const BITCOIN_PUBLIC = 'bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu'
+const BITCOIN_PRIVATE = 'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr'
+const BITCOIN_DEPOSIT = 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh'
+const BITCOIN_LEGACY = '1BoatSLRHtKNngkdXEeobR76b53LETtpyT'
+
+function bitcoinQuote(request, depositAddress) {
+  return {
+    correlationId: 'btc-quote',
+    quoteRequest: {
+      swapType: 'EXACT_INPUT',
+      confidentiality: 'basic',
+      originAsset: request.originAsset,
+      destinationAsset: request.destinationAsset,
+      amount: request.amountRaw,
+      refundTo: request.refundTo ?? request.signerId,
+      depositType: request.depositType,
+      refundType: request.refundType,
+      recipient: request.recipient,
+      recipientType: request.recipientType,
+      slippageTolerance: request.slippageBps
+    },
+    quote: {
+      amountIn: request.amountRaw,
+      amountOut: request.amountRaw,
+      minAmountOut: request.amountRaw,
+      depositAddress,
+      deadline: new Date(120_000).toISOString()
+    }
+  }
+}
+
+const EVM_SIGNER = '0x1111111111111111111111111111111111111111'
+
+function bitcoinMove(operation, sourceDomain, destinationDomain, extra = {}) {
+  return {
+    network: 'mainnet',
+    keyDomainId: 'wallet:one',
+    accountId: 'account:one',
+    operation,
+    sourceDomain,
+    destinationDomain,
+    source: {
+      chainId: BITCOIN_CHAIN_ID,
+      chainName: 'btc',
+      assetId: BITCOIN_ASSET_ID,
+      protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID,
+      amountRaw: '1000'
+    },
+    destination: {
+      chainId: BITCOIN_CHAIN_ID,
+      chainName: 'btc',
+      assetId: BITCOIN_ASSET_ID,
+      protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID
+    },
+    slippageBps: 50,
+    ...extra
+  }
+}
+
+function bitcoinFundingCoordinator(options = {}) {
+  const records = []
+  const plans = []
+  const quoteRequests = []
+  const prepareInputs = []
+  let quoteCalls = 0
+  let prepareCalls = 0
+  let identityChainId
+  const confirmCalls = []
+  const quoteError = options.quoteError
+  const depositAddress = options.depositAddress ?? BITCOIN_DEPOSIT
+  const coordinator = new ConfidentialFundingCoordinator({
+    network: 'mainnet',
+    api: {
+      async quote(request) {
+        quoteCalls += 1
+        quoteRequests.push(request)
+        if (options.quote) return options.quote(request)
+        if (quoteError) throw quoteError
+        return bitcoinQuote(request, depositAddress)
+      },
+      async getStatus() {
+        return null
+      },
+      async getBalances() {
+        return [
+          {
+            tokenId: confidentialPrivateTokenId(BITCOIN_PROTOCOL_ASSET_ID),
+            available: '5000'
+          }
+        ]
+      }
+    },
+    store: {
+      async listPlans() {
+        return plans
+      },
+      async getPlan(planId) {
+        let match = null
+        for (const plan of plans) {
+          if (plan.planId === planId) match = plan
+        }
+        return match
+      },
+      async putPlan(plan) {
+        plans.push(plan)
+      },
+      async getSession() {
+        return {
+          accessToken: 'synthetic',
+          expiresAt: 1_000_000,
+          signerId: EVM_SIGNER
+        }
+      },
+      async putBalances() {},
+      async listExternalDeposits() {
+        return records
+      },
+      async putExternalDeposit(record) {
+        records.push(record)
+      },
+      async withExternalDepositScope(_scope, operation) {
+        return operation()
+      }
+    },
+    signer: {
+      async resolveIdentity(chainId) {
+        identityChainId = chainId
+        return {
+          address: EVM_SIGNER,
+          addressIndex: 0,
+          peaAddress: '0x2222222222222222222222222222222222222222',
+          context: {
+            chainAccount: {
+              scope: {
+                keyDomainId: 'wallet:one',
+                accountId: 'account:one',
+                chainId
+              }
+            }
+          }
+        }
+      },
+      async resolveBitcoinPublicSpendAddress() {
+        options.resolveCalls = (options.resolveCalls ?? 0) + 1
+        return {
+          sourceAddress: BITCOIN_PUBLIC,
+          counterpartyAddress: BITCOIN_PRIVATE
+        }
+      },
+      async resolveBitcoinFundingAddresses() {
+        if (options.bitcoinFundingError) throw options.bitcoinFundingError
+        const privateExecutionAddress = options.omitPrivateExecutionAddress
+          ? undefined
+          : (options.privateExecutionAddress ?? BITCOIN_PRIVATE)
+        return {
+          publicAddress: BITCOIN_PUBLIC,
+          ...(privateExecutionAddress === undefined ? {} : { privateExecutionAddress })
+        }
+      },
+      async prepareChainDeposit(input) {
+        prepareCalls += 1
+        prepareInputs.push(input)
+        return {
+          commandId: 'transaction:bitcoin:test',
+          payloadFingerprint: 'ab'.repeat(32),
+          expiresAt: 120_000,
+          preparedTransfer: { family: 'bitcoin', chainId: BITCOIN_CHAIN_ID }
+        }
+      },
+      async confirmTransaction(input) {
+        confirmCalls.push(input)
+        return {
+          rawTransaction: '0200000001',
+          transactionHash: '11'.repeat(32)
+        }
+      },
+      async broadcastDeposit() {}
+    },
+    repository: options.repository ?? new InMemoryTransactionRepository(),
+    assets: {
+      get: id =>
+        id === BITCOIN_ASSET_ID
+          ? {
+              asset: {
+                id: BITCOIN_ASSET_ID,
+                chainId: BITCOIN_CHAIN_ID,
+                namespace: 'slip44',
+                reference: '0',
+                kind: 'native'
+              },
+              metadata: { symbol: 'BTC', decimals: 8 }
+            }
+          : undefined,
+      list: () => []
+    },
+    protocolTokens: [
+      {
+        assetId: BITCOIN_PROTOCOL_ASSET_ID,
+        blockchain: 'btc',
+        decimals: 8,
+        symbol: 'BTC'
+      }
+    ],
+    evmNetworks: getEvmNetworkConfigs('mainnet'),
+    assetMappings: [{ assetId: BITCOIN_ASSET_ID, protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID }],
+    now: () => 1_000,
+    createId: () => options.id ?? 'btc-funding',
+    scheduleMonitoring: async () => {}
+  })
+  return {
+    coordinator,
+    records,
+    plans,
+    quoteRequests,
+    prepareInputs,
+    confirmCalls,
+    counts: () => ({ quoteCalls, prepareCalls, identityChainId, resolveCalls: options.resolveCalls ?? 0 })
+  }
+}
+
+test('Bitcoin external deposits use the EVM signer and create the shield graph', async () => {
+  const repository = new InMemoryTransactionRepository()
+  const harness = bitcoinFundingCoordinator({ repository, id: 'btc-external-one' })
+  const source = {
+    chainId: BITCOIN_CHAIN_ID,
+    chainName: 'Bitcoin',
+    assetId: BITCOIN_ASSET_ID,
+    protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID,
+    amountRaw: '1000'
+  }
+  const created = await harness.coordinator.createExternalDeposit({
+    network: 'mainnet',
+    keyDomainId: 'wallet:one',
+    accountId: 'account:one',
+    source,
+    refundAddress: BITCOIN_PUBLIC,
+    requestId: 'btc-public-refund'
+  })
+  expect(created.signerId).toBe('0x1111111111111111111111111111111111111111')
+  expect(created.refundAddress).toBe(BITCOIN_PUBLIC)
+  expect(created.depositAddress).toBe(BITCOIN_DEPOSIT)
+  expect(harness.counts().identityChainId.startsWith('eip155:')).toBe(true)
+  expect(created.transactionId).toBe('tx:confidential-external:btc-external-one')
+  const graph = await repository.get(
+    { keyDomainId: 'wallet:one', accountId: 'account:one' },
+    created.transactionId
+  )
+  expect(graph.root.kind).toBe('shield')
+  expect(graph.root.intent.shield.operation).toBe('deposit')
+
+  const privateRefund = bitcoinFundingCoordinator({ id: 'btc-external-private' })
+  const privateCreated = await privateRefund.coordinator.createExternalDeposit({
+    network: 'mainnet',
+    keyDomainId: 'wallet:one',
+    accountId: 'account:one',
+    source,
+    refundAddress: BITCOIN_PRIVATE,
+    requestId: 'btc-private-refund'
+  })
+  expect(privateCreated.refundAddress).toBe(BITCOIN_PRIVATE)
+
+  await expect(
+    harness.coordinator.createExternalDeposit({
+      network: 'mainnet',
+      keyDomainId: 'wallet:one',
+      accountId: 'account:one',
+      source,
+      refundAddress: 'not-a-bitcoin-address',
+      requestId: 'btc-bad-refund'
+    })
+  ).rejects.toThrow('refund address is invalid')
+
+  const badDeposit = bitcoinFundingCoordinator({
+    id: 'btc-bad-deposit',
+    depositAddress: BITCOIN_LEGACY
+  })
+  await expect(
+    badDeposit.coordinator.createExternalDeposit({
+      network: 'mainnet',
+      keyDomainId: 'wallet:one',
+      accountId: 'account:one',
+      source,
+      refundAddress: BITCOIN_PUBLIC,
+      requestId: 'btc-legacy-deposit'
+    })
+  ).rejects.toThrow('invalid deposit address')
+  expect(badDeposit.records).toHaveLength(0)
+
+  const intentsAccount = bitcoinFundingCoordinator({
+    id: 'btc-intents-deposit',
+    depositAddress: 'a'.repeat(64)
+  })
+  await expect(
+    intentsAccount.coordinator.createExternalDeposit({
+      network: 'mainnet',
+      keyDomainId: 'wallet:one',
+      accountId: 'account:one',
+      source,
+      refundAddress: BITCOIN_PUBLIC,
+      requestId: 'btc-intents-deposit'
+    })
+  ).rejects.toThrow('invalid deposit address')
+  expect(intentsAccount.records).toHaveLength(0)
+})
+
+test('a non-Bitcoin bip122 origin is rejected before a quote or transfer', async () => {
+  const harness = bitcoinFundingCoordinator()
+  await expect(
+    harness.coordinator.createExternalDeposit({
+      network: 'mainnet',
+      keyDomainId: 'wallet:one',
+      accountId: 'account:one',
+      source: {
+        chainId: `bip122:${'cd'.repeat(16)}`,
+        chainName: 'Other',
+        assetId: `bip122:${'cd'.repeat(16)}/slip44:0`,
+        protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID,
+        amountRaw: '1000'
+      },
+      refundAddress: BITCOIN_PUBLIC,
+      requestId: 'other-bip122'
+    })
+  ).rejects.toThrow('External Shield deposit request is invalid')
+  expect(harness.counts().quoteCalls).toBe(0)
+  expect(harness.records).toHaveLength(0)
+})
+
+test('a Bitcoin quote failure does not create a transfer', async () => {
+  const failed = bitcoinFundingCoordinator({ quoteError: new Error('quote down') })
+  await expect(
+    failed.coordinator.prepare({
+      network: 'mainnet',
+      keyDomainId: 'wallet:one',
+      accountId: 'account:one',
+      operation: 'deposit',
+      sourceDomain: 'public',
+      destinationDomain: 'shield',
+      source: {
+        chainId: BITCOIN_CHAIN_ID,
+        chainName: 'btc',
+        assetId: BITCOIN_ASSET_ID,
+        protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID,
+        amountRaw: '1000'
+      },
+      destination: {
+        chainId: BITCOIN_CHAIN_ID,
+        chainName: 'btc',
+        assetId: BITCOIN_ASSET_ID,
+        protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID
+      },
+      slippageBps: 50
+    })
+  ).rejects.toThrow('quote down')
+  expect(failed.counts().prepareCalls).toBe(0)
+  expect(failed.plans).toHaveLength(0)
+})
+
+test('a cluster split that is too low retries two withdrawals', async () => {
+  let withdrawQuotes = 0
+  const harness = bitcoinFundingCoordinator({
+    quote(request) {
+      if (request.depositType !== 'CONFIDENTIAL_INTENTS') {
+        return bitcoinQuote(request, BITCOIN_DEPOSIT)
+      }
+      withdrawQuotes += 1
+      if (withdrawQuotes <= 3) {
+        throw new ConfidentialFundingApiError(
+          'Amount is too low for bridge, try at least 3719',
+          400,
+          false
+        )
+      }
+      return bitcoinQuote(request, 'a'.repeat(64))
+    }
+  })
+  const move = bitcoinMove('cluster', 'public', 'private')
+  move.source.amountRaw = '12000'
+  const preview = await harness.coordinator.preview(move)
+  expect(withdrawQuotes).toBe(5)
+  expect(preview.amountOutRaw).toBe('12000')
+})
+
+test('a cluster that stays below the bridge floor reports the total minimum', async () => {
+  const harness = bitcoinFundingCoordinator({
+    quote(request) {
+      if (request.depositType !== 'CONFIDENTIAL_INTENTS') {
+        return bitcoinQuote(request, BITCOIN_DEPOSIT)
+      }
+      throw new ConfidentialFundingApiError(
+        'Amount is too low for bridge, try at least 3719',
+        400,
+        false
+      )
+    }
+  })
+  const move = bitcoinMove('cluster', 'public', 'private')
+  move.source.amountRaw = '5000'
+  await expect(harness.coordinator.preview(move)).rejects.toThrow(/try at least 9298/)
+  expect(harness.counts().quoteCalls).toBe(6)
+})
+
+test('a deposit quote minimum is not scaled by the cluster split', async () => {
+  const harness = bitcoinFundingCoordinator({
+    quote() {
+      throw new ConfidentialFundingApiError(
+        'Amount is too low for bridge, try at least 3719',
+        400,
+        false
+      )
+    }
+  })
+  const move = bitcoinMove('cluster', 'public', 'private')
+  move.source.amountRaw = '12000'
+  await expect(harness.coordinator.preview(move)).rejects.toThrow(/try at least 3719/)
+  expect(harness.counts().quoteCalls).toBe(1)
+})
+
+test('a private Bitcoin deposit prepares the PEA and does not prepare when it is missing', async () => {
+  const harness = bitcoinFundingCoordinator({ id: 'btc-private-deposit' })
+  const review = await harness.coordinator.prepare(bitcoinMove('deposit', 'private', 'shield'))
+  expect(harness.counts().identityChainId.startsWith('eip155:')).toBe(true)
+  expect(review.requiresDeposit).toBe(true)
+  expect(review.sourceAddress).toBe(BITCOIN_PRIVATE)
+  expect(harness.plans[0].signerId).toBe(EVM_SIGNER)
+  expect(harness.plans[0].source.address).toBe(BITCOIN_PRIVATE)
+  expect(harness.quoteRequests[0]).toMatchObject({
+    refundTo: BITCOIN_PRIVATE,
+    signerId: EVM_SIGNER,
+    recipient: EVM_SIGNER,
+    depositType: 'ORIGIN_CHAIN',
+    recipientType: 'CONFIDENTIAL_INTENTS'
+  })
+  expect(harness.prepareInputs).toEqual([
+    expect.objectContaining({
+      recipient: BITCOIN_DEPOSIT,
+      amountRaw: '1000',
+      sourceDomain: 'private',
+      bitcoinSourceAddress: BITCOIN_PRIVATE,
+      bitcoinCounterpartyAddress: BITCOIN_PUBLIC
+    })
+  ])
+
+  const missingPea = bitcoinFundingCoordinator({
+    id: 'btc-private-missing-pea',
+    omitPrivateExecutionAddress: true
+  })
+  await expect(
+    missingPea.coordinator.prepare(bitcoinMove('deposit', 'private', 'shield'))
+  ).rejects.toThrow('Bitcoin private deposit signing is unavailable')
+  expect(missingPea.counts().prepareCalls).toBe(0)
+  expect(missingPea.counts().quoteCalls).toBe(0)
+  expect(missingPea.plans).toHaveLength(0)
+
+  const sameAddress = bitcoinFundingCoordinator({
+    id: 'btc-private-public-pea',
+    privateExecutionAddress: BITCOIN_PUBLIC
+  })
+  await expect(
+    sameAddress.coordinator.prepare(bitcoinMove('deposit', 'private', 'shield'))
+  ).rejects.toThrow('Bitcoin private deposit signing is unavailable')
+  expect(sameAddress.counts().prepareCalls).toBe(0)
+  expect(sameAddress.counts().quoteCalls).toBe(0)
+  expect(sameAddress.plans).toHaveLength(0)
+})
+
+test('a private Bitcoin deposit confirms when the PEA matches and does not sign when it does not', async () => {
+  const matching = bitcoinFundingCoordinator({ id: 'btc-private-confirm' })
+  const review = await matching.coordinator.prepare(bitcoinMove('deposit', 'private', 'shield'))
+  expect(matching.plans[0].source.address).toBe(BITCOIN_PRIVATE)
+  expect(matching.plans[0].destination.address).toBe(EVM_SIGNER)
+  const confirmed = await matching.coordinator.confirm(review.planId, review.payloadFingerprint)
+  expect(confirmed.phase).toBe('deposit-confirming')
+  expect(matching.confirmCalls).toEqual([
+    expect.objectContaining({
+      commandId: 'transaction:bitcoin:test',
+      sourceDomain: 'private'
+    })
+  ])
+
+  const changedPea = { id: 'btc-private-confirm-changed-pea' }
+  const changed = bitcoinFundingCoordinator(changedPea)
+  const changedReview = await changed.coordinator.prepare(
+    bitcoinMove('deposit', 'private', 'shield')
+  )
+  changedPea.privateExecutionAddress = BITCOIN_PUBLIC
+  await expect(
+    changed.coordinator.confirm(changedReview.planId, changedReview.payloadFingerprint)
+  ).rejects.toThrow('Active Wallet Account changed before private funding completed')
+  expect(changed.confirmCalls).toHaveLength(0)
+  expect(changed.plans[0].phase).toBe('prepared')
+
+  const missingPea = { id: 'btc-private-confirm-missing-pea' }
+  const missing = bitcoinFundingCoordinator(missingPea)
+  const missingReview = await missing.coordinator.prepare(bitcoinMove('deposit', 'private', 'shield'))
+  missingPea.omitPrivateExecutionAddress = true
+  await expect(
+    missing.coordinator.confirm(missingReview.planId, missingReview.payloadFingerprint)
+  ).rejects.toThrow('Active Wallet Account changed before private funding completed')
+  expect(missing.confirmCalls).toHaveLength(0)
+  expect(missing.plans[0].phase).toBe('prepared')
+
+  const unavailablePea = { id: 'btc-private-confirm-unavailable-pea' }
+  const unavailable = bitcoinFundingCoordinator(unavailablePea)
+  const unavailableReview = await unavailable.coordinator.prepare(
+    bitcoinMove('deposit', 'private', 'shield')
+  )
+  unavailablePea.bitcoinFundingError = new Error('Bitcoin deposit signing is unavailable')
+  await expect(
+    unavailable.coordinator.confirm(unavailableReview.planId, unavailableReview.payloadFingerprint)
+  ).rejects.toThrow('Active Wallet Account changed before private funding completed')
+  expect(unavailable.confirmCalls).toHaveLength(0)
+  expect(unavailable.plans[0].phase).toBe('prepared')
+
+  const casedPea = { id: 'btc-private-confirm-cased-pea' }
+  const cased = bitcoinFundingCoordinator(casedPea)
+  const casedReview = await cased.coordinator.prepare(bitcoinMove('deposit', 'private', 'shield'))
+  casedPea.privateExecutionAddress = BITCOIN_PRIVATE.toUpperCase()
+  await expect(
+    cased.coordinator.confirm(casedReview.planId, casedReview.payloadFingerprint)
+  ).rejects.toThrow('Active Wallet Account changed before private funding completed')
+  expect(cased.confirmCalls).toHaveLength(0)
+  expect(cased.plans[0].phase).toBe('prepared')
+})
+
+test('Bitcoin withdraw signs with erc191 and does not pay the intents account', async () => {
+  const harness = bitcoinFundingCoordinator({ depositAddress: 'ab'.repeat(32) })
+  const review = await harness.coordinator.prepare({
+    network: 'mainnet',
+    keyDomainId: 'wallet:one',
+    accountId: 'account:one',
+    operation: 'withdraw',
+    sourceDomain: 'shield',
+    destinationDomain: 'public',
+    externalRecipient: BITCOIN_PUBLIC,
+    source: {
+      chainId: BITCOIN_CHAIN_ID,
+      chainName: 'btc',
+      assetId: BITCOIN_ASSET_ID,
+      protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID,
+      amountRaw: '1000'
+    },
+    destination: {
+      chainId: BITCOIN_CHAIN_ID,
+      chainName: 'btc',
+      assetId: BITCOIN_ASSET_ID,
+      protocolAssetId: BITCOIN_PROTOCOL_ASSET_ID
+    },
+    slippageBps: 50
+  })
+  expect(harness.counts().identityChainId.startsWith('eip155:')).toBe(true)
+  expect(harness.counts().prepareCalls).toBe(0)
+  expect(review.requiresDeposit).toBe(false)
+  expect(review.externalRecipient).toBe(BITCOIN_PUBLIC)
+  expect(harness.plans[0].preparedDeposit).toBeUndefined()
+})
+
+test('a public and private Bitcoin cluster prepares a deposit from the source address', async () => {
+  const publicToPrivate = bitcoinFundingCoordinator({ id: 'btc-cluster-public' })
+  const review = await publicToPrivate.coordinator.prepare(
+    bitcoinMove('cluster', 'public', 'private')
+  )
+  expect(publicToPrivate.counts().identityChainId.startsWith('eip155:')).toBe(true)
+  expect(review.requiresDeposit).toBe(true)
+  expect(review.sourceAddress).toBe(BITCOIN_PUBLIC)
+  expect(review.destinationAddress).toBe(BITCOIN_PRIVATE)
+  expect(publicToPrivate.plans[0].signerId).toBe(EVM_SIGNER)
+  expect(publicToPrivate.quoteRequests[0]).toMatchObject({
+    refundTo: BITCOIN_PUBLIC,
+    signerId: EVM_SIGNER,
+    recipient: EVM_SIGNER,
+    depositType: 'ORIGIN_CHAIN',
+    recipientType: 'CONFIDENTIAL_INTENTS'
+  })
+  expect(publicToPrivate.quoteRequests.length).toBeGreaterThan(1)
+  for (const request of publicToPrivate.quoteRequests.slice(1)) {
+    expect(request).toMatchObject({
+      signerId: EVM_SIGNER,
+      recipient: BITCOIN_PRIVATE,
+      depositType: 'CONFIDENTIAL_INTENTS',
+      recipientType: 'DESTINATION_CHAIN'
+    })
+  }
+  expect(publicToPrivate.prepareInputs).toEqual([
+    expect.objectContaining({
+      recipient: BITCOIN_DEPOSIT,
+      sourceDomain: 'public',
+      bitcoinSourceAddress: BITCOIN_PUBLIC,
+      bitcoinCounterpartyAddress: BITCOIN_PRIVATE
+    })
+  ])
+
+  const privateToPublic = bitcoinFundingCoordinator({ id: 'btc-cluster-private' })
+  const privateReview = await privateToPublic.coordinator.prepare(
+    bitcoinMove('cluster', 'private', 'public')
+  )
+  expect(privateToPublic.counts().identityChainId.startsWith('eip155:')).toBe(true)
+  expect(privateReview.requiresDeposit).toBe(true)
+  expect(privateReview.sourceAddress).toBe(BITCOIN_PRIVATE)
+  expect(privateReview.destinationAddress).toBe(BITCOIN_PUBLIC)
+  expect(privateToPublic.plans[0].signerId).toBe(EVM_SIGNER)
+  expect(privateToPublic.quoteRequests[0]).toMatchObject({
+    refundTo: BITCOIN_PRIVATE,
+    signerId: EVM_SIGNER,
+    recipient: EVM_SIGNER,
+    depositType: 'ORIGIN_CHAIN'
+  })
+  expect(privateToPublic.prepareInputs).toEqual([
+    expect.objectContaining({
+      recipient: BITCOIN_DEPOSIT,
+      amountRaw: '1000',
+      sourceDomain: 'private',
+      bitcoinSourceAddress: BITCOIN_PRIVATE,
+      bitcoinCounterpartyAddress: BITCOIN_PUBLIC
+    })
+  ])
+
+  const missingPea = bitcoinFundingCoordinator({
+    id: 'btc-cluster-missing-pea',
+    omitPrivateExecutionAddress: true
+  })
+  await expect(
+    missingPea.coordinator.prepare(bitcoinMove('cluster', 'private', 'public'))
+  ).rejects.toThrow('Bitcoin private deposit signing is unavailable')
+  expect(missingPea.counts().prepareCalls).toBe(0)
+  expect(missingPea.prepareInputs).toHaveLength(0)
+  expect(missingPea.plans).toHaveLength(0)
+  expect(missingPea.counts().quoteCalls).toBe(0)
+
+  const shieldCluster = bitcoinFundingCoordinator({ id: 'btc-cluster-shield' })
+  await expect(
+    shieldCluster.coordinator.prepare(bitcoinMove('cluster', 'shield', 'public'))
+  ).rejects.toThrow('Confidential funding requires an EVM signing chain')
+  expect(shieldCluster.counts().quoteCalls).toBe(0)
+  expect(shieldCluster.prepareInputs).toHaveLength(0)
+})
+
+test('a shield withdraw to the account Bitcoin address does not require an external recipient', async () => {
+  const ownPublic = bitcoinFundingCoordinator({
+    id: 'btc-withdraw-own-public',
+    depositAddress: 'ab'.repeat(32)
+  })
+  const review = await ownPublic.coordinator.prepare(bitcoinMove('withdraw', 'shield', 'public'))
+  expect(ownPublic.counts().identityChainId.startsWith('eip155:')).toBe(true)
+  expect(review.externalRecipient).toBeUndefined()
+  expect(review.destinationAddress).toBe(BITCOIN_PUBLIC)
+  expect(review.requiresDeposit).toBe(false)
+  expect(ownPublic.prepareInputs).toHaveLength(0)
+  expect(ownPublic.quoteRequests[0]).toMatchObject({
+    signerId: EVM_SIGNER,
+    recipient: BITCOIN_PUBLIC,
+    depositType: 'CONFIDENTIAL_INTENTS',
+    recipientType: 'DESTINATION_CHAIN'
+  })
+
+  const ownPrivate = bitcoinFundingCoordinator({
+    id: 'btc-withdraw-own-private',
+    depositAddress: 'cd'.repeat(32)
+  })
+  const privateReview = await ownPrivate.coordinator.prepare(
+    bitcoinMove('withdraw', 'shield', 'private')
+  )
+  expect(privateReview.externalRecipient).toBeUndefined()
+  expect(privateReview.destinationAddress).toBe(BITCOIN_PRIVATE)
+  expect(ownPrivate.prepareInputs).toHaveLength(0)
+  expect(ownPrivate.quoteRequests[0].recipient).toBe(BITCOIN_PRIVATE)
+
+  const external = bitcoinFundingCoordinator({ id: 'btc-withdraw-external' })
+  const externalReview = await external.coordinator.prepare(
+    bitcoinMove('withdraw', 'shield', 'public', { externalRecipient: BITCOIN_DEPOSIT })
+  )
+  expect(externalReview.externalRecipient).toBe(BITCOIN_DEPOSIT)
+  expect(externalReview.destinationAddress).toBe(BITCOIN_DEPOSIT)
+  expect(external.quoteRequests[0].recipient).toBe(BITCOIN_DEPOSIT)
+  expect(external.prepareInputs).toHaveLength(0)
+})
+
+test('a Bitcoin cluster quote without a bc1 deposit address fails before a PSBT', async () => {
+  const intentsAccount = bitcoinFundingCoordinator({
+    id: 'btc-cluster-intents-account',
+    depositAddress: 'ab'.repeat(32)
+  })
+  await expect(
+    intentsAccount.coordinator.prepare(bitcoinMove('cluster', 'public', 'private'))
+  ).rejects.toThrow('Confidential withdraw deposit is not a Bitcoin payment')
+  expect(intentsAccount.prepareInputs).toHaveLength(0)
+  expect(intentsAccount.plans).toHaveLength(0)
+
+  const legacy = bitcoinFundingCoordinator({
+    id: 'btc-cluster-legacy-deposit',
+    depositAddress: BITCOIN_LEGACY
+  })
+  await expect(
+    legacy.coordinator.prepare(bitcoinMove('cluster', 'public', 'private'))
+  ).rejects.toThrow('Bitcoin deposit address must be a bc1 address')
+  expect(legacy.prepareInputs).toHaveLength(0)
+  expect(legacy.plans).toHaveLength(0)
+
+  const walletAddress = bitcoinFundingCoordinator({
+    id: 'btc-cluster-wallet-deposit',
+    depositAddress: BITCOIN_PRIVATE
+  })
+  await expect(
+    walletAddress.coordinator.prepare(bitcoinMove('cluster', 'public', 'private'))
+  ).rejects.toThrow('Bitcoin deposit output pays another wallet address')
+  expect(walletAddress.prepareInputs).toHaveLength(0)
+  expect(walletAddress.plans).toHaveLength(0)
+})
+
+test('lists Shield BTC on mainnet when the protocol mapping exists', () => {
+  const token = {
+    assetId: BITCOIN_PROTOCOL_ASSET_ID,
+    blockchain: 'btc',
+    symbol: 'BTC',
+    decimals: 8
+  }
+  const model = { chains: [], assets: [], confidential: { status: 'ready', assets: [] } }
+  expect(listShieldFundingAssets(model, [], [token], 'mainnet').map(item => item.asset.asset.id)).toEqual([
+    BITCOIN_ASSET_ID
+  ])
+  expect(listShieldFundingAssets(model, [], [token], 'testnet')).toEqual([])
+  expect(depositTokenChainId(token)).toBe(BITCOIN_CHAIN_ID)
+  const previousFlags = globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__
+  globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__ = [
+    'chain.zcash',
+    'chain.evm',
+    'chain.bitcoin',
+    'chain.near',
+    'chain.solana'
+  ]
+  try {
+    expect(depositSourceNetworks().some(chain => chain.family === 'bitcoin')).toBe(true)
+  } finally {
+    globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__ = previousFlags
+  }
+  globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__ = ['chain.zcash', 'chain.evm']
+  try {
+    expect(depositSourceNetworks().some(chain => chain.family === 'bitcoin')).toBe(false)
+  } finally {
+    globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__ = previousFlags
+  }
+})
+
+function bitcoinDepositIdentity() {
+  return {
+    address: EVM_SIGNER,
+    addressIndex: 0,
+    peaAddress: '0x2222222222222222222222222222222222222222',
+    context: {
+      chainAccount: {
+        scope: {
+          keyDomainId: 'wallet:one',
+          accountId: 'account:one',
+          chainId: 'eip155:1'
+        }
+      }
+    }
+  }
+}
+
+function privateDepositReview(signer, outputs, id = 'transaction:bitcoin:pea') {
+  return {
+    graph: { root: { id } },
+    review: {
+      payloadFingerprint: { digestHex: 'ab'.repeat(32) },
+      expiresAt: Date.now() + 60_000,
+      summary: {
+        schema: 'bitcoin.psbt.v1',
+        fields: {
+          feeSats: '150',
+          signer,
+          outputs
+        }
+      }
+    }
+  }
+}
+
+test('a private Bitcoin deposit PSBT spends the PEA and rejects another wallet output', async () => {
+  const prepareCalls = []
+  const rejected = []
+  let review = privateDepositReview(BITCOIN_PRIVATE, [
+    { address: BITCOIN_DEPOSIT, classification: 'recipient' },
+    { address: BITCOIN_PRIVATE, classification: 'change' }
+  ])
+  const controller = {
+    async prepare(...args) {
+      prepareCalls.push(args)
+      return review
+    },
+    async reject(commandId) {
+      rejected.push(commandId)
+    },
+    async approve() {
+      throw new Error('approve should not run')
+    }
+  }
+  const client = createBitcoinConfidentialDepositClient(controller, {})
+  const prepared = await client.preparePrivateDeposit({
+    chainId: BITCOIN_CHAIN_ID,
+    recipient: BITCOIN_DEPOSIT,
+    amountRaw: '1000',
+    privateExecutionAddress: BITCOIN_PRIVATE,
+    publicReceiveAddress: BITCOIN_PUBLIC,
+    counterpartyAddress: BITCOIN_LEGACY
+  })
+  expect(prepared.signerAddress).toBe(BITCOIN_PRIVATE)
+  expect(prepared.networkFeeRaw).toBe('150')
+  expect(prepareCalls).toEqual([
+    [
+      {
+        recipient: BITCOIN_DEPOSIT,
+        amount: { mode: 'exact', valueSats: '1000' }
+      },
+      undefined,
+      'standard',
+      'p2wpkh',
+      undefined,
+      undefined,
+      'private'
+    ]
+  ])
+  expect(rejected).toHaveLength(0)
+
+  await expect(
+    client.preparePrivateDeposit({
+      chainId: BITCOIN_CHAIN_ID,
+      recipient: BITCOIN_DEPOSIT,
+      amountRaw: '1000',
+      privateExecutionAddress: BITCOIN_PUBLIC,
+      publicReceiveAddress: BITCOIN_PUBLIC
+    })
+  ).rejects.toThrow('Bitcoin private deposit signing is unavailable')
+  expect(prepareCalls).toHaveLength(1)
+
+  const rejectReview = async (nextReview, message) => {
+    review = nextReview
+    await expect(
+      client.preparePrivateDeposit({
+        chainId: BITCOIN_CHAIN_ID,
+        recipient: BITCOIN_DEPOSIT,
+        amountRaw: '1000',
+        privateExecutionAddress: BITCOIN_PRIVATE,
+        publicReceiveAddress: BITCOIN_PUBLIC,
+        counterpartyAddress: BITCOIN_LEGACY
+      })
+    ).rejects.toThrow(message)
+  }
+  await rejectReview(
+    privateDepositReview(
+      BITCOIN_PUBLIC,
+      [
+        { address: BITCOIN_DEPOSIT, classification: 'recipient' },
+        { address: BITCOIN_PRIVATE, classification: 'change' }
+      ],
+      'transaction:bitcoin:signer'
+    ),
+    'Bitcoin deposit source does not match the selected address'
+  )
+  await rejectReview(
+    privateDepositReview(
+      BITCOIN_PRIVATE,
+      [
+        { address: BITCOIN_DEPOSIT, classification: 'recipient' },
+        { address: BITCOIN_PUBLIC, classification: 'change' }
+      ],
+      'transaction:bitcoin:public'
+    ),
+    'Bitcoin deposit output pays another wallet address'
+  )
+  await rejectReview(
+    privateDepositReview(
+      BITCOIN_PRIVATE,
+      [
+        { address: BITCOIN_DEPOSIT, classification: 'recipient' },
+        { address: BITCOIN_LEGACY, classification: 'recipient' },
+        { address: BITCOIN_PRIVATE, classification: 'change' }
+      ],
+      'transaction:bitcoin:other'
+    ),
+    'Bitcoin deposit output pays another wallet address'
+  )
+  await rejectReview(
+    privateDepositReview(
+      BITCOIN_PRIVATE,
+      [
+        { address: BITCOIN_DEPOSIT, classification: 'recipient' },
+        { address: 'bc1qchange-not-the-pea', classification: 'change' }
+      ],
+      'transaction:bitcoin:change'
+    ),
+    'Bitcoin deposit outputs must pay the quote address and return change to the source'
+  )
+  expect(rejected).toEqual([
+    'transaction:bitcoin:signer',
+    'transaction:bitcoin:public',
+    'transaction:bitcoin:other',
+    'transaction:bitcoin:change'
+  ])
+})
+
+test('private Bitcoin deposit signing prepares the PEA and skips prepare without one', async () => {
+  const privateCalls = []
+  const publicCalls = []
+  const client = {
+    async resolvePublicSpendAddress() {
+      return { sourceAddress: BITCOIN_PUBLIC }
+    },
+    async preparePublicDeposit(input) {
+      publicCalls.push(input)
+      return {
+        commandId: 'transaction:bitcoin:public',
+        payloadFingerprint: 'cd'.repeat(32),
+        expiresAt: Date.now() + 60_000,
+        networkFeeRaw: '100',
+        signerAddress: input.sourceAddress,
+        outputs: [{ address: input.recipient }, { address: input.sourceAddress }]
+      }
+    },
+    async preparePrivateDeposit(input) {
+      privateCalls.push(input)
+      return {
+        commandId: 'transaction:bitcoin:private',
+        payloadFingerprint: 'ab'.repeat(32),
+        expiresAt: Date.now() + 60_000,
+        networkFeeRaw: '100',
+        signerAddress: input.privateExecutionAddress,
+        outputs: [{ address: input.recipient }, { address: input.privateExecutionAddress }]
+      }
+    },
+    async confirmPublicDeposit() {
+      throw new Error('confirm should not run')
+    },
+    async rejectDeposit() {}
+  }
+  const signer = new ConfidentialFundingSigner({}, async () => null)
+  signer.setBitcoinDepositClient(client)
+  const request = {
+    identity: bitcoinDepositIdentity(),
+    chainId: BITCOIN_CHAIN_ID,
+    assetKind: 'native',
+    assetNamespace: 'slip44',
+    assetReference: '0',
+    assetId: BITCOIN_ASSET_ID,
+    decimals: 8,
+    recipient: BITCOIN_DEPOSIT,
+    amountRaw: '1000',
+    sourceDomain: 'private',
+    bitcoinSourceAddress: BITCOIN_PRIVATE,
+    bitcoinCounterpartyAddress: BITCOIN_PUBLIC
+  }
+  setBitcoinPrivateExecutionAddressReader(async () => BITCOIN_PRIVATE)
+  try {
+    const prepared = await signer.prepareChainDeposit(request)
+    expect(prepared.preparedTransfer).toMatchObject({
+      family: 'bitcoin',
+      chainId: BITCOIN_CHAIN_ID,
+      networkFeeRaw: '100'
+    })
+    expect(privateCalls).toEqual([
+      {
+        chainId: BITCOIN_CHAIN_ID,
+        recipient: BITCOIN_DEPOSIT,
+        amountRaw: '1000',
+        privateExecutionAddress: BITCOIN_PRIVATE,
+        publicReceiveAddress: BITCOIN_PUBLIC,
+        counterpartyAddress: BITCOIN_PUBLIC
+      }
+    ])
+    expect(publicCalls).toHaveLength(0)
+
+    setBitcoinPrivateExecutionAddressReader(async () => undefined)
+    await expect(signer.prepareChainDeposit(request)).rejects.toThrow(
+      'Bitcoin private deposit signing is unavailable'
+    )
+    expect(privateCalls).toHaveLength(1)
+
+    setBitcoinPrivateExecutionAddressReader(async () => BITCOIN_PUBLIC)
+    await expect(
+      signer.prepareChainDeposit({ ...request, bitcoinSourceAddress: undefined })
+    ).rejects.toThrow('Bitcoin private deposit signing is unavailable')
+    expect(privateCalls).toHaveLength(1)
+
+    setBitcoinPrivateExecutionAddressReader(async () => BITCOIN_PRIVATE)
+    await expect(
+      signer.prepareChainDeposit({ ...request, bitcoinSourceAddress: BITCOIN_PUBLIC })
+    ).rejects.toThrow('Bitcoin deposit source does not match the selected address')
+    await expect(
+      signer.prepareChainDeposit({ ...request, bitcoinSourceAddress: EVM_SIGNER })
+    ).rejects.toThrow('Bitcoin deposit source does not match the selected address')
+    expect(privateCalls).toHaveLength(1)
+
+    await signer.prepareChainDeposit({
+      ...request,
+      sourceDomain: 'public',
+      bitcoinSourceAddress: BITCOIN_PUBLIC,
+      bitcoinCounterpartyAddress: BITCOIN_PRIVATE
+    })
+    expect(publicCalls).toEqual([
+      expect.objectContaining({
+        sourceAddress: BITCOIN_PUBLIC,
+        recipient: BITCOIN_DEPOSIT,
+        amountRaw: '1000'
+      })
+    ])
+    expect(privateCalls).toHaveLength(1)
+  } finally {
+    setBitcoinPrivateExecutionAddressReader(undefined)
+  }
+})
+
+test('a Bitcoin deposit PSBT rejects an output that pays the other wallet address', () => {
+  initEccLib(secp256k1)
+  const key = digit => {
+    const privateKey = Buffer.alloc(32)
+    privateKey[31] = digit
+    const publicKey = Buffer.from(secp256k1.pointFromScalar(privateKey, true))
+    const payment = payments.p2wpkh({ pubkey: publicKey, network: networks.bitcoin })
+    return {
+      publicKey,
+      address: payment.address,
+      payment
+    }
+  }
+  const source = key(1)
+  const deposit = key(2)
+  const counterparty = key(3)
+  const funding = new Transaction()
+  funding.version = 2
+  funding.addInput(Buffer.alloc(32), 0xffffffff)
+  funding.addOutput(source.payment.output, 100000)
+  const selectionFor = recipient =>
+    selectBitcoinCoins({
+      chainId: BITCOIN_CHAIN_ID,
+      accountIndex: 0,
+      addressType: 'p2wpkh',
+      recipient,
+      amount: { mode: 'exact', valueSats: '50000' },
+      feeRateSatsPerVbyte: 2,
+      utxos: [
+        {
+          chainId: BITCOIN_CHAIN_ID,
+          addressType: 'p2wpkh',
+          accountIndex: 0,
+          change: false,
+          addressIndex: 0,
+          address: source.address,
+          derivationPath: "m/84'/0'/0'/0/0",
+          publicKey: `0x${source.publicKey.toString('hex')}`,
+          transactionId: funding.getId(),
+          outputIndex: 0,
+          valueSats: '100000',
+          blockHeight: 899_999
+        }
+      ]
+    })
+  const changeAddress = address => ({
+    chainId: BITCOIN_CHAIN_ID,
+    addressType: 'p2wpkh',
+    accountIndex: 0,
+    change: false,
+    addressIndex: 0,
+    address,
+    addressScheme: 'bitcoin-p2wpkh',
+    derivationScheme: 'bip84',
+    derivationPath: "m/84'/0'/0'/0/0",
+    publicKey: `0x${source.publicKey.toString('hex')}`
+  })
+  const previousTransactions = [
+    { transactionId: funding.getId(), rawTransactionHex: funding.toHex() }
+  ]
+  const payingCounterparty = buildBitcoinPsbt({
+    selection: selectionFor(counterparty.address),
+    masterFingerprint: '0x01020304',
+    lockTime: 900_000,
+    previousTransactions,
+    change: { address: changeAddress(source.address), outputPosition: 'last' }
+  })
+  expect(() =>
+    assertBitcoinDepositOutputs({
+      chainId: BITCOIN_CHAIN_ID,
+      depositAddress: deposit.address,
+      sourceAddress: source.address,
+      counterpartyAddress: counterparty.address,
+      outputs: [
+        { address: payingCounterparty.recipient },
+        { address: payingCounterparty.changeAddress }
+      ]
+    })
+  ).toThrow('Bitcoin deposit output pays another wallet address')
+  const valid = buildBitcoinPsbt({
+    previousTransactions,
+    selection: selectionFor(deposit.address),
+    masterFingerprint: '0x01020304',
+    lockTime: 900_000,
+    change: { address: changeAddress(source.address), outputPosition: 'last' }
+  })
+  expect(() =>
+    assertBitcoinDepositOutputs({
+      chainId: BITCOIN_CHAIN_ID,
+      depositAddress: deposit.address,
+      sourceAddress: source.address,
+      counterpartyAddress: counterparty.address,
+      outputs: [
+        { address: valid.recipient },
+        { address: valid.changeAddress }
+      ]
+    })
+  ).not.toThrow()
+  expect(() =>
+    assertBitcoinDepositOutputs({
+      chainId: BITCOIN_CHAIN_ID,
+      depositAddress: 'ab'.repeat(32),
+      sourceAddress: source.address,
+      outputs: [{ address: 'ab'.repeat(32) }]
+    })
+  ).toThrow('Confidential withdraw deposit is not a Bitcoin payment')
 })

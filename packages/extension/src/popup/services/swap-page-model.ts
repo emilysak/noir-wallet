@@ -385,6 +385,8 @@ export function resolveSwapExecutionSourceMode(input: {
   readonly privateSourceAvailable: boolean
 }): 'main' | 'private' {
   if (input.isPrivateFunding) return 'main'
+  // Stay private when the PEA is missing so a Bitcoin quote is not signed from the public address.
+  if (input.requestedMode === 'private' && input.sourceFamily === 'bitcoin') return 'private'
   return input.requestedMode === 'private' &&
     (input.sourceFamily === 'evm' ||
       input.sourceFamily === 'solana' ||
@@ -405,7 +407,7 @@ export function filterConfidentialFundingSourceTokens(
     const owned = resolveWalletOwnedQuoteAsset(token, portfolio, receiveTargets)
     if (owned?.family === 'evm') return true
     return (
-      (owned?.family === 'near' || owned?.family === 'solana') &&
+      (owned?.family === 'near' || owned?.family === 'solana' || owned?.family === 'bitcoin') &&
       owned.chain.chain.network?.kind === 'mainnet'
     )
   })
@@ -449,6 +451,11 @@ export function isPrivateSwapDestinationSupported(
   }
   if (target?.kind === 'solana') {
     if (target.chain.network?.kind !== 'mainnet') return false
+    if (mode === 'main') return target.address.length > 0
+    const privateAddress = privateExecutionAddresses.get(target.chain.id)
+    return Boolean(privateAddress && privateAddress !== target.address)
+  }
+  if (target?.kind === 'bitcoin') {
     if (mode === 'main') return target.address.length > 0
     const privateAddress = privateExecutionAddresses.get(target.chain.id)
     return Boolean(privateAddress && privateAddress !== target.address)
@@ -524,7 +531,9 @@ function isConfidentialFundingWalletDestination(
   if (!destination) return false
   if (destination.family === 'evm') return true
   return (
-    (destination.family === 'near' || destination.family === 'solana') &&
+    (destination.family === 'near' ||
+      destination.family === 'solana' ||
+      destination.family === 'bitcoin') &&
     destination.chain.chain.network?.kind === 'mainnet'
   )
 }

@@ -170,8 +170,21 @@ function harness(options = {}) {
     chains,
     assets,
     getAddressType: async () => options.addressType ?? 'p2wpkh',
-    onRefreshError: options.onRefreshError
+    onRefreshError: options.onRefreshError,
+    resolvePrivateExecutionAddress: options.resolvePrivateExecutionAddress,
+    readPrivateAddressUtxos: options.readPrivateAddressUtxos
   })
+}
+
+function p2wpkhAddress(index) {
+  const key = Buffer.alloc(32)
+  key[31] = index
+  const value = payments.p2wpkh({
+    pubkey: Buffer.from(secp256k1.pointFromScalar(key, true)),
+    network: networks.bitcoin
+  }).address
+  if (!value) throw new Error('Unable to derive Bitcoin test address')
+  return value
 }
 
 test('scopes the portfolio balance to the active Bitcoin address', async () => {
@@ -202,6 +215,138 @@ test('scopes the portfolio balance to the active Bitcoin address', async () => {
       balances: [{ totalRaw: '9000', spendableRaw: '9000', availableRaw: '9000', pendingRaw: '0' }]
     }
   })
+})
+
+test('keeps the public Bitcoin total separate from the single PEA address', async () => {
+  const pea = p2wpkhAddress(9)
+  const reads = []
+  const portfolio = harness({
+    resolvePrivateExecutionAddress: async () => pea,
+    readPrivateAddressUtxos: async address => {
+      reads.push(address)
+      return [
+        {
+          transactionId: 'f'.repeat(64),
+          outputIndex: 0,
+          valueRaw: '5000',
+          status: { confirmed: true }
+        },
+        {
+          transactionId: 'e'.repeat(64),
+          outputIndex: 1,
+          valueRaw: '40',
+          status: { confirmed: false }
+        }
+      ]
+    }
+  })
+
+  await expect(portfolio.readCachedActiveSource()).resolves.toMatchObject({
+    source: {
+      status: 'ready',
+      balances: [
+        {
+          totalRaw: '6240',
+          mainRaw: '1200',
+          privateRaw: '5040',
+          spendableRaw: '1000',
+          availableRaw: '0',
+          pendingRaw: '200'
+        }
+      ]
+    }
+  })
+  expect(reads).toEqual([pea])
+})
+
+test('excludes a discovered PEA output from the public Bitcoin total', async () => {
+  const pea = p2wpkhAddress(9)
+  const stored = state()
+  stored.observations = stored.observations.map(item =>
+    item.derived.addressType === 'p2wpkh' && item.derived.addressIndex === 0
+      ? { ...item, derived: { ...item.derived, address: pea } }
+      : item
+  )
+  const portfolio = harness({
+    state: stored,
+    resolvePrivateExecutionAddress: async () => pea,
+    readPrivateAddressUtxos: async () => [
+      {
+        transactionId: 'f'.repeat(64),
+        outputIndex: 0,
+        valueRaw: '5000',
+        status: { confirmed: true }
+      }
+    ]
+  })
+
+  await expect(portfolio.readCachedActiveSource()).resolves.toMatchObject({
+    source: {
+      balances: [
+        {
+          totalRaw: '5000',
+          mainRaw: '0',
+          privateRaw: '5000',
+          spendableRaw: '0',
+          availableRaw: '0',
+          pendingRaw: '0'
+        }
+      ]
+    }
+  })
+})
+
+test('omits the private split when no Bitcoin PEA is exposed', async () => {
+  const portfolio = harness({
+    resolvePrivateExecutionAddress: async () => undefined,
+    readPrivateAddressUtxos: async () => {
+      throw new Error('PEA lookup must not run')
+    }
+  })
+  const balance = (await portfolio.readCachedActiveSource()).source.balances[0]
+  expect(balance).toMatchObject({ totalRaw: '1200', spendableRaw: '1000', pendingRaw: '200' })
+  expect(balance.mainRaw).toBeUndefined()
+  expect(balance.privateRaw).toBeUndefined()
+})
+
+test('keeps the public total when the PEA lookup fails', async () => {
+  const portfolio = harness({
+    resolvePrivateExecutionAddress: async () => p2wpkhAddress(9),
+    readPrivateAddressUtxos: async () => {
+      throw new Error('esplora unavailable')
+    }
+  })
+  const balance = (await portfolio.readCachedActiveSource()).source.balances[0]
+  expect(balance).toMatchObject({ totalRaw: '1200', spendableRaw: '1000' })
+  expect(balance.privateRaw).toBeUndefined()
+})
+
+test('hardware accounts do not gain a Bitcoin PEA balance', async () => {
+  const reads = []
+  const portfolio = harness({
+    keyDomainSource: {
+      kind: 'hardware',
+      vendor: 'keystone',
+      firmwareProfile: 'cypherpunk',
+      capabilities: ['zcash', 'bitcoin']
+    },
+    resolvePrivateExecutionAddress: async () => p2wpkhAddress(9),
+    readPrivateAddressUtxos: async address => {
+      reads.push(address)
+      return [
+        {
+          transactionId: 'f'.repeat(64),
+          outputIndex: 0,
+          valueRaw: '5000',
+          status: { confirmed: true }
+        }
+      ]
+    }
+  })
+  const balance = (await portfolio.readCachedActiveSource()).source.balances[0]
+  expect(balance).toMatchObject({ totalRaw: '1200' })
+  expect(balance.privateRaw).toBeUndefined()
+  expect(reads).toEqual([])
 })
 
 test('aggregates Ledger receive and change balances while retaining software active-address scope', async () => {

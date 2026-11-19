@@ -1,4 +1,7 @@
 import { parseAccountId } from '@/core/accounts/domain'
+import { parseSupportedBitcoinAddress } from '@/core/chains/bitcoin'
+import { parseChainId } from '@/core/chains/registry'
+import { BITCOIN_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import { parseKeyDomainId } from '@/core/keyring/domain'
 import {
   parseTransactionGraph,
@@ -544,9 +547,25 @@ const EVM_PRIVATE_EXECUTION_ADDRESS = /^0x[0-9a-fA-F]{40}$/
 // after this check, so the accepted form stays the canonical public key.
 const SOLANA_PRIVATE_EXECUTION_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/
 
+function isBitcoinPrivateExecutionAddress(address: string): boolean {
+  const chainId = address.startsWith('bc1')
+    ? BITCOIN_CHAIN_IDS.mainnet
+    : address.startsWith('tb1')
+      ? BITCOIN_CHAIN_IDS.testnet
+      : undefined
+  if (!chainId) return false
+  try {
+    return parseSupportedBitcoinAddress(address, parseChainId(chainId).id, 'p2wpkh') === address
+  } catch {
+    return false
+  }
+}
+
 function isPrivateExecutionAddress(address: string): boolean {
   return (
-    EVM_PRIVATE_EXECUTION_ADDRESS.test(address) || SOLANA_PRIVATE_EXECUTION_ADDRESS.test(address)
+    EVM_PRIVATE_EXECUTION_ADDRESS.test(address) ||
+    SOLANA_PRIVATE_EXECUTION_ADDRESS.test(address) ||
+    isBitcoinPrivateExecutionAddress(address)
   )
 }
 

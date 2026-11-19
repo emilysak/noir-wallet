@@ -2,7 +2,8 @@ import { test } from 'node:test'
 import { expect } from '@playwright/test'
 import { normalizeQuote, serializeQuoteRequest } from '@rhea-finance/cross-chain-aggregation-dex'
 import { getNearNetworkConfig, getSolanaNetworkConfig } from '../../../src/config/networks.ts'
-import { getZcashChainId } from '../../../src/core/chains/registry/index.ts'
+import { listShieldFundingAssets } from '../../../src/popup/services/shield-transfer.ts'
+import { getBitcoinChainId, getZcashChainId } from '../../../src/core/chains/registry/index.ts'
 import { parseTrustedExtensionRuntimeMessage } from '../../../src/lib/runtime-message-security.ts'
 import { readRheaDestinationHash } from '../../../src/core/services/rhea-swap/rhea-order-status.ts'
 import {
@@ -16,6 +17,8 @@ import {
   assertPrivateQuoteRoute,
   assertReviewedPrivateQuoteSender,
   isConfidentialQuoteSender,
+  isPrivateSwapApiChain,
+  quoteAddressesMatch,
   parseRheaSwapQuoteRequest,
   toSdkQuoteRequest,
   toRheaSwapToken
@@ -869,6 +872,232 @@ test('Private Swap accepts Solana private addresses on the same chain and across
     ])
   ).toBe(false)
   expect(isConfidentialQuoteSender({ fromChain: '1', sender: evmPrivate }, [account])).toBe(true)
+})
+
+test('Private Swap accepts Bitcoin only at this account private execution address', () => {
+  const privateAddress = 'bc1qprivatepea'
+  const publicAddress = 'bc1qpublicaddr'
+  const bitcoinChainId = getBitcoinChainId('mainnet')
+  const account = {
+    walletId: 'wallet-1',
+    accountId: 'account-1',
+    networks: [
+      {
+        chainId: bitcoinChainId,
+        privateExecutionAddress: privateAddress,
+        addresses: [{ value: publicAddress }]
+      },
+      {
+        chainId: 'eip155:1',
+        privateExecutionAddress: `0x${'2'.repeat(40)}`,
+        addresses: [{ value: `0x${'4'.repeat(40)}` }]
+      }
+    ]
+  }
+  const token = { address: 'btc' }
+  const route = {
+    fromChain: 'btc',
+    toChain: 'btc',
+    sender: privateAddress,
+    recipient: privateAddress,
+    confidentiality: 'basic',
+    tokenIn: token,
+    tokenOut: token
+  }
+
+  expect(isPrivateSwapApiChain('btc')).toBe(true)
+  expect(isPrivateSwapApiChain('BTC')).toBe(false)
+  expect(quoteAddressesMatch(privateAddress, privateAddress, 'btc')).toBe(true)
+  expect(quoteAddressesMatch(privateAddress, privateAddress.toUpperCase(), 'btc')).toBe(false)
+  expect(quoteAddressesMatch(privateAddress, publicAddress, 'btc')).toBe(false)
+  expect(() => assertPrivateQuoteRoute(route, account, 'private-swap', account)).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...route, recipient: publicAddress },
+      account,
+      'private-swap',
+      account
+    )
+  ).toThrow(/this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...route, recipient: privateAddress.toUpperCase() },
+      account,
+      'private-swap',
+      account
+    )
+  ).toThrow(/this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute({ ...route, sender: publicAddress }, account, 'private-swap', account)
+  ).toThrow(/source does not match/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...route, confidentiality: undefined },
+      account,
+      'private-swap',
+      account
+    )
+  ).toThrow(/account changed/)
+  expect(() =>
+    assertReviewedPrivateQuoteSender({
+      purpose: 'private-swap',
+      fromChain: 'btc',
+      privateSender: false
+    })
+  ).toThrow(/reviewed route/)
+  expect(() =>
+    assertReviewedPrivateQuoteSender({
+      purpose: 'private-swap',
+      fromChain: 'btc',
+      privateSender: true
+    })
+  ).not.toThrow()
+  expect(
+    isConfidentialQuoteSender({ fromChain: 'btc', sender: privateAddress }, [account])
+  ).toBe(true)
+  expect(isConfidentialQuoteSender({ fromChain: 'btc', sender: publicAddress }, [account])).toBe(
+    false
+  )
+  const bitcoinFunding = {
+    fromChain: 'btc',
+    toChain: 'btc',
+    sender: publicAddress,
+    recipient: privateAddress,
+    confidentiality: 'basic',
+    tokenIn: token,
+    tokenOut: token
+  }
+  expect(() =>
+    assertPrivateQuoteRoute(bitcoinFunding, account, 'confidential-funding')
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...bitcoinFunding, recipient: publicAddress },
+      account,
+      'confidential-funding'
+    )
+  ).toThrow(/funding/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...bitcoinFunding, sender: privateAddress },
+      account,
+      'confidential-funding'
+    )
+  ).toThrow(/funding/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...bitcoinFunding, recipient: privateAddress.toUpperCase() },
+      account,
+      'confidential-funding'
+    )
+  ).toThrow(/funding/)
+  const bitcoinMove = {
+    fromChain: 'btc',
+    toChain: 'btc',
+    sender: privateAddress,
+    recipient: publicAddress,
+    confidentiality: 'basic',
+    tokenIn: token,
+    tokenOut: token
+  }
+  expect(() => assertPrivateQuoteRoute(bitcoinMove, account, 'private-transfer')).not.toThrow()
+  expect(() =>
+    assertReviewedPrivateQuoteSender({
+      purpose: 'private-transfer',
+      fromChain: 'btc',
+      privateSender: false
+    })
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...bitcoinMove, recipient: privateAddress },
+      account,
+      'private-transfer'
+    )
+  ).toThrow(/must stay in this Account/)
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...bitcoinMove, sender: publicAddress },
+      account,
+      'private-transfer'
+    )
+  ).toThrow(/source does not match/)
+  expect(() => assertPrivateQuoteRoute(bitcoinMove, null, 'private-transfer')).toThrow(
+    /account changed/
+  )
+  expect(
+    isConfidentialQuoteSender({ fromChain: 'btc', sender: privateAddress.toUpperCase() }, [
+      account
+    ])
+  ).toBe(false)
+
+  const testnetAccount = {
+    ...account,
+    networks: [
+      {
+        chainId: getBitcoinChainId('testnet'),
+        privateExecutionAddress: privateAddress,
+        addresses: [{ value: publicAddress }]
+      }
+    ]
+  }
+  expect(() =>
+    assertPrivateQuoteRoute(route, testnetAccount, 'private-swap', testnetAccount)
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      { ...route, recipient: publicAddress },
+      testnetAccount,
+      'private-swap',
+      testnetAccount
+    )
+  ).toThrow(/this Account/)
+
+  expect(() =>
+    assertPrivateQuoteRoute(
+      {
+        fromChain: 'btc',
+        toChain: '1',
+        sender: privateAddress,
+        recipient: account.networks[1].privateExecutionAddress,
+        confidentiality: 'basic',
+        tokenIn: token,
+        tokenOut: { address: 'native' }
+      },
+      account,
+      'private-swap',
+      account
+    )
+  ).not.toThrow()
+  expect(() =>
+    assertPrivateQuoteRoute(
+      {
+        fromChain: 'btc',
+        toChain: 'btc',
+        sender: publicAddress,
+        recipient: publicAddress,
+        tokenIn: token,
+        tokenOut: token
+      },
+      account,
+      'wallet-swap',
+      account
+    )
+  ).not.toThrow()
+})
+
+test('lists Shield BTC only on mainnet when the protocol asset is mapped', () => {
+  const token = {
+    assetId: 'nep141:btc.omft.near',
+    blockchain: 'btc',
+    symbol: 'BTC',
+    decimals: 8
+  }
+  const model = { chains: [], assets: [], confidential: { status: 'ready', assets: [] } }
+  expect(
+    listShieldFundingAssets(model, [], [token], 'mainnet').map(item => item.asset.asset.id)
+  ).toEqual([`${getBitcoinChainId('mainnet')}/slip44:0`])
+  expect(listShieldFundingAssets(model, [], [token], 'testnet')).toEqual([])
 })
 
 test('NEAR and Solana private Move quotes do not need an EVM confidential sender', () => {

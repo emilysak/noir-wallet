@@ -61,9 +61,11 @@ import {
   assertBitcoinSigningSummaryMatchesPrepared,
   computeBitcoinSigningPayloadFingerprint,
   createBitcoinSigningSummary,
+  createBitcoinPeaSigningPreparePayload,
   createBitcoinSigningPreparePayload,
   KEYSTONE_BITCOIN_SIGNING_TTL_MS,
   normalizeBitcoinSigningSummary,
+  type BitcoinPeaSigningPreparePayload,
   type BitcoinSigningPreparePayload
 } from './bitcoin-signing-summary-validator'
 import { createBitcoinTransferGraph } from './bitcoin-transaction-graph'
@@ -78,7 +80,7 @@ import {
 export interface BitcoinTransferSigningPort {
   readonly prepare: (
     keyDomainId: ChainAccount['scope']['keyDomainId'],
-    payload: BitcoinSigningPreparePayload,
+    payload: BitcoinSigningPreparePayload | BitcoinPeaSigningPreparePayload,
     signal?: AbortSignal
   ) => Promise<PreparedSigningCommand>
   readonly confirm: (
@@ -127,6 +129,7 @@ export interface PrepareBitcoinTransferInput {
   readonly inputReservation: BitcoinInputReservation
   readonly requiredConfirmations: number
   readonly signingMode?: 'internal' | 'keystone' | 'ledger'
+  readonly signingFamily?: 'bitcoin' | 'bitcoin-pea'
   readonly nearIntentsBinding?: NearIntentsTransactionBinding
   readonly rheaSwapBinding?: RheaSwapTransactionBinding
   readonly signal?: AbortSignal
@@ -322,6 +325,13 @@ export class BitcoinTransferOrchestrator {
       discoveryScope.chainAccount,
       input.prepared
     )
+    if (
+      input.signingFamily === 'bitcoin-pea' &&
+      input.signingMode !== undefined &&
+      input.signingMode !== 'internal'
+    ) {
+      throw new Error('Bitcoin private execution signing is unavailable for this account')
+    }
     const createdAt = this.timestamp()
     if (input.nearIntentsBinding && input.rheaSwapBinding) {
       throw new Error('Bitcoin transfer cannot bind multiple swap protocols')
@@ -377,7 +387,9 @@ export class BitcoinTransferOrchestrator {
             })
           : await this.signer.prepare(
               scope.keyDomainId,
-              createBitcoinSigningPreparePayload(input.prepared),
+              input.signingFamily === 'bitcoin-pea'
+                ? createBitcoinPeaSigningPreparePayload(input.prepared)
+                : createBitcoinSigningPreparePayload(input.prepared),
               input.signal
             )
       signing = Object.freeze({

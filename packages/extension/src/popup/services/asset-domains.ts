@@ -3,7 +3,7 @@ import { getNearNetworkConfig, getSolanaNetworkConfig } from '@/config/networks'
 import { formatBaseUnitDecimalAmount, formatFiatAmount } from '@/lib/number-format'
 import type { PortfolioAssetView, PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
 import { findAssetPrice, type AssetPriceReadModel } from '@/core/prices'
-import { ZCASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
+import { BITCOIN_CHAIN_IDS, ZCASH_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import {
   summarizeNearConfidentialHoldings,
   type NearConfidentialSummary
@@ -12,8 +12,16 @@ import {
 export type AssetDomain = 'all' | 'public' | 'shield' | 'private'
 export type ShieldProvider = 'near-confidential' | 'zcash-shield'
 const ZCASH_CHAIN_ID_SET = new Set<string>(Object.values(ZCASH_CHAIN_IDS))
+const BITCOIN_CHAIN_ID_SET = new Set<string>(Object.values(BITCOIN_CHAIN_IDS))
 const NEAR_MAINNET_CHAIN_ID = getNearNetworkConfig('mainnet').chainId
 const SOLANA_MAINNET_CHAIN_ID = getSolanaNetworkConfig('mainnet').chainId
+
+function isBitcoinPortfolioAsset(asset: PortfolioAssetView): boolean {
+  return (
+    BITCOIN_CHAIN_ID_SET.has(asset.asset.chainId) &&
+    asset.asset.id === `${asset.asset.chainId}/slip44:0`
+  )
+}
 
 function hasMainnetConfidentialProtocol(asset: PortfolioAssetView): boolean {
   if (asset.asset.chainId === NEAR_MAINNET_CHAIN_ID) {
@@ -64,6 +72,15 @@ export function getAssetDomainRaw(asset: PortfolioAssetView, domain: AssetDomain
     if (domain === 'public') return balance.transparentRaw ?? null
     return balance.shieldedRaw ?? null
   }
+  if (isBitcoinPortfolioAsset(asset)) {
+    if (domain === 'shield') return balance.confidentialRaw ?? '0'
+    // Public is mainRaw. privateRaw is the PEA only and does not include Shield.
+    if (balance.mainRaw !== undefined && balance.privateRaw !== undefined) {
+      if (!completeRawParts(balance.totalRaw, [balance.mainRaw, balance.privateRaw])) return null
+      return domain === 'public' ? balance.mainRaw : balance.privateRaw
+    }
+    return domain === 'public' ? balance.totalRaw : '0'
+  }
   if (asset.asset.chainId.startsWith('solana:') || asset.asset.chainId.startsWith('near:')) {
     if (domain === 'shield') {
       return hasMainnetConfidentialProtocol(asset) ? (balance.confidentialRaw ?? '0') : '0'
@@ -84,14 +101,19 @@ export function getAssetDomainRaw(asset: PortfolioAssetView, domain: AssetDomain
 export function selectHomeActionSource(
   model: PortfolioReadModel | null,
   domain: 'public' | 'private',
-  action: 'send' | 'swap'
+  action: 'send' | 'swap',
+  options: Readonly<{ bitcoinPrivateAvailable?: boolean }> = {}
 ): Readonly<{ asset: PortfolioAssetView; chain: PortfolioChainView }> | null {
   if (!model) return null
   const candidates = model.assets.flatMap(asset => {
     const chain = model.chains.find(item => item.chain.id === asset.asset.chainId)
+    const bitcoinPrivate =
+      options.bitcoinPrivateAvailable === true && chain?.chain.family === 'bitcoin'
     if (
       !chain ||
-      (domain === 'private' && !['evm', 'solana', 'near'].includes(chain.chain.family))
+      (domain === 'private' &&
+        !['evm', 'solana', 'near'].includes(chain.chain.family) &&
+        !bitcoinPrivate)
     ) {
       return []
     }
@@ -122,7 +144,7 @@ function projectDisplayAsset(asset: PortfolioAssetView, totalRaw: string): Portf
 export function projectPortfolioForDomain(
   model: PortfolioReadModel,
   domain: AssetDomain,
-  options: Readonly<{ evmPrivateAvailable?: boolean }> = {}
+  options: Readonly<{ evmPrivateAvailable?: boolean; bitcoinPrivateAvailable?: boolean }> = {}
 ): PortfolioReadModel {
   // Display-only: projected totals must never be passed to transaction preparation.
   if (domain === 'all') return model
@@ -145,7 +167,9 @@ export function projectPortfolioForDomain(
         domain === 'public' ||
         chain.chain.family === 'evm' ||
         (domain === 'private' &&
-          (chain.chain.family === 'solana' || chain.chain.family === 'near')) ||
+          (chain.chain.family === 'solana' ||
+            chain.chain.family === 'near' ||
+            (chain.chain.family === 'bitcoin' && options.bitcoinPrivateAvailable === true))) ||
         (domain === 'shield' && chain.chain.family === 'zcash') ||
         (domain === 'shield' &&
           (chain.chain.family === 'near' || chain.chain.family === 'solana') &&

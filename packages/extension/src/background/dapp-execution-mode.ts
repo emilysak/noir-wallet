@@ -1,4 +1,5 @@
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
+import { supportsBitcoinPrivateExecution } from '@/core/chains/bitcoin'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
 import { supportsNearPrivateExecution } from '@/core/chains/near'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
@@ -6,7 +7,8 @@ import {
   resolveNearRuntimeNetworkConfig,
   resolveSolanaRuntimeNetworkConfig
 } from '@/core/chains/solana-near-runtime-config'
-import { getEvmNetworkConfig } from '@/config/networks'
+import { getBitcoinNetworkConfig, getEvmNetworkConfig } from '@/config/networks'
+import { loadActiveBitcoinDiscoveryContext } from '@/infrastructure/chains/bitcoin/bitcoin-discovery-coordinator'
 import {
   DAppExecutionModeCoordinator,
   DAppExecutionModeRequestGate,
@@ -70,11 +72,29 @@ export const dappExecutionModeCoordinator = new DAppExecutionModeCoordinator(
         storageRepository,
         resolveNearRuntimeNetworkConfig(DEFAULT_NETWORK).chainId
       )
-      return (
+      if (
         nearContext !== null &&
         supportsNearPrivateExecution(nearContext.keyDomainSource) &&
         nearContext.chainAccount.scope.keyDomainId === scope.keyDomainId &&
         nearContext.chainAccount.scope.accountId === scope.accountId
+      ) {
+        return true
+      }
+      // Private mode is the wallet's own execution mode. Bitcoin dApps stay on the public address.
+      const bitcoinChainId = getBitcoinNetworkConfig(DEFAULT_NETWORK).chainId
+      const bitcoinContext = await loadActiveBitcoinDiscoveryContext(
+        storageRepository,
+        bitcoinChainId
+      )
+      return (
+        bitcoinContext !== null &&
+        supportsBitcoinPrivateExecution(
+          bitcoinContext.keyDomainSource,
+          bitcoinContext.accountIndex,
+          bitcoinChainId
+        ) &&
+        bitcoinContext.chainAccount.scope.keyDomainId === scope.keyDomainId &&
+        bitcoinContext.chainAccount.scope.accountId === scope.accountId
       )
     }
   }

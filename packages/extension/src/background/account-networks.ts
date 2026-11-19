@@ -10,7 +10,7 @@ import {
   createInitialProductChainRegistry,
   type AddressGatedChainRegistry
 } from '@/core/chains/registry'
-import { BITCOIN_ADDRESS_POLICY } from '@/core/chains/bitcoin'
+import { BITCOIN_ADDRESS_POLICY, supportsBitcoinPrivateExecution } from '@/core/chains/bitcoin'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
 import { supportsNearPrivateExecution } from '@/core/chains/near'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
@@ -18,6 +18,7 @@ import type { KeyDomainId } from '@/core/keyring/domain'
 import type { HardwareCredentialMetadata } from '@/core/keyring/domain'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import type { EvmNetworkConfig } from '@/config/networks'
+import { BitcoinMultichainSigningClient } from '@/infrastructure/keyring/multichain/bitcoin-signing-client'
 import { NearMultichainSigningClient } from '@/infrastructure/keyring/multichain/near-signing-client'
 import { IndexedDbStorageV2Repository } from '@/infrastructure/persistence/repositories'
 import type { BitcoinAddressDerivationPort } from '@/infrastructure/keyring/multichain/bitcoin-derivation-client'
@@ -102,6 +103,13 @@ export interface AccountNetworksCoordinatorOptions {
       accountIndex: number
     ): Promise<Readonly<{ readonly address: string }>>
   }>
+  readonly bitcoinPeaDerivation?: Readonly<{
+    deriveBitcoinPea(
+      keyDomainId: KeyDomainId,
+      accountIndex: number,
+      chainId: string
+    ): Promise<Readonly<{ readonly address: string }>>
+  }>
 }
 
 export class AccountNetworksCoordinator {
@@ -172,6 +180,7 @@ export class AccountNetworksCoordinator {
         const privateExecutionAddresses = new Map<number, Promise<string>>()
         const solanaPrivateExecutionAddresses = new Map<number, Promise<string>>()
         const nearPrivateExecutionAddresses = new Map<number, Promise<string>>()
+        const bitcoinPrivateExecutionAddresses = new Map<string, Promise<string>>()
         const networks = (
           await Promise.all(
             snapshot.chainAccounts
@@ -362,6 +371,37 @@ export class AccountNetworksCoordinator {
                     }
                   }
                 }
+                const bitcoinPeaDerivation = this.options.bitcoinPeaDerivation
+                if (
+                  chain.family === 'bitcoin' &&
+                  supportsBitcoinPrivateExecution(
+                    keyDomain.source,
+                    account.accountIndex,
+                    chain.id
+                  ) &&
+                  bitcoinPeaDerivation &&
+                  deriveMissingAddresses
+                ) {
+                  try {
+                    const cacheKey = `${chain.id}:${account.accountIndex}`
+                    let derived = bitcoinPrivateExecutionAddresses.get(cacheKey)
+                    if (!derived) {
+                      derived = bitcoinPeaDerivation
+                        .deriveBitcoinPea(account.keyDomainId, account.accountIndex, chain.id)
+                        .then(result => result.address)
+                      bitcoinPrivateExecutionAddresses.set(cacheKey, derived)
+                    }
+                    privateExecutionAddress = await derived
+                  } catch (error) {
+                    if (
+                      !(error instanceof Error) ||
+                      (error.message !== 'Wallet is locked' &&
+                        error.message !== 'Credential is not unlocked')
+                    ) {
+                      throw error
+                    }
+                  }
+                }
 
                 if (addresses.length === 0) {
                   throw new Error('Enabled ChainAccount has no displayable Address')
@@ -432,7 +472,8 @@ export function createBackgroundAccountNetworksCoordinator(
   bitcoinDerivation?: BitcoinAddressDerivationPort,
   evmPeaDerivation?: AccountNetworksCoordinatorOptions['evmPeaDerivation'],
   getZcashShieldedReceiveAddress?: AccountNetworksCoordinatorOptions['getZcashShieldedReceiveAddress'],
-  solanaPeaDerivation?: AccountNetworksCoordinatorOptions['solanaPeaDerivation']
+  solanaPeaDerivation?: AccountNetworksCoordinatorOptions['solanaPeaDerivation'],
+  bitcoinPeaDerivation?: AccountNetworksCoordinatorOptions['bitcoinPeaDerivation']
 ): AccountNetworksCoordinator {
   return new AccountNetworksCoordinator({
     repository: new IndexedDbStorageV2Repository(),
@@ -444,6 +485,9 @@ export function createBackgroundAccountNetworksCoordinator(
     getZcashShieldedReceiveAddress,
     solanaPeaDerivation,
     nearPeaDerivation: new NearMultichainSigningClient({ credentials: credentialSession }),
+    bitcoinPeaDerivation:
+      bitcoinPeaDerivation ??
+      new BitcoinMultichainSigningClient({ credentials: credentialSession }),
     isNetworkEnabled: (scope, family, chainId) =>
       isStoredAccountNetworkEnabled(
         scope.keyDomainId,

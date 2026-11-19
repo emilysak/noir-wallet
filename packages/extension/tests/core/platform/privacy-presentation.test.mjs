@@ -1195,3 +1195,56 @@ test('projects NEAR main and PEA balances without folding Shield into private', 
   expect(selectHomeActionSource(model, 'public', 'swap')?.asset.asset.id).toBe(asset.asset.id)
   expect(selectHomeActionSource(model, 'private', 'swap')?.asset.asset.id).toBe(asset.asset.id)
 })
+
+test('includes Bitcoin in the private domain only when a PEA balance is available', () => {
+  const chainId = 'bip122:000000000019d6689c085ae165831e93'
+  const asset = {
+    asset: { id: `${chainId}/slip44:0`, chainId, kind: 'native' },
+    balance: {
+      totalRaw: '22',
+      mainRaw: '10',
+      privateRaw: '12',
+      confidentialRaw: '7',
+      spendableRaw: '10',
+      availableRaw: '10',
+      pendingRaw: '0'
+    }
+  }
+  const chain = {
+    chain: {
+      id: chainId,
+      family: 'bitcoin',
+      capabilities: { transaction: { status: 'available' } }
+    },
+    assets: [asset]
+  }
+  const model = { assets: [asset], chains: [chain] }
+
+  expect(getAssetDomainRaw(asset, 'public')).toBe('10')
+  expect(getAssetDomainRaw(asset, 'private')).toBe('12')
+  expect(getAssetDomainRaw(asset, 'shield')).toBe('7')
+  expect(projectPortfolioForDomain(model, 'private').chains).toEqual([])
+  expect(projectPortfolioForDomain(model, 'public').assets[0].balance.totalRaw).toBe('10')
+  expect(
+    projectPortfolioForDomain(model, 'private', { bitcoinPrivateAvailable: true }).assets[0].balance
+      .totalRaw
+  ).toBe('12')
+  expect(
+    projectPortfolioForDomain(model, 'private', { bitcoinPrivateAvailable: true }).chains.map(
+      item => item.chain.id
+    )
+  ).toEqual([chainId])
+  expect(selectHomeActionSource(model, 'private', 'send')).toBeNull()
+  expect(
+    selectHomeActionSource(model, 'private', 'swap', { bitcoinPrivateAvailable: true })?.asset.asset
+      .id
+  ).toBe(asset.asset.id)
+
+  const publicOnly = {
+    ...asset,
+    balance: { totalRaw: '10', spendableRaw: '10', availableRaw: '10', pendingRaw: '0' }
+  }
+  expect(getAssetDomainRaw(publicOnly, 'public')).toBe('10')
+  expect(getAssetDomainRaw(publicOnly, 'private')).toBe('0')
+  expect(getAssetDomainRaw(publicOnly, 'shield')).toBe('0')
+})

@@ -885,7 +885,8 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
       nearIntentsBinding: isRecord,
       rheaSwapBinding: isRecord,
       feeTier: isNetworkFeeTier,
-      bitcoinAddressType: isBitcoinAddressType
+      bitcoinAddressType: isBitcoinAddressType,
+      executionMode: value => value === 'main' || value === 'private'
     }
   },
   GET_PENDING_BITCOIN_TRANSFER: { required: { transactionId: isShortString } },

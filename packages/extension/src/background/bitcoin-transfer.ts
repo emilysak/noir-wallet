@@ -25,6 +25,7 @@ import {
 import { BitcoinMultichainDerivationClient } from '@/infrastructure/keyring/multichain/bitcoin-derivation-client'
 import { BitcoinAddressDerivationRouter } from '@/infrastructure/keyring/bitcoin-address-derivation-router'
 import { bitcoinAccountRootFromPath } from '@/infrastructure/chains/bitcoin/bitcoin-transaction-model'
+import { supportsBitcoinPrivateExecution } from '@/core/chains/bitcoin'
 import { BitcoinMultichainSigningClient } from '@/infrastructure/keyring/multichain/bitcoin-signing-client'
 import {
   IndexedDbStorageV2Repository,
@@ -37,6 +38,7 @@ import { BITCOIN_TRANSACTION_MONITOR_ALARM } from './bitcoin-transaction-monitor
 import { NEAR_INTENTS_TRANSACTION_MONITOR_ALARM } from './near-intents-transaction-monitor'
 import { BackgroundBitcoinTransferController } from './bitcoin-transfer-controller'
 import { getBitcoinAccountPreferences } from './bitcoin-account-preferences'
+import { readBitcoinPrivateExecutionAddress } from './bitcoin-private-execution-address'
 import { credentialSession } from './credential-session'
 import { recordRheaSwapGraphBroadcast } from './rhea-swap'
 import { reportBackgroundSendBroadcast } from './analytics/send-broadcast'
@@ -144,10 +146,11 @@ function createBackgroundBitcoinRuntime(customRpcUrl?: string): BackgroundBitcoi
       chrome.alarms.create(NEAR_INTENTS_TRANSACTION_MONITOR_ALARM, { delayInMinutes: 0.1 })
     ])
   }
+  const signer = new BitcoinMultichainSigningClient({ credentials: credentialSession })
   const orchestrator = new BitcoinTransferOrchestrator({
     repository: new IndexedDbTransactionRepository(),
     pendingStore: new ChromeSessionBitcoinPendingTransferStore(),
-    signer: new BitcoinMultichainSigningClient({ credentials: credentialSession }),
+    signer,
     rpc,
     assets,
     changeReservations,
@@ -204,7 +207,34 @@ function createBackgroundBitcoinRuntime(customRpcUrl?: string): BackgroundBitcoi
         network: DEFAULT_NETWORK
       })
     },
-    requiredConfirmations: network.requiredConfirmations
+    requiredConfirmations: network.requiredConfirmations,
+    resolvePrivateExecutionAccount: async context => {
+      if (
+        context.keyDomainSource.kind === 'hardware' ||
+        !supportsBitcoinPrivateExecution(
+          context.keyDomainSource,
+          context.accountIndex,
+          context.chainAccount.scope.chainId
+        )
+      ) {
+        return undefined
+      }
+      const address = await readBitcoinPrivateExecutionAddress({
+        keyDomainId: context.chainAccount.scope.keyDomainId,
+        accountId: context.chainAccount.scope.accountId,
+        chainId: context.chainAccount.scope.chainId
+      })
+      if (!address) return undefined
+      const derived = await signer.deriveBitcoinPea(
+        context.chainAccount.scope.keyDomainId,
+        context.accountIndex,
+        context.chainAccount.scope.chainId
+      )
+      if (derived.address !== address) {
+        throw new Error('Bitcoin private execution address does not match the signer')
+      }
+      return Object.freeze({ address: derived.address, publicKey: derived.publicKey })
+    }
   })
   const portfolio = new BitcoinPortfolioCoordinator({
     storageRepository,
@@ -214,6 +244,13 @@ function createBackgroundBitcoinRuntime(customRpcUrl?: string): BackgroundBitcoi
     chains,
     assets,
     getAddressType,
+    resolvePrivateExecutionAddress: context =>
+      readBitcoinPrivateExecutionAddress({
+        keyDomainId: context.chainAccount.scope.keyDomainId,
+        accountId: context.chainAccount.scope.accountId,
+        chainId: context.chainAccount.scope.chainId
+      }),
+    readPrivateAddressUtxos: address => rpc.getAddressUtxos(address),
     onRefreshError: (error, context) => {
       logger.warn(
         `Bitcoin portfolio refresh failed: ${formatLogError(error)}`,

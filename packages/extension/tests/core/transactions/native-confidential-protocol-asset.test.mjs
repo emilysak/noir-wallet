@@ -1,12 +1,17 @@
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
-import { getNearNetworkConfig, getSolanaNetworkConfig } from '../../../src/config/networks.ts'
+import {
+  getBitcoinNetworkConfig,
+  getNearNetworkConfig,
+  getSolanaNetworkConfig
+} from '../../../src/config/networks.ts'
 import { resolveShieldManagedAsset } from '../../../src/popup/services/shield-transfer.ts'
 import { findDirectConfidentialChainToken } from '../../../src/popup/services/move-method-estimate.ts'
 
 const nearChainId = getNearNetworkConfig('mainnet').chainId
 const solanaChainId = getSolanaNetworkConfig('mainnet').chainId
+const bitcoinChainId = getBitcoinNetworkConfig('mainnet').chainId
 
 function walletAsset(chainId, reference, namespace, kind, decimals) {
   return {
@@ -23,6 +28,7 @@ function walletAsset(chainId, reference, namespace, kind, decimals) {
 
 const nativeNear = walletAsset(nearChainId, '397', 'slip44', 'native', 24)
 const nativeSol = walletAsset(solanaChainId, '501', 'slip44', 'native', 9)
+const nativeBtc = walletAsset(bitcoinChainId, '0', 'slip44', 'native', 8)
 const wrapNear = {
   assetId: 'nep141:wrap.near',
   blockchain: 'near',
@@ -117,4 +123,33 @@ test('direct confidential moves quote the native protocol token and not another 
     rheaAddress: 'So11111111111111111111111111111111111111112'
   }
   expect(findDirectConfidentialChainToken([decoy, wrapped, wrappedSol], nativeSol)).toBe(wrappedSol)
+
+  const wrappedBtc = {
+    assetId: 'nep141:btc.omft.near',
+    blockchain: 'btc',
+    contractAddress: null,
+    decimals: 8,
+    symbol: 'BTC',
+    rheaAddress: 'btc'
+  }
+  expect(findDirectConfidentialChainToken([decoy, wrappedBtc], nativeBtc)).toBe(wrappedBtc)
+  expect(
+    findDirectConfidentialChainToken([decoy, { ...wrappedBtc, decimals: 6 }], nativeBtc)
+  ).toBeUndefined()
+})
+
+test('resolves native BTC to nep141:btc.omft.near on mainnet only', () => {
+  const wrappedBtc = {
+    assetId: 'nep141:btc.omft.near',
+    blockchain: 'btc',
+    decimals: 8
+  }
+  expect(resolveShieldManagedAsset(nativeBtc, [], [wrappedBtc], 'mainnet')).toEqual({
+    assetId: `${bitcoinChainId}/slip44:0`,
+    chainId: bitcoinChainId,
+    protocolAssetId: 'nep141:btc.omft.near',
+    blockchain: 'btc'
+  })
+  expect(resolveShieldManagedAsset(nativeBtc, [], [{ ...wrappedBtc, decimals: 6 }], 'mainnet')).toBeNull()
+  expect(resolveShieldManagedAsset(nativeBtc, [], [wrappedBtc], 'testnet')).toBeNull()
 })

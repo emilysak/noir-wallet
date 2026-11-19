@@ -1,6 +1,10 @@
 import { ASSET_PRICE_SOURCE_ASSETS } from '@/config/asset-market-assets'
 import { WNEAR_NEAR_ASSET } from '@/config/intents'
-import { getNearNetworkConfig, getSolanaNetworkConfig } from '@/config/networks'
+import {
+  getBitcoinNetworkConfig,
+  getNearNetworkConfig,
+  getSolanaNetworkConfig
+} from '@/config/networks'
 import type { Network } from '@/types'
 import type { SwapToken } from '@/core/services/intents-api'
 import { isDeprecatedIntentsToken } from '@/core/services/intents-evm-assets'
@@ -13,8 +17,8 @@ export interface ConfidentialFundingAssetLookup {
 }
 
 // Wrapped NEAR and SOL rows keep a contract address, so the wallet catalog treats
-// them as NEP-141. Confidential moves still spend the native coin through that
-// protocol asset when the registered decimals match.
+// them as NEP-141. BTC uses the same native alias. Confidential moves still spend
+// the native coin through that protocol asset when the registered decimals match.
 export const NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS = Object.freeze([
   Object.freeze({
     chainId: getNearNetworkConfig('mainnet').chainId,
@@ -27,6 +31,12 @@ export const NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS = Object.freeze([
     reference: '501',
     protocolAssetId: ASSET_PRICE_SOURCE_ASSETS.sol,
     blockchain: 'sol'
+  }),
+  Object.freeze({
+    chainId: getBitcoinNetworkConfig('mainnet').chainId,
+    reference: '0',
+    protocolAssetId: ASSET_PRICE_SOURCE_ASSETS.btc,
+    blockchain: 'btc'
   })
 ])
 
