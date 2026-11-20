@@ -763,9 +763,17 @@ test('merges NEAR and Solana signer balances without copying them into the EVM c
       getBalanceSnapshot: async () => ({ fresh: true, balances: [] }),
       getSession: async (_network, _domain, _account, signerId) =>
         signerId ? sessionFor(signerId) : sessionFor(evm),
-      putBalances: async (_network, _domain, _account, balances, signerId) => {
+      putBalances: async (
+        _network,
+        _domain,
+        _account,
+        balances,
+        requestedAtOrSigner,
+        signerId
+      ) => {
         writes.push({
-          signerId: signerId ?? null,
+          signerId:
+            typeof requestedAtOrSigner === 'string' ? requestedAtOrSigner : (signerId ?? null),
           tokenIds: balances.map(row => row.tokenId)
         })
       },

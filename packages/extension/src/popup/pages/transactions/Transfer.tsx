@@ -310,7 +310,12 @@ function MethodCard({
           {loading ? (
             <Skeleton className="ml-auto h-4 w-12 max-w-full" />
           ) : (
-            <span className="block">{estimate?.time ?? '—'}</span>
+            <span className="block">
+              {estimate?.time ?? '—'}
+              {estimate?.timeScope ? (
+                <span className="block text-[10px] text-muted">{estimate.timeScope}</span>
+              ) : null}
+            </span>
           )}
         </span>
       </span>
@@ -1443,7 +1448,14 @@ function TransferForm() {
       userPickedMethod.current = false
       setMethod('cluster')
     }
-  }, [method, clusterUnavailable, directUnavailable, clusterQuoted, directQuoted, solanaClusterPair])
+  }, [
+    method,
+    clusterUnavailable,
+    directUnavailable,
+    clusterQuoted,
+    directQuoted,
+    solanaClusterPair
+  ])
   const shieldReviewKeyForFee = (feeSelection: EvmFeeSelection) =>
     `${routeKey}:${method}:${currentAmount}:${shieldAmountState?.amountRaw ?? ''}:${JSON.stringify(feeSelection)}`
   const shieldReviewKey = shieldReviewKeyForFee(evmMoveFee)
@@ -1725,11 +1737,11 @@ function TransferForm() {
         const message = error instanceof Error ? error.message : ''
         if (message.includes('Bitcoin private deposit signing is unavailable')) {
           setShieldError('Bitcoin private deposit signing is unavailable')
-          return
+          return false
         }
         if (message.startsWith('Confidential funding') || message.startsWith('Bitcoin ')) {
           setShieldError(message)
-          return
+          return false
         }
         const classifiedMessage = classifyError(error).userMessage
         const userMessage =
@@ -2341,7 +2353,10 @@ function TransferForm() {
                   from === 'shield' && destination
                     ? destination.asset.asset.id
                     : selected?.asset.asset.id
-                if (reversedAssetId && assets.some(item => item.asset.asset.id === reversedAssetId)) {
+                if (
+                  reversedAssetId &&
+                  assets.some(item => item.asset.asset.id === reversedAssetId)
+                ) {
                   setSelectedAssetId(reversedAssetId)
                 } else if (selected) setSelectedAssetId(selected.asset.asset.id)
                 setDestinationAssetId(null)

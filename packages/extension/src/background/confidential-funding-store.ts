@@ -924,9 +924,12 @@ export class ChromeConfidentialFundingStore {
     keyDomainId: string,
     accountId: string,
     balances: readonly ConfidentialBalance[],
-    requestedAt = this.now(),
+    requestedAtOrSigner: number | string = this.now(),
     signerId?: string
   ): Promise<void> {
+    const requestedAt = typeof requestedAtOrSigner === 'number' ? requestedAtOrSigner : this.now()
+    const resolvedSignerId =
+      typeof requestedAtOrSigner === 'string' ? requestedAtOrSigner : signerId
     if (!Number.isSafeInteger(requestedAt) || requestedAt < 0) {
       throw new Error('Confidential balance request time is invalid')
     }
@@ -937,12 +940,12 @@ export class ChromeConfidentialFundingStore {
     })
     const legacyKey = this.balanceKey(network, keyDomainId, accountId)
     const entries: Record<string, unknown> =
-      signerId && !isConfidentialEvmSigner(signerId)
-        ? { [this.balanceKey(network, keyDomainId, accountId, signerId)]: snapshot }
+      resolvedSignerId && !isConfidentialEvmSigner(resolvedSignerId)
+        ? { [this.balanceKey(network, keyDomainId, accountId, resolvedSignerId)]: snapshot }
         : {
             [legacyKey]: snapshot,
-            ...(signerId
-              ? { [this.balanceKey(network, keyDomainId, accountId, signerId)]: snapshot }
+            ...(resolvedSignerId
+              ? { [this.balanceKey(network, keyDomainId, accountId, resolvedSignerId)]: snapshot }
               : {})
           }
     await withUndeletedWalletAccountMetadata(keyDomainId, accountId, network, async () => {

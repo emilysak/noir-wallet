@@ -7,9 +7,12 @@ import { getEvmNetworkConfigs } from '@/config/networks'
 import { resolveIntentsEvmAssets } from '@/core/services/intents-evm-assets'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import {
+  isPrivateSwapApiChain,
+  isRheaSwapQuoteFresh,
   quoteAddressesMatch,
   RHEA_SWAP_CHAIN_CATALOG,
   type RheaSwapQuoteRequest,
+  type RheaSwapQuoteView,
   type RheaSwapReviewView,
   type RheaSwapToken
 } from '@/core/services/rhea-swap'
@@ -322,6 +325,38 @@ export function resolveSwapSourceExecutionTarget(input: {
   return null
 }
 
+export function hasSwapQuoteTermsChanged(
+  previous: RheaSwapQuoteView,
+  next: RheaSwapQuoteView
+): boolean {
+  return (
+    previous.estimatedOut !== next.estimatedOut ||
+    previous.minAmountOut !== next.minAmountOut ||
+    previous.router !== next.router ||
+    previous.recipient !== next.recipient
+  )
+}
+
+export function isAcceptedSwapReview(input: {
+  readonly quote: RheaSwapQuoteView | null
+  readonly review: RheaSwapReviewView | null
+  readonly acceptedHandle: string | null
+  readonly quoteKey: string | null
+  readonly requestKey: string | null | undefined
+  readonly now?: number
+}): boolean {
+  const { quote, review, acceptedHandle, quoteKey, requestKey } = input
+  return Boolean(
+    quote &&
+    review &&
+    acceptedHandle === quote.quoteHandle &&
+    review.quoteHandle === quote.quoteHandle &&
+    quoteKey &&
+    quoteKey === requestKey &&
+    isRheaSwapQuoteFresh(quote, input.now)
+  )
+}
+
 export function resolveSwapStatusPollingProvider(input: {
   readonly depositAddress?: string
   readonly rheaQuoteHandle?: string
@@ -470,11 +505,13 @@ export function resolveWalletSwapSourceAvailableRaw(
   evmExecutionMode: 'main' | 'private'
 ): string | undefined {
   if (source.family === 'solana' || source.family === 'near') {
-    // Missing privateRaw means the private account has no recorded balance.
-    // Show 0 instead of the combined public balance. A recorded amount still wins.
-    return evmExecutionMode === 'private'
-      ? (source.asset.balance.privateRaw ?? '0')
-      : source.asset.balance.availableRaw
+    // A recorded private amount wins. When the account also has a public raw
+    // balance, a missing private amount is zero rather than the combined total.
+    if (evmExecutionMode === 'private') {
+      if (source.asset.balance.privateRaw !== undefined) return source.asset.balance.privateRaw
+      if (source.asset.balance.mainRaw !== undefined) return '0'
+    }
+    return source.asset.balance.availableRaw
   }
   if (source.family !== 'evm') return source.asset.balance.availableRaw
   if (
@@ -547,8 +584,24 @@ export function filterConfidentialFundingSourceTokens(
   })
 }
 
+function hasNearIntentsSource(token: RheaSwapToken): boolean {
+  return (
+    token.sources?.some(source =>
+      ['nearintents', 'preswap-nearintents'].includes(source.toLowerCase())
+    ) ?? false
+  )
+}
+
+/** EVM and Zcash stay on the upstream catalog rule. NEAR, Solana, and Bitcoin join only on an Intents route. */
+function isWalletConfidentialDestinationToken(token: RheaSwapToken): boolean {
+  return (
+    isConfidentialSwapDestinationSupported(token) ||
+    (hasNearIntentsSource(token) && isPrivateSwapApiChain(String(token.rheaChainId)))
+  )
+}
+
 export function isConfidentialSwapDestinationSupported(token: RheaSwapToken): boolean {
-  return token.rheaChainId === 'zcash' || /^[1-9]\d*$/.test(token.rheaChainId)
+  return token.rheaChainId === 'zcash' || /^[1-9]\d*$/.test(String(token.rheaChainId))
 }
 
 export function filterSwapDestinationTokens(
@@ -568,7 +621,7 @@ export function isPrivateSwapDestinationSupported(
   mode: 'main' | 'private' = 'private',
   zcashAddresses?: Readonly<{ shielded: string; transparent: string }>
 ): boolean {
-  if (!portfolio || !isConfidentialSwapDestinationSupported(token)) return false
+  if (!portfolio || !isWalletConfidentialDestinationToken(token)) return false
   if (isZecToken(token)) return Boolean(zcashAddresses?.shielded && zcashAddresses.transparent)
   const target = resolveWalletQuoteReceiveTarget(token, portfolio, receiveTargets)
   if (target?.kind === 'near') {
@@ -680,7 +733,7 @@ export function resolveConfidentialFundingDestinationToken(input: {
   return (
     input.tokens.find(token => {
       if (String(token.rheaChainId) !== input.destinationChain) return false
-      if (!isConfidentialSwapDestinationSupported(token)) return false
+      if (!isWalletConfidentialDestinationToken(token)) return false
       const destination = resolveWalletOwnedQuoteAsset(token, portfolio, input.receiveTargets)
       if (!isConfidentialFundingWalletDestination(destination)) return false
       return input.destinationAsset

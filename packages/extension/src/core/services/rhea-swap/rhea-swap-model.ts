@@ -152,7 +152,10 @@ export function assertPrivateQuoteRoute(
       purpose !== 'public-cross-chain-send' &&
       ((!/^[1-9]\d*$/.test(request.fromChain) && !nonEvmFromChainAllowed) ||
         (purpose === 'private-swap'
-          ? request.confidentiality !== undefined
+          ? isDerivedQuoteAddressChain(request.fromChain) ||
+            isDerivedQuoteAddressChain(request.toChain)
+            ? request.confidentiality !== 'basic'
+            : request.confidentiality !== undefined
           : request.confidentiality !== 'basic')))
   ) {
     throw new Error('Private quote account changed. Get a new quote.')
@@ -315,8 +318,8 @@ export function assertPrivateQuoteRoute(
         ? request.tokenIn.address !== request.tokenOut.address
         : request.tokenIn.address.toLowerCase() !== request.tokenOut.address.toLowerCase()) ||
       !(nonEvmPrivateMove
-        ? source.addresses?.some(address => address.value === request.recipient)
-        : source.addresses?.some(
+        ? source?.addresses?.some(address => address.value === request.recipient)
+        : source?.addresses?.some(
             address => address.value.toLowerCase() === request.recipient?.toLowerCase()
           ))
     ) {
@@ -911,7 +914,9 @@ export function toRheaSwapToken(item: SwapTokenListItem): RheaSwapToken {
   const preliminaryAssetId = isNative
     ? (evmNativeAssetId ?? protocolNativeAssetId ?? chainScopedCatalogAssetId)
     : chainScopedCatalogAssetId
-  const canonicalQuoteAddress = RHEA_NATIVE_QUOTE_ADDRESSES.get(`${item.chain}:${preliminaryAssetId}`)
+  const canonicalQuoteAddress = RHEA_NATIVE_QUOTE_ADDRESSES.get(
+    `${item.chain}:${preliminaryAssetId}`
+  )
   const quoteAddress = canonicalQuoteAddress
     ? canonicalQuoteAddress
     : nativeQuoteAddress

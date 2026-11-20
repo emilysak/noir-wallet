@@ -4,9 +4,10 @@ import { expect } from '@playwright/test'
 
 test('maps every supported mainnet quote asset to its exact 1Click chain identity', () => {
   const { assets, mappings } = createMappings('mainnet')
-  expect(mappings).toHaveLength(20)
-  expect(new Set(mappings.map(mapping => mapping.assetId)).size).toBe(20)
-  expect(new Set(mappings.map(mapping => mapping.protocolAssetId)).size).toBe(20)
+  expect(mappings).toHaveLength(21)
+  expect(new Set(mappings.map(mapping => mapping.assetId)).size).toBe(21)
+  expect(new Set(mappings.map(mapping => mapping.protocolAssetId)).size).toBe(21)
+  expect(mappings.some(mapping => mapping.protocolAssetId === 'nep141:sol.omft.near')).toBe(true)
 
   const byAssetId = new Map(mappings.map(mapping => [mapping.assetId, mapping.protocolAssetId]))
   expect(byAssetId.get('eip155:1/slip44:60')).toBe('nep141:eth.omft.near')

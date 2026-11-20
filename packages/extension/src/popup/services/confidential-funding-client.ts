@@ -138,12 +138,6 @@ function isConfidentialReviewAddress(value: unknown): value is string {
   return parserAccepts(parseNearAccountId, value) || parserAccepts(parseSolanaPublicKey, value)
 }
 
-function sameConfidentialReviewAddress(left: string, right: string): boolean {
-  return /^0x/i.test(left) && /^0x/i.test(right)
-    ? left.toLowerCase() === right.toLowerCase()
-    : left === right
-}
-
 function unwrap(value: unknown): unknown {
   if (!isRecord(value)) throw new Error('Confidential funding returned an invalid response')
   if (typeof value.error === 'string') {

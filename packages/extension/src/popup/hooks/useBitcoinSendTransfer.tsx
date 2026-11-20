@@ -36,7 +36,6 @@ import {
 import { RecipientSelector } from '@/popup/components/transaction/RecipientSelector'
 import type { SendTransferViewState } from '@/popup/components/transaction/SendTransferView'
 import { DEFAULT_NETWORK_FEE_TIER, type NetworkFeeTier } from '@/core/transactions/domain'
-import { ExecutionAccountBadge } from '@/popup/components/account/ExecutionAccountSelector'
 import { useActiveAccountNetworks } from '@/popup/hooks/useActiveAccountNetworks'
 import { usePortfolioUpdates } from '@/popup/hooks/usePortfolioUpdates'
 import { useTransferFeePreview } from '@/popup/hooks/useTransferFeePreview'
@@ -65,7 +64,6 @@ interface PreparedReview {
 }
 
 export function useBitcoinSendTransfer({
-  selection,
   selection,
   executionMode = 'main',
   onSubmitted

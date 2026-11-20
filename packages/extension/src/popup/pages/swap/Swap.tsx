@@ -351,19 +351,6 @@ function moveSigningNetworkFeeRaw(review: PendingRheaSigningReview | null): stri
   return null
 }
 
-const swapWalletSourcesCache = new Map<string, SwapWalletSourcesSnapshot>()
-const MAX_SWAP_WALLET_SOURCE_SCOPES = 8
-
-function cacheSwapWalletSources(scope: string, snapshot: SwapWalletSourcesSnapshot): void {
-  swapWalletSourcesCache.delete(scope)
-  swapWalletSourcesCache.set(scope, snapshot)
-  while (swapWalletSourcesCache.size > MAX_SWAP_WALLET_SOURCE_SCOPES) {
-    const oldest = swapWalletSourcesCache.keys().next().value
-    if (oldest === undefined) break
-    swapWalletSourcesCache.delete(oldest)
-  }
-}
-
 export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-send' }) {
   const { goBack, navigate } = useNavigate()
   const location = useLocation()
@@ -6653,51 +6640,19 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
                           gasPriceWei:
                             preparedQuoteTransfer.review.review.summary.fields.gasPriceWei
                         }
-                        amount={sourceNetworkFee.amount}
-                        symbol={sourceNetworkFee.symbol}
-                        onTierChange={reviewLiveQuote}
-                        onSelectionChange={
-                          isPrivateFunding && walletOwnedSource.family === 'evm'
-                            ? async selection => {
-                                setEvmMoveFeeSelection(selection)
-                                await reviewLiveQuote(
-                                  selection.kind === 'tier' ? selection.tier : networkFeeTier,
-                                  false,
-                                  selection
-                                )
-                              }
-                            : undefined
-                        }
-                        customDefaults={
-                          preparedQuoteTransfer?.family === 'evm' &&
-                          preparedQuoteTransfer.review.review.summary.schema ===
-                            'evm.transaction.v1'
-                            ? {
-                                gasLimit:
-                                  preparedQuoteTransfer.review.review.summary.fields.gasLimit,
-                                maxFeePerGasWei:
-                                  preparedQuoteTransfer.review.review.summary.fields
-                                    .maxFeePerGasWei ?? '0',
-                                maxPriorityFeePerGasWei:
-                                  preparedQuoteTransfer.review.review.summary.fields
-                                    .maxPriorityFeePerGasWei ?? '0',
-                                gasPriceWei:
-                                  preparedQuoteTransfer.review.review.summary.fields.gasPriceWei
-                              }
-                            : undefined
-                        }
-                        disabled={isSending || isPreparingReview}
-                      />
-                    ) : (
-                      <AmountDisplay
-                        value={sourceNetworkFee.amount}
-                        symbol={sourceNetworkFee.symbol}
-                        profile="fee"
-                      />
-                    )
-                }
-              ]
-            : []),
+                      : undefined
+                  }
+                  disabled={isSending || isPreparingReview}
+                />
+              ) : (
+                <AmountDisplay
+                  value={sourceNetworkFee.amount}
+                  symbol={sourceNetworkFee.symbol}
+                  profile="fee"
+                />
+              )
+            ) : undefined
+          },
           ...(pendingRheaEvmAfterApproval
             ? [
                 {
@@ -7476,8 +7431,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           !ordinarySwapRequested &&
           privateSwapRequested &&
           (walletDestinationTarget?.kind === 'evm' ||
-                walletDestinationTarget?.kind === 'solana' ||
-                walletDestinationTarget?.kind === 'near')
+            walletDestinationTarget?.kind === 'solana' ||
+            walletDestinationTarget?.kind === 'near')
             ? () => setDestinationSelectorOpen(true)
             : undefined
         }
@@ -7809,8 +7764,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           privateAvailable={Boolean(swap.tokenOut && supportsPrivateDestination(swap.tokenOut))}
           mainAddress={
             walletDestinationTarget?.kind === 'evm' ||
-                walletDestinationTarget?.kind === 'solana' ||
-                walletDestinationTarget?.kind === 'near'
+            walletDestinationTarget?.kind === 'solana' ||
+            walletDestinationTarget?.kind === 'near'
               ? walletDestinationTarget.address
               : undefined
           }

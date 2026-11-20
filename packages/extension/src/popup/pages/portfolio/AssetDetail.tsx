@@ -346,8 +346,7 @@ export function AssetDetail() {
     searchParams.get('domain') === 'private' ||
     (searchParams.get('domain') !== 'public' && searchParams.get('mode') === 'private')
   const actionDomain =
-    privateDomainRequested &&
-    (privateExecutionChain ? privateMoveReady : chain?.chain.family !== 'evm' || privateTransferEligible)
+    privateDomainRequested && (privateExecutionChain ? privateMoveReady : true)
       ? 'private'
       : 'public'
   const showPrivateMove =

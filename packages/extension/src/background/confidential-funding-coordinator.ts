@@ -756,7 +756,8 @@ function confidentialSigningChainId(
   return parseChainId(getEvmNetworkConfig(network).chainId).id
 }
 
-function confidentialSignerFamily(chainId: string): 'evm' | 'near' | 'solana' {
+function confidentialSignerFamily(chainId: string | undefined): 'evm' | 'near' | 'solana' {
+  if (!chainId) return 'evm'
   const namespace = parseChainId(chainId).namespace
   if (namespace === 'near') return 'near'
   if (namespace === 'solana') return 'solana'
@@ -2113,12 +2114,28 @@ export class ConfidentialFundingCoordinator {
     }
   }
 
+  private async clusterDepositBindingForQuote(
+    input: ClusterFundingInput,
+    identity: ConfidentialSigningIdentity
+  ) {
+    const binding = clusterDepositBinding(input, identity)
+    if (!isBitcoinConfidentialChain(input.source.chainId) || input.sourceDomain === 'shield') {
+      return binding
+    }
+    const chainId = parseChainId(input.source.chainId).id
+    const bitcoin = await this.options.signer.resolveBitcoinFundingAddresses(chainId, identity)
+    return {
+      ...binding,
+      refundTo: bitcoinDomainAddress(input.sourceDomain, bitcoin)
+    }
+  }
+
   private async clusterDepositQuote(
     input: ClusterFundingInput,
     identity: ConfidentialSigningIdentity,
     mode: 'prefetch' | 'review'
   ): Promise<ConfidentialQuote> {
-    const binding = clusterDepositBinding(input, identity)
+    const binding = await this.clusterDepositBindingForQuote(input, identity)
     const referral = fundingReferral(input)
     const key = await fingerprintConfidentialValue({
       network: input.network,
@@ -2134,14 +2151,17 @@ export class ConfidentialFundingCoordinator {
     })
     const validate = (quote: ConfidentialQuote) => {
       assertConfidentialQuoteBinding(quote, binding, this.now())
-      const bitcoinSource = isBitcoinConfidentialChain(input.source.chainId)
-      if (
-        quote.quoteRequest.dry !== false ||
-        !quote.quote.depositAddress ||
-        (!bitcoinSource &&
-          (!isAddress(quote.quote.depositAddress) || /^0x0{40}$/i.test(quote.quote.depositAddress)))
-      )
+      const evmSource = input.source.chainId.startsWith('eip155:')
+      if (evmSource) {
+        if (
+          quote.quoteRequest.dry !== false ||
+          !isAddress(quote.quote.depositAddress) ||
+          /^0x0{40}$/i.test(quote.quote.depositAddress)
+        )
+          throw new Error('Confidential deposit quote has no destination')
+      } else if (!quote.quote.depositAddress) {
         throw new Error('Confidential deposit quote has no destination')
+      }
       return quote
     }
     const fetchQuote = () =>
@@ -3216,9 +3236,13 @@ export class ConfidentialFundingCoordinator {
               freshness: current.fresh ? ('fresh' as const) : ('stale' as const),
               updatedAt: current.updatedAt
             })
+      const storedPlans =
+        typeof this.options.store.listPlans === 'function'
+          ? await this.options.store.listPlans()
+          : []
       const reserved = holdings.assets.length
         ? this.reservedShieldBalances(
-            (await this.options.store.listPlans()).filter(
+            storedPlans.filter(
               plan =>
                 plan.network === this.options.network &&
                 plan.keyDomainId === model.scope.keyDomainId &&
@@ -3268,7 +3292,11 @@ export class ConfidentialFundingCoordinator {
         ) {
           await this.refreshPortfolioBalances(identity, session.accessToken).catch(() => null)
           next = await this.options.store
-            .getBalanceSnapshot(this.options.network, model.scope.keyDomainId, model.scope.accountId)
+            .getBalanceSnapshot(
+              this.options.network,
+              model.scope.keyDomainId,
+              model.scope.accountId
+            )
             .catch(() => snapshot)
         }
       }
@@ -3360,6 +3388,7 @@ export class ConfidentialFundingCoordinator {
     if (typeof list === 'function') {
       return list.call(this.options.store, this.options.network, keyDomainId, accountId)
     }
+    if (typeof this.options.store.getBalanceSnapshot !== 'function') return Object.freeze([])
     const snapshot = await this.options.store.getBalanceSnapshot(
       this.options.network,
       keyDomainId,
@@ -3391,27 +3420,6 @@ export class ConfidentialFundingCoordinator {
       groups.push(row.balances)
     }
     return mergeConfidentialSignerBalances(groups)
-  }
-
-  private async tryRefreshEvmBalances(
-    keyDomainId: string,
-    accountId: string
-  ): Promise<readonly ConfidentialBalance[] | null> {
-    const firstEvm = this.options.evmNetworks[0]
-    if (!firstEvm) return null
-    const session = await this.readUsableSessionForScope(keyDomainId, accountId)
-    if (!session) return null
-    const identity = await this.options.signer
-      .resolveIdentity(parseChainId(firstEvm.chainId).id)
-      .catch(() => null)
-    if (
-      !identity ||
-      keyDomainId !== identity.context.chainAccount.scope.keyDomainId ||
-      accountId !== identity.context.chainAccount.scope.accountId
-    ) {
-      return null
-    }
-    return this.refreshPortfolioBalances(identity, session.accessToken).catch(() => null)
   }
 
   private async refreshStoredSignerBalances(
@@ -3452,11 +3460,13 @@ export class ConfidentialFundingCoordinator {
     refreshed: ReadonlyMap<string, readonly ConfidentialBalance[]>
   ): Promise<Readonly<{ signerId: string; balances: readonly ConfidentialBalance[] }> | null> {
     if (this.options.network !== 'mainnet') return null
+    const nearChainId = getNearNetworkConfig('mainnet').chainId
     const near = await this.options.signer
-      .resolveIdentity(parseChainId(getNearNetworkConfig('mainnet').chainId).id)
+      .resolveIdentity(parseChainId(nearChainId).id)
       .catch(() => null)
     if (
       !near ||
+      near.context.chainAccount.scope.chainId !== nearChainId ||
       near.context.chainAccount.scope.keyDomainId !== scope.keyDomainId ||
       near.context.chainAccount.scope.accountId !== scope.accountId ||
       refreshed.has(near.address)

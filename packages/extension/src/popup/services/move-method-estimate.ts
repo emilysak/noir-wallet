@@ -21,6 +21,7 @@ export interface MoveMethodEstimate {
     readonly decimals: number
   }
   readonly time: string
+  readonly timeScope?: 'Network only' | 'Excl. scheduling'
 }
 
 const DIRECT_MAXIMUM_MINUTES = 5
