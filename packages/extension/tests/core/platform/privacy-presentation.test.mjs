@@ -14,12 +14,16 @@ import {
 import {
   getAssetDomainRaw,
   getAssetShieldProvider,
+  getDisplayedAssetTotalRaw,
   projectPortfolioForDomain,
   selectHomeActionSource,
   summarizeAssetDomainsUsd,
   summarizeKnownShieldFiat
 } from '../../../src/popup/services/asset-domains.ts'
-import { projectPortfolioForChains } from '../../../src/popup/services/portfolio-presentation.ts'
+import {
+  getPortfolioAssetDomainBalances,
+  projectPortfolioForChains
+} from '../../../src/popup/services/portfolio-presentation.ts'
 import {
   getNearConfidentialChainId,
   getNearConfidentialIconChain,
@@ -1142,6 +1146,21 @@ test('splits Solana native and token balances into public and private detail row
   expect(nativeCategories.raw).toMatchObject({ public: '10', shield: '0', private: '5' })
   expect(tokenCategories.domains).toEqual(['all', 'public', 'shield', 'private'])
   expect(tokenCategories.raw).toMatchObject({ public: '3', shield: '0', private: '5' })
+  const shieldedToken = {
+    ...token,
+    asset: { ...token.asset, namespace: 'token' },
+    balance: { ...token.balance, confidentialRaw: '4' }
+  }
+  expect(getAssetDomainRaw(shieldedToken, 'shield')).toBe('4')
+  expect(getDisplayedAssetTotalRaw(shieldedToken)).toBe('12')
+  expect(
+    getAssetDetailCategories(shieldedToken, { assets: [shieldedToken] }, true).raw
+  ).toMatchObject({
+    all: '12',
+    public: '3',
+    shield: '4',
+    private: '5'
+  })
 
   const emptyPrivate = {
     ...native,
@@ -1163,6 +1182,7 @@ test('projects NEAR main and PEA balances without folding Shield into private', 
   const chainId = 'near:mainnet'
   const asset = {
     asset: { id: `${chainId}/slip44:397`, chainId, kind: 'native' },
+    metadata: { decimals: 0, symbol: 'NEAR' },
     balance: {
       totalRaw: '14',
       mainRaw: '10',
@@ -1211,12 +1231,58 @@ test('projects NEAR main and PEA balances without folding Shield into private', 
   expect(selectHomeActionSource(model, 'private', 'send')?.asset.asset.id).toBe(asset.asset.id)
   expect(selectHomeActionSource(model, 'public', 'swap')?.asset.asset.id).toBe(asset.asset.id)
   expect(selectHomeActionSource(model, 'private', 'swap')?.asset.asset.id).toBe(asset.asset.id)
+  expect(getDisplayedAssetTotalRaw(asset)).toBe('21')
+  expect(getDisplayedAssetTotalRaw(testnet)).toBe('14')
+  expect(getDisplayedAssetTotalRaw(projectPortfolioForDomain(model, 'public').assets[0])).toBe('10')
+  expect(getDisplayedAssetTotalRaw(projectPortfolioForDomain(model, 'shield').assets[0])).toBe('7')
+  expect(getAssetDetailCategories(asset, model, true).domains).toEqual([
+    'all',
+    'public',
+    'shield',
+    'private'
+  ])
+  expect(getAssetDetailCategories(asset, model, true).raw).toEqual({
+    all: '21',
+    public: '10',
+    shield: '7',
+    private: '4'
+  })
+  expect(getAssetDetailCategories(testnet, { assets: [testnet] }, false).raw).toMatchObject({
+    all: '14',
+    shield: null
+  })
+  expect(
+    getPortfolioAssetDomainBalances([{ asset, chain }], 'all', null).map(row => [
+      row.domain,
+      row.amount
+    ])
+  ).toEqual([
+    ['public', '10'],
+    ['shield', '7'],
+    ['private', '4']
+  ])
+  const nearHolding = {
+    tokenId: 'near-shield',
+    protocolAssetId: 'nep141:wrap.near',
+    assetId: asset.asset.id,
+    chainId,
+    availableRaw: '7',
+    decimals: 0,
+    symbol: 'NEAR'
+  }
+  const withHolding = {
+    ...model,
+    confidential: { status: 'ready', assets: [nearHolding] }
+  }
+  expect(listStandaloneNearConfidentialHoldings(withHolding, withHolding, null)).toEqual([])
+  expect(resolveConfidentialDetailAssetId(withHolding, nearHolding.tokenId)).toBe(asset.asset.id)
 })
 
 test('includes Bitcoin in the private domain only when a PEA balance is available', () => {
   const chainId = 'bip122:000000000019d6689c085ae165831e93'
   const asset = {
     asset: { id: `${chainId}/slip44:0`, chainId, kind: 'native' },
+    metadata: { decimals: 0, symbol: 'BTC' },
     balance: {
       totalRaw: '22',
       mainRaw: '10',
@@ -1264,4 +1330,36 @@ test('includes Bitcoin in the private domain only when a PEA balance is availabl
   expect(getAssetDomainRaw(publicOnly, 'public')).toBe('10')
   expect(getAssetDomainRaw(publicOnly, 'private')).toBe('0')
   expect(getAssetDomainRaw(publicOnly, 'shield')).toBe('0')
+  expect(getDisplayedAssetTotalRaw(asset)).toBe('29')
+  expect(projectPortfolioForDomain(model, 'shield').assets[0].balance.totalRaw).toBe('7')
+  expect(getAssetDetailCategories(asset, model, true).raw).toEqual({
+    all: '29',
+    public: '10',
+    shield: '7',
+    private: '12'
+  })
+  expect(getAssetDetailCategories(asset, model, true).domains).toEqual([
+    'all',
+    'public',
+    'shield',
+    'private'
+  ])
+  expect(
+    getPortfolioAssetDomainBalances([{ asset, chain }], 'all', null).map(row => row.domain)
+  ).toEqual(['public', 'shield', 'private'])
+  const bitcoinHolding = {
+    tokenId: 'btc-shield',
+    protocolAssetId: 'nep141:btc.omft.near',
+    assetId: asset.asset.id,
+    chainId,
+    availableRaw: '7',
+    decimals: 0,
+    symbol: 'BTC'
+  }
+  const withHolding = {
+    ...model,
+    confidential: { status: 'ready', assets: [bitcoinHolding] }
+  }
+  expect(listStandaloneNearConfidentialHoldings(withHolding, withHolding, null)).toEqual([])
+  expect(resolveConfidentialDetailAssetId(withHolding, bitcoinHolding.tokenId)).toBe(asset.asset.id)
 })

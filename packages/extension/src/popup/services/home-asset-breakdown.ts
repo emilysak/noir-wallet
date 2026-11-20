@@ -1,10 +1,29 @@
 import type { PortfolioFiatSummary } from '@/popup/components/portfolio/portfolio-prices'
-import type { PortfolioReadModel } from '@/core/portfolio'
+import type { PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
 import type { AssetPriceReadModel } from '@/core/prices'
 import { buildAccountKey } from '@/core/wallet/account-scope'
 import type { AccountPortfolioValueSnapshot } from '@/core/wallet/account-portfolio-value'
 import { isPortfolioModelForScope } from './portfolio-cache'
 import { getAssetDomainRaw, summarizeAssetDomainsUsd, type AssetDomain } from './asset-domains'
+
+function nearConfidentialFamily(family: string): boolean {
+  return family === 'evm' || family === 'near' || family === 'solana' || family === 'bitcoin'
+}
+
+function splitBalanceFamily(family: string): boolean {
+  return family === 'zcash' || nearConfidentialFamily(family)
+}
+
+function separateBalanceFamily(family: string): boolean {
+  return family === 'near' || family === 'solana' || family === 'bitcoin'
+}
+
+function hasDomainBalance(chain: PortfolioChainView, domain: 'shield' | 'private'): boolean {
+  return chain.assets.some(asset => {
+    const raw = getAssetDomainRaw(asset, domain)
+    return raw !== null && BigInt(raw) > 0n
+  })
+}
 
 export type HomePortfolioTotalStatus = 'loading' | 'ready' | 'partial' | 'unavailable'
 
@@ -102,20 +121,13 @@ export function resolveHomeAssetDomainDisplay(input: {
       chains.some(
         chain =>
           (chain.chain.family === 'zcash' && chain.status === 'ready') ||
-          ((chain.chain.family === 'evm' || chain.chain.family === 'zcash') &&
-            chain.assets.some(asset => {
-              const raw = getAssetDomainRaw(asset, 'shield')
-              return raw !== null && BigInt(raw) > 0n
-            }))
+          (splitBalanceFamily(chain.chain.family) && hasDomainBalance(chain, 'shield'))
       ),
     private: chains.some(
       chain =>
-        chain.chain.family === 'evm' &&
-        (chain.status === 'ready' ||
-          chain.assets.some(asset => {
-            const raw = getAssetDomainRaw(asset, 'private')
-            return raw !== null && BigInt(raw) > 0n
-          }))
+        (chain.chain.family === 'evm' &&
+          (chain.status === 'ready' || hasDomainBalance(chain, 'private'))) ||
+        (separateBalanceFamily(chain.chain.family) && hasDomainBalance(chain, 'private'))
     )
   }
   const pending = {
@@ -123,17 +135,19 @@ export function resolveHomeAssetDomainDisplay(input: {
     shield:
       chains.some(
         chain =>
-          (chain.chain.family === 'zcash' || chain.chain.family === 'evm') &&
+          (chain.chain.family === 'zcash' || splitBalanceFamily(chain.chain.family)) &&
           (chain.status === 'loading' || chain.status === 'partial')
       ) ||
       (model?.confidential === undefined &&
         !input.settled &&
         chains.some(
-          chain => chain.chain.family === 'evm' && chain.chain.network.kind === 'mainnet'
+          chain =>
+            chain.chain.network?.kind === 'mainnet' && nearConfidentialFamily(chain.chain.family)
         )),
     private: chains.some(
       chain =>
-        chain.chain.family === 'evm' && (chain.status === 'loading' || chain.status === 'partial')
+        (chain.chain.family === 'evm' || separateBalanceFamily(chain.chain.family)) &&
+        (chain.status === 'loading' || chain.status === 'partial')
     )
   }
   const totals: Record<AssetDomain, string | null> = {

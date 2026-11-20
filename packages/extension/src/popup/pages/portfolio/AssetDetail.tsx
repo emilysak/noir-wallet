@@ -314,7 +314,9 @@ export function AssetDetail() {
             ? solanaPrivateEligible
             : chain?.chain.family === 'bitcoin'
               ? bitcoinPrivateReady
-              : privateTransferEligible,
+              : chain?.chain.family === 'near'
+                ? nearPrivateSwapReady
+                : privateTransferEligible,
           findAssetPrice(displayPrices, asset.asset.id)?.priceUsd
         )
       : null
@@ -349,8 +351,7 @@ export function AssetDetail() {
     privateDomainRequested && (privateExecutionChain ? privateMoveReady : true)
       ? 'private'
       : 'public'
-  const showPrivateMove =
-    actionDomain === 'private' && privateExecutionChain && chain?.chain.family !== 'bitcoin'
+  const showPrivateMove = actionDomain === 'private' && privateExecutionChain
   const activityFilterDomain = searchParams.get('history') === 'shield' ? 'shield' : undefined
   useEffect(() => {
     if (!refreshConfidentialBalances || !effectiveWalletId || !effectiveAccountId) return
@@ -541,7 +542,8 @@ export function AssetDetail() {
     if (
       (chain.chain.family === 'evm' ||
         chain.chain.family === 'solana' ||
-        chain.chain.family === 'near') &&
+        chain.chain.family === 'near' ||
+        chain.chain.family === 'bitcoin') &&
       domain === 'private'
     ) {
       handleMove(domain)
@@ -666,7 +668,11 @@ export function AssetDetail() {
                 )
             }
           ]
-        : chain?.chain.family === 'evm'
+        : chain?.chain.family === 'evm' ||
+            ((chain?.chain.family === 'solana' ||
+              chain?.chain.family === 'near' ||
+              chain?.chain.family === 'bitcoin') &&
+              currentNetwork === 'mainnet')
           ? [
               {
                 action: 'move' as const,
@@ -1158,7 +1164,10 @@ export function AssetDetail() {
           )}
         </div>
 
-        {(chain.chain.family === 'evm' || chain.chain.family === 'solana') && (
+        {(chain.chain.family === 'evm' ||
+          chain.chain.family === 'solana' ||
+          chain.chain.family === 'near' ||
+          chain.chain.family === 'bitcoin') && (
           <section className="py-2" aria-label="Account balances">
             {categories?.domains
               .filter(

@@ -1,5 +1,6 @@
 import { getNearNetworkConfigs } from '@/config/networks'
 import { createAssetId, parseChainId } from '@/core/chains/registry'
+import { PORTFOLIO_READ_LIMITS } from '@/core/portfolio'
 
 import type { NearReadRpc } from './near-rpc-types'
 import { readNearAccountId } from './near-rpc-codecs'
@@ -8,7 +9,8 @@ import type {
   NearIndexedFungibleTokenBalance
 } from './near-fastnear-client'
 
-const MAXIMUM_TOKEN_DEFINITIONS = 64
+const MAXIMUM_TOKEN_DEFINITIONS = PORTFOLIO_READ_LIMITS.balancesPerSource
+const MAXIMUM_RPC_TOKEN_READS = 64
 const MAXIMUM_CONCURRENT_TOKEN_READS = 4
 
 export interface NearFungibleTokenDefinition {
@@ -48,6 +50,7 @@ export interface ReadNearBalancesInput {
   readonly chainId: string
   readonly accountId: string
   readonly trustedTokens?: readonly NearFungibleTokenDefinition[]
+  readonly catalogByContract?: ReadonlyMap<string, NearFungibleTokenDefinition>
   readonly rpc: Pick<
     NearReadRpc,
     'assertExpectedChain' | 'getAccount' | 'getFinalBlock' | 'getFungibleTokenBalance'
@@ -126,6 +129,18 @@ function nearContractAssetReference(contractId: string): string {
   return contractId.replace(/_/g, '%5F')
 }
 
+// A missing FastNear row is a reported zero for tracked tokens. Only a missing
+// inventory, or a tracked row with no usable amount, needs ft_balance_of. The
+// RPC cap applies to that tracked set. Catalog rows are included only when the
+// index already reports a positive balance.
+function hasUsableIndexedBalance(
+  indexedTokenBalances: ReadonlyMap<string, NearIndexedFungibleTokenBalance> | null,
+  contractId: string
+): boolean {
+  if (!indexedTokenBalances) return false
+  return indexedTokenBalances.get(contractId)?.amountRaw !== null
+}
+
 async function mapWithConcurrency<T, R>(
   values: readonly T[],
   mapper: (value: T) => Promise<R>
@@ -190,33 +205,16 @@ export async function readNearBalances(
   if (native.blockHash.length === 0) {
     throw new Error('NEAR missing-account projection requires a final block')
   }
-  const tokens = await mapWithConcurrency(
-    account === null ? [] : tokenDefinitions,
-    async definition => {
-      const indexedBalance = indexedTokenBalances?.get(definition.contractId)
-      if (indexedTokenBalances && indexedBalance?.amountRaw !== null) {
-        return Object.freeze({
-          assetId: createAssetId(
-            parsedChainId.id,
-            'nep141',
-            nearContractAssetReference(definition.contractId)
-          ),
-          contractId: definition.contractId,
-          symbol: definition.symbol,
-          decimals: definition.decimals,
-          amountRaw: indexedBalance?.amountRaw ?? '0',
-          blockHash: native.blockHash,
-          blockHeight: indexedBalance?.lastUpdateBlockHeight ?? native.blockHeight
-        })
-      }
-      const balance = await input.rpc.getFungibleTokenBalance(
-        definition.contractId,
-        accountId,
-        input.signal
-      )
-      if (balance.contractId !== definition.contractId || balance.accountId !== accountId) {
-        throw new Error('NEAR fungible token response identity mismatch')
-      }
+  const readableDefinitions = account === null ? [] : tokenDefinitions
+  const rpcReadCount = readableDefinitions.filter(
+    definition => !hasUsableIndexedBalance(indexedTokenBalances, definition.contractId)
+  ).length
+  if (rpcReadCount > MAXIMUM_RPC_TOKEN_READS) {
+    throw new Error('NEAR fungible token list exceeds the supported limit')
+  }
+  const tokens = await mapWithConcurrency(readableDefinitions, async definition => {
+    const indexedBalance = indexedTokenBalances?.get(definition.contractId)
+    if (hasUsableIndexedBalance(indexedTokenBalances, definition.contractId)) {
       return Object.freeze({
         assetId: createAssetId(
           parsedChainId.id,
@@ -226,12 +224,57 @@ export async function readNearBalances(
         contractId: definition.contractId,
         symbol: definition.symbol,
         decimals: definition.decimals,
-        amountRaw: balance.amountRaw,
-        blockHash: balance.blockHash,
-        blockHeight: balance.blockHeight
+        amountRaw: indexedBalance?.amountRaw ?? '0',
+        blockHash: native.blockHash,
+        blockHeight: indexedBalance?.lastUpdateBlockHeight ?? native.blockHeight
       })
     }
-  )
+    const balance = await input.rpc.getFungibleTokenBalance(
+      definition.contractId,
+      accountId,
+      input.signal
+    )
+    if (balance.contractId !== definition.contractId || balance.accountId !== accountId) {
+      throw new Error('NEAR fungible token response identity mismatch')
+    }
+    return Object.freeze({
+      assetId: createAssetId(
+        parsedChainId.id,
+        'nep141',
+        nearContractAssetReference(definition.contractId)
+      ),
+      contractId: definition.contractId,
+      symbol: definition.symbol,
+      decimals: definition.decimals,
+      amountRaw: balance.amountRaw,
+      blockHash: balance.blockHash,
+      blockHeight: balance.blockHeight
+    })
+  })
+  const indexedCatalogTokens =
+    account === null || !indexedTokenBalances || !input.catalogByContract
+      ? []
+      : [...indexedTokenBalances].flatMap(([contractId, indexed]) => {
+          if (indexed.amountRaw === null || indexed.amountRaw === '0') return []
+          if (tokens.some(token => token.contractId === contractId)) return []
+          const definition = input.catalogByContract?.get(contractId)
+          if (!definition) return []
+          return [
+            Object.freeze({
+              assetId: createAssetId(
+                parsedChainId.id,
+                'nep141',
+                nearContractAssetReference(contractId)
+              ),
+              contractId,
+              symbol: definition.symbol,
+              decimals: definition.decimals,
+              amountRaw: indexed.amountRaw,
+              blockHash: native.blockHash,
+              blockHeight: indexed.lastUpdateBlockHeight ?? native.blockHeight
+            })
+          ]
+        })
   const updatedAt = (input.now ?? Date.now)()
   if (!Number.isSafeInteger(updatedAt) || updatedAt < 0) {
     throw new Error('Invalid NEAR balance timestamp')
@@ -248,7 +291,9 @@ export async function readNearBalances(
       blockHeight: native.blockHeight
     }),
     tokens: Object.freeze(
-      [...tokens].sort((left, right) => left.assetId.localeCompare(right.assetId))
+      [...tokens, ...indexedCatalogTokens].sort((left, right) =>
+        left.assetId.localeCompare(right.assetId)
+      )
     ),
     updatedAt
   })

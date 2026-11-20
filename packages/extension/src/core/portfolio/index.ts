@@ -14,6 +14,12 @@ export {
   type TokenDisplayPolicy
 } from './portfolio-visibility'
 export {
+  portfolioProtocolDefinitionId,
+  selectManagedProtocolAssetIds,
+  selectPortfolioProtocolDefinitions,
+  selectPricedProtocolMappings
+} from './portfolio-protocol-assets'
+export {
   parsePortfolioBalanceSnapshot,
   parsePortfolioSourceState,
   type PortfolioSourceState

@@ -1,4 +1,5 @@
-import type { PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
+import type { PortfolioAssetView, PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
+import { BITCOIN_CHAIN_IDS } from '@/core/chains/registry/chain-ids'
 import {
   createAssetRegistry,
   createInitialProductChainRegistry,
@@ -133,11 +134,32 @@ export function resolveConfidentialDetailAssetId(
   }
   const asset = model.assets.find(item => item.asset.id === holding.assetId)
   return asset &&
-    asset.asset.chainId.startsWith('eip155:') &&
+    isConfidentialDetailChain(asset) &&
     holding.chainId === asset.asset.chainId &&
     holding.decimals === asset.metadata.decimals
     ? asset.asset.id
     : null
+}
+
+function isConfidentialDetailChain(asset: PortfolioAssetView): boolean {
+  const chainId = asset.asset.chainId
+  if (
+    chainId.startsWith('eip155:') ||
+    chainId.startsWith('near:') ||
+    chainId.startsWith('solana:')
+  ) {
+    return true
+  }
+  return (
+    (chainId === BITCOIN_CHAIN_IDS.mainnet || chainId === BITCOIN_CHAIN_IDS.testnet) &&
+    asset.asset.id === `${chainId}/slip44:0`
+  )
+}
+
+function mergedConfidentialRaw(asset: PortfolioAssetView): string | null {
+  const raw = asset.balance.confidentialRaw
+  if (!raw || BigInt(raw) === 0n || !isConfidentialDetailChain(asset)) return null
+  return raw
 }
 
 export function getNearConfidentialChainId(asset: ConfidentialAsset): string | null {
@@ -166,12 +188,14 @@ export function listStandaloneNearConfidentialHoldings(
   sourceModel: PortfolioReadModel,
   prices: AssetPriceReadModel | null
 ): readonly StandaloneNearConfidentialHolding[] {
+  const displayedIds = new Set(displayedModel.assets.map(asset => asset.asset.id))
+  const limitToDisplayed = displayedModel !== sourceModel
   const mergedAssets = new Map<string, string>(
-    displayedModel.assets.flatMap(asset =>
-      asset.asset.chainId.startsWith('eip155:') && BigInt(asset.balance.confidentialRaw ?? '0') > 0n
-        ? [[asset.asset.id, asset.balance.confidentialRaw ?? '0'] as const]
-        : []
-    )
+    sourceModel.assets.flatMap(asset => {
+      if (limitToDisplayed && !displayedIds.has(asset.asset.id)) return []
+      const raw = mergedConfidentialRaw(asset)
+      return raw ? [[asset.asset.id, raw] as const] : []
+    })
   )
   const chains = new Map<string, PortfolioChainView>(
     sourceModel.chains.map(chain => [chain.chain.id, chain])

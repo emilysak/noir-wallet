@@ -31,7 +31,7 @@ import {
   type PortfolioAssetGroup,
   type PortfolioAssetGroupEntry
 } from '@/popup/services/portfolio-presentation'
-import type { AssetDomain } from '@/popup/services/asset-domains'
+import { getDisplayedAssetTotalRaw, type AssetDomain } from '@/popup/services/asset-domains'
 import type { NearConfidentialZecRow } from '@/popup/services/near-confidential-holdings'
 import { ZcashFundingBadge } from '@/popup/components/account/ZcashFundingBadge'
 import { Tooltip } from '@/popup/components/ui/tooltip'
@@ -110,7 +110,9 @@ function portfolioTokenIconProps(
 }
 
 function assetAmount(asset: PortfolioAssetView): Big {
-  return new Big(formatBaseUnitDecimalAmount(asset.balance.totalRaw, asset.metadata.decimals))
+  return new Big(
+    formatBaseUnitDecimalAmount(getDisplayedAssetTotalRaw(asset), asset.metadata.decimals)
+  )
 }
 
 function assetPendingAmount(asset: PortfolioAssetView): Big {

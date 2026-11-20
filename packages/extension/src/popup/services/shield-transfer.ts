@@ -1,6 +1,6 @@
 import type { PortfolioAssetView, PortfolioChainView, PortfolioReadModel } from '@/core/portfolio'
 import type { IntentsManagedAsset } from '@/core/services/intents-managed-assets'
-import type { SwapToken } from '@/core/services/intents-api'
+import { resolveSwapTokenIconUrl, type SwapToken } from '@/core/services/intents-api'
 import { isDeprecatedIntentsToken } from '@/core/services/intents-evm-assets'
 import { resolveIntentsWalletAsset } from '@/core/services/intents-wallet-assets'
 import { parseSupportedBitcoinAddress } from '@/core/chains/bitcoin'
@@ -104,7 +104,15 @@ function fundingAssetView(
     return null
   const publicAsset = model.assets.find(asset => asset.asset.id === managed.assetId)
   if (publicAsset) {
-    return publicAsset.metadata.decimals === managed.decimals ? publicAsset : null
+    if (publicAsset.metadata.decimals !== managed.decimals) return null
+    if (publicAsset.metadata.iconUrl || !managed.iconUrl) return publicAsset
+    return Object.freeze({
+      ...publicAsset,
+      metadata: Object.freeze({
+        ...publicAsset.metadata,
+        iconUrl: managed.iconUrl
+      })
+    })
   }
   const zero = '0'
   const confidentialRaw = holding?.availableRaw ?? zero
@@ -203,6 +211,7 @@ export function listShieldFundingAssets(
       ? catalogTokens.flatMap(token => {
           const descriptor = resolveIntentsWalletAsset(token, network)
           if (!descriptor) return []
+          const iconUrl = resolveSwapTokenIconUrl(token)
           return [
             {
               assetId: descriptor.assetId,
@@ -210,7 +219,8 @@ export function listShieldFundingAssets(
               protocolAssetId: token.assetId,
               blockchain: token.blockchain,
               symbol: token.symbol,
-              decimals: token.decimals
+              decimals: token.decimals,
+              ...(iconUrl ? { iconUrl } : {})
             }
           ]
         })
@@ -804,4 +814,14 @@ export function buildShieldTransferRequest(
       : { feeSelection: input.feeSelection }),
     ...(input.dedupKey ? { dedupKey: input.dedupKey } : {})
   })
+}
+
+/** Cluster gas is an EVM estimate. Other chains must not send that fee selection. */
+export function clusterNetworkFeeRequest<Request extends object>(
+  family: string,
+  request: Request,
+  feeSelection: EvmFeeSelection
+): (Request & { readonly feeSelection: EvmFeeSelection }) | null {
+  if (family !== 'evm') return null
+  return Object.freeze({ ...request, feeSelection })
 }

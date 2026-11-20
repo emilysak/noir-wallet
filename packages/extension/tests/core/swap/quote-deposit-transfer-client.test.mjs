@@ -21,6 +21,7 @@ import {
   isPrivateSwapDestinationSupported,
   resolveConfidentialFundingDestinationToken,
   resolveLockedWalletSwapSourceToken,
+  resolveSameChainConfidentialDestination,
   resolveSwapReviewAction
 } from '../../../src/popup/services/swap-page-model.ts'
 
@@ -465,6 +466,46 @@ test.describe('quote deposit transfer client', () => {
       assetId: NEAR_ASSET_ID
     })
     expect(funding({ ...sol, sources: undefined }, 'solana', solanaAssetId)).toBeNull()
+  })
+
+  test('resolves a same-chain confidential destination on the Intents route', () => {
+    const near = {
+      ...token('nep141:wrap.near', 'near', 24),
+      rheaChainId: 'near',
+      rheaAddress: 'wrap.near',
+      isNative: true,
+      sources: ['nearintents']
+    }
+    const sol = {
+      ...token('nep141:sol.omft.near', 'sol', 9),
+      rheaChainId: 'solana',
+      rheaAddress: 'sol',
+      isNative: true,
+      sources: ['preswap-nearintents']
+    }
+    const btc = {
+      ...token('nep141:btc.omft.near', 'btc', 8),
+      rheaChainId: 'btc',
+      rheaAddress: 'btc',
+      isNative: true,
+      sources: ['nearintents']
+    }
+    const evm = {
+      ...token('nep141:eth.omft.near', 'eth', 18),
+      rheaChainId: '1',
+      rheaAddress: 'eth',
+      isNative: true,
+      sources: []
+    }
+    expect(resolveSameChainConfidentialDestination([near], near)).toBe(near)
+    expect(resolveSameChainConfidentialDestination([sol], sol)).toBe(sol)
+    expect(resolveSameChainConfidentialDestination([btc], btc)).toBe(btc)
+    expect(resolveSameChainConfidentialDestination([evm], evm)).toBe(evm)
+    expect(resolveSameChainConfidentialDestination([{ ...near, sources: [] }], near)).toBeUndefined()
+    expect(
+      resolveSameChainConfidentialDestination([{ ...near, sources: ['lifi'] }], near)
+    ).toBeUndefined()
+    expect(resolveSameChainConfidentialDestination([sol], near)).toBeUndefined()
   })
 
   test('binds a NEAR private move to a distinct private execution account', () => {

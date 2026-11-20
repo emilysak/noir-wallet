@@ -18,6 +18,21 @@ import {
 import { WNEAR_NEAR_ASSET } from '@/config/intents'
 import { getEvmNetworkConfigs } from '@/config/networks'
 
+const FULL_SWAP_CATALOG_NETWORKS = new Set(['near', 'sol', 'btc'])
+
+/** NEAR, Solana, and Bitcoin tabs list the chain catalog before the user searches. */
+export function usesFullSwapCatalogNetwork(network: string): boolean {
+  return FULL_SWAP_CATALOG_NETWORKS.has(network)
+}
+
+export function selectUnsearchedSwapCatalog<T>(input: {
+  readonly network: string
+  readonly tokens: readonly T[]
+  readonly defaultTokens: readonly T[]
+}): readonly T[] {
+  return usesFullSwapCatalogNetwork(input.network) ? input.tokens : input.defaultTokens
+}
+
 export function getSwapCatalogDisplaySeeds(chainIds: readonly number[]): readonly RheaSwapToken[] {
   const supported = new Set(chainIds)
   const seed = (

@@ -69,6 +69,7 @@ export async function refreshPortfolioFromCache(
     }
     return refreshed
   } catch (error) {
+    console.log('refreshPortfolioFromCache error: %o', error)
     if (scopedCached && options.allowStaleOnError !== false) return scopedCached
     throw error
   }

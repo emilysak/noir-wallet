@@ -3,7 +3,11 @@ import { expect } from '@playwright/test'
 import { normalizeQuote, serializeQuoteRequest } from '@rhea-finance/cross-chain-aggregation-dex'
 import { getNearNetworkConfig, getSolanaNetworkConfig } from '../../../src/config/networks.ts'
 import { listShieldFundingAssets } from '../../../src/popup/services/shield-transfer.ts'
-import { getBitcoinChainId, getZcashChainId } from '../../../src/core/chains/registry/index.ts'
+import {
+  createInitialProductChainRegistry,
+  getBitcoinChainId,
+  getZcashChainId
+} from '../../../src/core/chains/registry/index.ts'
 import { parseTrustedExtensionRuntimeMessage } from '../../../src/lib/runtime-message-security.ts'
 import { readRheaDestinationHash } from '../../../src/core/services/rhea-swap/rhea-order-status.ts'
 import {
@@ -1134,6 +1138,72 @@ test('Private Swap accepts Bitcoin only at this account private execution addres
       account
     )
   ).not.toThrow()
+})
+
+test('lists a Solana Shield token icon from the catalog and a held row', () => {
+  const chain = createInitialProductChainRegistry('mainnet').resolve(
+    getSolanaNetworkConfig('mainnet').chainId
+  )
+  const mint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+  const assetId = `${chain.id}/token:${mint}`
+  const catalogIcon = 'https://example.com/sol-usdc.png'
+  const heldIcon = 'https://example.com/sol-usdc-coingecko.png'
+  const listed = token =>
+    listShieldFundingAssets(
+      {
+        chains: [{ chain, status: 'ready', assets: [], errorCodes: [] }],
+        assets: [],
+        confidential: { status: 'ready', assets: [] }
+      },
+      [],
+      [token],
+      'mainnet'
+    )
+  expect(
+    listed({
+      assetId: 'nep141:sol-usdc.omft.near',
+      blockchain: 'sol',
+      contractAddress: mint,
+      symbol: 'USDC',
+      decimals: 6,
+      icon: catalogIcon
+    }).map(item => item.asset.metadata.iconUrl)
+  ).toEqual([catalogIcon])
+  const publicAsset = {
+    asset: { id: assetId, chainId: chain.id, namespace: 'token', reference: mint, kind: 'token' },
+    metadata: { name: 'USDC', symbol: 'USDC', decimals: 6 },
+    source: 'protocol',
+    balance: {
+      totalRaw: '1',
+      spendableRaw: '1',
+      availableRaw: '1',
+      pendingRaw: '0'
+    },
+    chainAccountIds: [],
+    freshness: 'fresh',
+    updatedAt: 0
+  }
+  const held = listShieldFundingAssets(
+    {
+      chains: [{ chain, status: 'ready', assets: [], errorCodes: [] }],
+      assets: [publicAsset],
+      confidential: { status: 'ready', assets: [] }
+    },
+    [],
+    [
+      {
+        assetId: 'nep141:sol-usdc.omft.near',
+        blockchain: 'sol',
+        contractAddress: mint,
+        symbol: 'USDC',
+        decimals: 6,
+        coingeckoIcon: heldIcon
+      }
+    ],
+    'mainnet'
+  )
+  expect(held.map(item => item.asset.metadata.iconUrl)).toEqual([heldIcon])
+  expect(publicAsset.metadata.iconUrl).toBeUndefined()
 })
 
 test('lists Shield BTC only on mainnet when the protocol asset is mapped', () => {

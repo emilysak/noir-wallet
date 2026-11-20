@@ -3,6 +3,10 @@ import {
   confidentialFundingClient,
   type ConfidentialBalanceErrorCode
 } from '@/popup/services/confidential-funding-client'
+import {
+  nextShieldSessionProbe,
+  shouldProbeShieldSession
+} from '@/popup/services/shield-session-check'
 import { usePortfolioSnapshot } from './usePortfolioSnapshot'
 import type { Network } from '@/types/wallet'
 
@@ -32,6 +36,12 @@ export function useShieldBalances({
   const [error, setError] = useState<string | null>(null)
   const [errorCode, setErrorCode] = useState<ConfidentialBalanceErrorCode | null>(null)
   const [autoRecoveringKey, setAutoRecoveringKey] = useState<string | null>(null)
+  const [sessionReadyKey, setSessionReadyKey] = useState<string | null>(null)
+  const [trackedScope, setTrackedScope] = useState(scopeKey)
+  if (trackedScope !== scopeKey) {
+    setTrackedScope(scopeKey)
+    setSessionReadyKey(null)
+  }
   const currentKey = useRef(scopeKey)
   const currentActive = useRef(active && enabled)
   const autoAttemptedKey = useRef<string | null>(null)
@@ -60,7 +70,9 @@ export function useShieldBalances({
       })) ?? null,
     [freshAssets]
   )
-  const autoRecovering = active && enabled && autoRecoveringKey === scopeKey && !balances
+  const sessionChecking = active && enabled && autoRecoveringKey === scopeKey
+  const needsSessionCheck = active && enabled && authorizeOnMount
+  const sessionReady = !needsSessionCheck || sessionReadyKey === scopeKey
 
   useEffect(() => {
     setConnecting(false)
@@ -107,6 +119,7 @@ export function useShieldBalances({
           if (latest?.confidential?.freshness !== 'fresh') {
             throw new Error('Shield balance unavailable')
           }
+          if (currentKey.current === requestKey) setSessionReadyKey(requestKey)
           return true
         } catch (cause) {
           const code =
@@ -145,15 +158,24 @@ export function useShieldBalances({
     ]
   )
 
+  const refreshBalancesRef = useRef(refreshBalances)
+  refreshBalancesRef.current = refreshBalances
+  const scopeRef = useRef(scope)
+  scopeRef.current = scope
+  const hasFreshBalancesRef = useRef(false)
+  hasFreshBalancesRef.current = Boolean(balances)
+
   useEffect(() => {
     if (
-      !active ||
-      !enabled ||
-      !scope ||
-      !authorizeOnMount ||
-      !settled ||
-      balances ||
-      autoAttemptedKey.current === scopeKey
+      !scopeRef.current ||
+      !shouldProbeShieldSession({
+        active,
+        enabled,
+        settled,
+        authorizeOnMount,
+        hasFreshBalances: hasFreshBalancesRef.current,
+        attempted: autoAttemptedKey.current === scopeKey
+      })
     )
       return
     autoAttemptedKey.current = scopeKey
@@ -168,12 +190,27 @@ export function useShieldBalances({
       if (cancelAutoRecovery.current === stop) cancelAutoRecovery.current = null
       setAutoRecoveringKey(current => (current === scopeKey ? null : current))
     }
+    const finish = () => {
+      if (currentKey.current === scopeKey) setSessionReadyKey(scopeKey)
+      stop()
+    }
     cancelAutoRecovery.current = stop
     const attempt = async (authorize: boolean) => {
-      const success = await refreshBalances(false, authorize, true, true)
+      // force refreshes even when the portfolio snapshot is already fresh.
+      const success = await refreshBalancesRef.current(true, authorize, true, true)
       if (cancelled) return
-      if (success || lastErrorCode.current !== 'balance_unavailable' || retries >= 3) {
-        stop()
+      const step = nextShieldSessionProbe({
+        ok: success,
+        authorize,
+        errorCode: lastErrorCode.current,
+        retries
+      })
+      if (step === 'done' || step === 'stop') {
+        finish()
+        return
+      }
+      if (step === 'authorize') {
+        await attempt(true)
         return
       }
       retries += 1
@@ -189,18 +226,22 @@ export function useShieldBalances({
       if (cancelled) return
       started = true
       setAutoRecoveringKey(scopeKey)
-      void attempt(true)
+      void attempt(false)
     })
     return stop
-  }, [active, enabled, authorizeOnMount, settled, Boolean(balances), scopeKey, refreshBalances])
+  }, [active, enabled, authorizeOnMount, settled, scopeKey])
+
+  const readBalanceErrorCode = useCallback(() => lastErrorCode.current, [])
 
   return {
     balances,
     spendableBalances,
     settled,
-    connecting: connecting || autoRecovering,
-    error: autoRecovering ? null : error,
-    errorCode: autoRecovering ? null : errorCode,
+    sessionReady,
+    connecting: connecting || sessionChecking,
+    error: sessionChecking ? null : error,
+    errorCode: sessionChecking ? null : errorCode,
+    readBalanceErrorCode,
     refreshBalances
   }
 }

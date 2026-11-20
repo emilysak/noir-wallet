@@ -17,8 +17,11 @@ import {
 } from '../../../src/infrastructure/prices/index.ts'
 import {
   BackgroundAssetPriceService,
+  createBackgroundAssetMarketHistoryService,
+  createBackgroundAssetPriceService,
   mergeAssetMarketChanges
 } from '../../../src/background/asset-prices.ts'
+import { selectPricedProtocolMappings } from '../../../src/core/portfolio/portfolio-protocol-assets.ts'
 import { createIntentsWalletAssetCatalog } from '../../../src/core/services/intents-wallet-assets.ts'
 import {
   hasRetryablePortfolioPriceGap,
@@ -854,4 +857,62 @@ test('portfolio fiat summary excludes non-zero assets with missing prices', () =
     metadata: { name: 'Custom Token', symbol: 'CUSTOM', decimals: 18 }
   }
   expect(hasRetryablePortfolioPriceGap({ assets: [customAsset] }, prices)).toBe(false)
+})
+
+test('installs price services for a catalog larger than the mapping bound', () => {
+  const previousFlags = globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__
+  globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__ = [
+    'chain.zcash',
+    'chain.evm',
+    'chain.bitcoin',
+    'chain.solana',
+    'chain.near'
+  ]
+  try {
+    const chainId = 'near:mainnet'
+    const definitions = []
+    const mappings = []
+    for (let index = 0; index < 4_089; index += 1) {
+      const reference = `t${index}.near`
+      definitions.push(
+        Object.freeze({
+          chainId,
+          namespace: 'nep141',
+          reference,
+          kind: 'token',
+          metadata: { name: `Token ${index}`, symbol: 'TOK', decimals: 24 },
+          source: 'protocol',
+          verification: 'trusted'
+        })
+      )
+      mappings.push(
+        Object.freeze({
+          assetId: `${chainId}/nep141:${reference}`,
+          marketAssetId: `tok${index}`,
+          sourceAssetId: `nep141:${reference}`
+        })
+      )
+    }
+    expect(() => createBackgroundAssetPriceService([], definitions, mappings)).toThrow(
+      'Asset price service requires bounded source mappings'
+    )
+    expect(() => createBackgroundAssetMarketHistoryService([], definitions, mappings)).toThrow(
+      'Market history service requires bounded source mappings'
+    )
+
+    const visibleAssetId = mappings[9].assetId
+    const heldAssetId = mappings[3].assetId
+    const priced = selectPricedProtocolMappings({
+      mappings,
+      visibleAssetIds: new Set([visibleAssetId]),
+      heldAssetIds: new Set([heldAssetId]),
+      maximum: 2_048
+    })
+    expect(priced.map(mapping => mapping.assetId)).toEqual([visibleAssetId, heldAssetId])
+    expect(() => createBackgroundAssetPriceService([], definitions, priced)).not.toThrow()
+    expect(() => createBackgroundAssetMarketHistoryService([], definitions, priced)).not.toThrow()
+  } finally {
+    if (previousFlags === undefined) delete globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__
+    else globalThis.__ENABLED_CHAIN_FEATURE_FLAGS__ = previousFlags
+  }
 })

@@ -27,7 +27,31 @@ function hasMainnetConfidentialProtocol(asset: PortfolioAssetView): boolean {
   if (asset.asset.chainId === NEAR_MAINNET_CHAIN_ID) {
     return asset.asset.kind === 'native' || asset.asset.namespace === 'nep141'
   }
-  return asset.asset.chainId === SOLANA_MAINNET_CHAIN_ID && asset.asset.kind === 'native'
+  // Any mapped mainnet Solana asset can hold NEAR Confidential, including SPL tokens.
+  return (
+    asset.asset.chainId === SOLANA_MAINNET_CHAIN_ID &&
+    (asset.asset.kind === 'native' || asset.balance.confidentialRaw !== undefined)
+  )
+}
+
+// NEAR, Solana, and Bitcoin keep Shield beside the on-chain total. Add it for display only
+// while totalRaw is still that on-chain sum. Domain projections replace totalRaw and clear
+// confidentialRaw so Public and Private rows do not pick the protocol balance up again.
+export function getDisplayedAssetTotalRaw(asset: PortfolioAssetView): string {
+  const confidential = asset.balance.confidentialRaw
+  if (!confidential || confidential === '0') return asset.balance.totalRaw
+  if (!isBitcoinPortfolioAsset(asset) && !hasMainnetConfidentialProtocol(asset)) {
+    return asset.balance.totalRaw
+  }
+  const { mainRaw, privateRaw, totalRaw } = asset.balance
+  if (
+    mainRaw !== undefined &&
+    privateRaw !== undefined &&
+    BigInt(mainRaw) + BigInt(privateRaw) !== BigInt(totalRaw)
+  ) {
+    return totalRaw
+  }
+  return (BigInt(totalRaw) + BigInt(confidential)).toString()
 }
 
 export function formatAssetDomainFiat(value: string | number | null, partial = false): string {
@@ -137,7 +161,14 @@ export function selectHomeActionSource(
 function projectDisplayAsset(asset: PortfolioAssetView, totalRaw: string): PortfolioAssetView {
   return Object.freeze({
     ...asset,
-    balance: Object.freeze({ ...asset.balance, totalRaw, pendingRaw: '0' })
+    balance: Object.freeze({
+      ...asset.balance,
+      totalRaw,
+      pendingRaw: '0',
+      // The projected total is one domain. Drop a separate protocol balance so
+      // displayed totals do not add Shield on top of Public, Private, or Shield.
+      ...(asset.balance.confidentialRaw !== undefined ? { confidentialRaw: '0' } : {})
+    })
   })
 }
 
@@ -172,7 +203,9 @@ export function projectPortfolioForDomain(
             (chain.chain.family === 'bitcoin' && options.bitcoinPrivateAvailable === true))) ||
         (domain === 'shield' && chain.chain.family === 'zcash') ||
         (domain === 'shield' &&
-          (chain.chain.family === 'near' || chain.chain.family === 'solana') &&
+          (chain.chain.family === 'near' ||
+            chain.chain.family === 'solana' ||
+            chain.chain.family === 'bitcoin') &&
           chain.assets.some(asset => {
             const raw = getAssetDomainRaw(asset, 'shield')
             return raw !== null && raw !== '0'
@@ -320,10 +353,17 @@ export function summarizeAssetDomainsUsd(
       independentConfidential && asset.asset.chainId.startsWith('eip155:')
         ? BigInt(asset.balance.confidentialRaw ?? '0')
         : 0n
+    // Shield for these chains is also reported from confidential holdings.
+    const shieldComesFromHoldings =
+      independentConfidential &&
+      BigInt(asset.balance.confidentialRaw ?? '0') > 0n &&
+      (asset.asset.chainId.startsWith('eip155:') ||
+        isBitcoinPortfolioAsset(asset) ||
+        hasMainnetConfidentialProtocol(asset))
     if (BigInt(asset.balance.totalRaw) - embeddedConfidential === 0n) continue
     const quote = findAssetPrice(prices, asset.asset.id)
     for (const domain of ['public', 'shield', 'private'] as const) {
-      if (independentConfidential && domain === 'shield' && embeddedConfidential > 0n) continue
+      if (domain === 'shield' && shieldComesFromHoldings) continue
       const raw = getAssetDomainRaw(asset, domain)
       if (raw === null) {
         unknown[domain] = true

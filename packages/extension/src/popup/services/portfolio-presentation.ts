@@ -8,7 +8,7 @@ import { isAssetVisibleInAssetView } from '@/popup/components/portfolio/portfoli
 import { getNearConfidentialChainId } from './near-confidential-holdings'
 import type { ChainFeatureFlagValue } from '@/config/multichain-feature-flags'
 import { isSelectableChainFamily } from './chain-selection-availability'
-import { getAssetDomainRaw, type AssetDomain } from './asset-domains'
+import { getAssetDomainRaw, getDisplayedAssetTotalRaw, type AssetDomain } from './asset-domains'
 
 const ASSET_FALLBACK_ORDER = ['USDC', 'USDT', 'ZEC', 'BTC', 'ETH', 'SOL', 'NEAR'] as const
 
@@ -81,8 +81,15 @@ export function getPortfolioAssetDomainBalances(
       ? category === 'public' ||
         entries.some(({ chain }) =>
           category === 'shield'
-            ? chain.chain.family === 'evm' || chain.chain.family === 'zcash'
-            : chain.chain.family === 'evm'
+            ? chain.chain.family === 'evm' ||
+              chain.chain.family === 'zcash' ||
+              chain.chain.family === 'near' ||
+              chain.chain.family === 'solana' ||
+              chain.chain.family === 'bitcoin'
+            : chain.chain.family === 'evm' ||
+              chain.chain.family === 'near' ||
+              chain.chain.family === 'solana' ||
+              chain.chain.family === 'bitcoin'
         )
       : category === domain
   )
@@ -129,7 +136,9 @@ export function getPortfolioAssetGroupUnitQuote(
   percent24h: string | null
   changeFreshness: 'fresh' | 'stale' | null
 }> | null {
-  const heldEntries = group.entries.filter(entry => BigInt(entry.asset.balance.totalRaw) !== 0n)
+  const heldEntries = group.entries.filter(
+    entry => BigInt(getDisplayedAssetTotalRaw(entry.asset)) !== 0n
+  )
   const relevantEntries = heldEntries.length > 0 ? heldEntries : group.entries
   const quotes = relevantEntries.map(entry => findAssetPrice(prices, entry.asset.asset.id))
   if (quotes.length === 0 || quotes.some(quote => quote === null)) return null
@@ -209,8 +218,12 @@ export function sortPortfolioChains(
   prices: AssetPriceReadModel | null
 ): readonly PortfolioChainView[] {
   return [...chains].sort((left, right) => {
-    const leftHasBalance = left.assets.some(asset => BigInt(asset.balance.totalRaw) !== 0n)
-    const rightHasBalance = right.assets.some(asset => BigInt(asset.balance.totalRaw) !== 0n)
+    const leftHasBalance = left.assets.some(
+      asset => BigInt(getDisplayedAssetTotalRaw(asset)) !== 0n
+    )
+    const rightHasBalance = right.assets.some(
+      asset => BigInt(getDisplayedAssetTotalRaw(asset)) !== 0n
+    )
     if (leftHasBalance !== rightHasBalance) return leftHasBalance ? -1 : 1
     const valueComparison = compareUsdValues(
       getPortfolioChainUsdValue(left, prices),
@@ -247,7 +260,7 @@ export function partitionPortfolioAssets(
     const fiat = getPortfolioAssetUsdValue(asset, prices)
     return (
       asset.asset.kind === 'token' &&
-      (BigInt(asset.balance.totalRaw) === 0n ||
+      (BigInt(getDisplayedAssetTotalRaw(asset)) === 0n ||
         (fiat !== null && new Big(fiat).lt(lowValueUsdThreshold)))
     )
   })
@@ -363,7 +376,7 @@ export function partitionPortfolioAssetGroups(
     const onlyTokens = group.entries.every(entry => entry.asset.asset.kind === 'token')
     if (
       onlyTokens &&
-      (group.entries.every(entry => BigInt(entry.asset.balance.totalRaw) === 0n) ||
+      (group.entries.every(entry => BigInt(getDisplayedAssetTotalRaw(entry.asset)) === 0n) ||
         (fiat !== null && new Big(fiat).lt(lowValueUsdThreshold)))
     ) {
       lowValueAssetGroups.push(group)

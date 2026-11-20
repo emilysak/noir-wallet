@@ -8,7 +8,9 @@ import {
   getSwapCatalogDisplaySeeds,
   loadTokenCatalogByChain,
   mergeTokenCatalogs,
-  pickProvisionalSwapSource
+  pickProvisionalSwapSource,
+  selectUnsearchedSwapCatalog,
+  usesFullSwapCatalogNetwork
 } from '../../../src/popup/services/swap-catalog-loading.ts'
 
 const zcashChain = {
@@ -306,6 +308,19 @@ test('distinguishes a selected token from an asset on another chain', () => {
   expect(
     findSwapTokenInCatalog([usdc], { ...usdc, rheaAddress: 'different-contract' })
   ).toBeUndefined()
+})
+
+test('NEAR, Solana, and Bitcoin tabs list the full catalog before a search', () => {
+  const tokens = [{ id: 'native' }, { id: 'usdc' }]
+  const defaultTokens = [tokens[0]]
+  for (const network of ['near', 'sol', 'btc']) {
+    expect(usesFullSwapCatalogNetwork(network)).toBe(true)
+    expect(selectUnsearchedSwapCatalog({ network, tokens, defaultTokens })).toEqual(tokens)
+  }
+  for (const network of ['all', 'eth', 'base']) {
+    expect(usesFullSwapCatalogNetwork(network)).toBe(false)
+    expect(selectUnsearchedSwapCatalog({ network, tokens, defaultTokens })).toEqual(defaultTokens)
+  }
 })
 
 test('display seeds cover configured native and USDC assets and resolve only to exact catalog identities', () => {

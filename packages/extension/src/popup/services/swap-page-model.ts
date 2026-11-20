@@ -593,10 +593,23 @@ function hasNearIntentsSource(token: RheaSwapToken): boolean {
 }
 
 /** EVM and Zcash stay on the upstream catalog rule. NEAR, Solana, and Bitcoin join only on an Intents route. */
-function isWalletConfidentialDestinationToken(token: RheaSwapToken): boolean {
+export function isWalletConfidentialDestinationToken(token: RheaSwapToken): boolean {
   return (
     isConfidentialSwapDestinationSupported(token) ||
     (hasNearIntentsSource(token) && isPrivateSwapApiChain(String(token.rheaChainId)))
+  )
+}
+
+/** Same-chain Private to Public Move uses the destination rule Swap already applies to funding. */
+export function resolveSameChainConfidentialDestination(
+  tokens: readonly RheaSwapToken[],
+  source: RheaSwapToken
+): RheaSwapToken | undefined {
+  return tokens.find(
+    token =>
+      token.assetId === source.assetId &&
+      token.blockchain === source.blockchain &&
+      isWalletConfidentialDestinationToken(token)
   )
 }
 

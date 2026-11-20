@@ -21,6 +21,7 @@ export interface ReadNearPortfolioSourceInput {
   >
   readonly tokenInventory?: NearAccountTokenInventoryClient
   readonly customTokens?: readonly NearFungibleTokenDefinition[]
+  readonly trackedAssetIds?: ReadonlySet<string>
   readonly privateAddress?: string
   readonly signal?: AbortSignal
   readonly now?: () => number
@@ -71,8 +72,9 @@ function customTokenDefinition(
   return Object.freeze({ contractId, symbol, decimals })
 }
 
-// FastNear omits contracts it has not indexed and the balance reader then
-// reports zero. Saved custom NEP-141 tokens are always read with ft_balance_of.
+// Saved custom NEP-141 tokens are always read with ft_balance_of. Catalog
+// tokens use the FastNear inventory, and only user-shown tokens fall back to
+// ft_balance_of when that inventory has no usable amount.
 async function mergeCustomNearTokenBalances(
   balances: NearBalanceReadModel,
   accountId: string,
@@ -142,6 +144,7 @@ export async function readNearPortfolioSource(
     entry.asset.kind === 'token' && entry.asset.namespace === 'nep141'
       ? [
           Object.freeze({
+            assetId: entry.asset.id,
             contractId: entry.asset.reference.replace(/%5F/gi, '_'),
             symbol: entry.metadata.symbol,
             decimals: entry.metadata.decimals,
@@ -179,11 +182,23 @@ export async function readNearPortfolioSource(
     }
     const customTokens = Object.freeze([...customByContract.values()])
     const customContractIds = new Set(customTokens.map(token => token.contractId))
-    const trustedTokens = fungibleTokens.flatMap(token => {
+    const trackedAssetIds = input.trackedAssetIds ?? new Set<string>()
+    const catalogByContract = new Map<string, NearFungibleTokenDefinition>()
+    const trustedTokens: NearFungibleTokenDefinition[] = []
+    for (const token of fungibleTokens) {
       const contractId = readNearAccountId(token.contractId, 'NEAR fungible token contract ID')
-      if (customContractIds.has(contractId)) return []
-      return [Object.freeze({ contractId, symbol: token.symbol, decimals: token.decimals })]
-    })
+      if (customContractIds.has(contractId)) continue
+      const definition = Object.freeze({
+        contractId,
+        symbol: token.symbol,
+        decimals: token.decimals
+      })
+      if (token.source === 'user-added' || trackedAssetIds.has(token.assetId)) {
+        trustedTokens.push(definition)
+        continue
+      }
+      catalogByContract.set(contractId, definition)
+    }
     const readBalances = async (requestedAccountId: string) =>
       mergeCustomNearTokenBalances(
         await readNearBalances({
@@ -192,6 +207,7 @@ export async function readNearPortfolioSource(
           rpc: input.rpc,
           allowMissingAccount: true,
           trustedTokens,
+          catalogByContract,
           ...(input.tokenInventory === undefined ? {} : { tokenInventory: input.tokenInventory }),
           ...(input.signal === undefined ? {} : { signal: input.signal }),
           ...(input.now === undefined ? {} : { now: input.now })

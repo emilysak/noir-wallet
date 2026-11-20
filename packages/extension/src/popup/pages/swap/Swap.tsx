@@ -285,6 +285,7 @@ import {
   isSwapSourceAmountInsufficient,
   isValidSwapZcashRecipient,
   resolveConfidentialFundingDestinationToken,
+  resolveSameChainConfidentialDestination,
   resolveLockedWalletSwapSourceToken,
   resolveSwapRefreshChainId,
   resolveSwapResultReturnPaths,
@@ -2274,12 +2275,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const privateTransferDestinationToken = useMemo(
     () =>
       privateTransferRequested && lockedSourceToken
-        ? swap.destinationTokens.find(
-            token =>
-              token.assetId === lockedSourceToken.assetId &&
-              token.blockchain === lockedSourceToken.blockchain &&
-              isConfidentialSwapDestinationSupported(token)
-          )
+        ? resolveSameChainConfidentialDestination(swap.destinationTokens, lockedSourceToken)
         : undefined,
     [privateTransferRequested, lockedSourceToken, swap.destinationTokens]
   )

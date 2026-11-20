@@ -110,4 +110,46 @@ test.describe('EVM signing adapter address binding', () => {
 
     expect(adapted.account).toMatchObject({ derivationScheme: 'imported', derivationPath: 'm' })
   })
+
+  test('accepts the canonical transaction echoed by the current engine', async () => {
+    const adapted = await adaptPreparedSigning(
+      {
+        ...rawPrepared(checksumContract),
+        transaction: { ...transaction, to: checksumContract }
+      },
+      payload,
+      'signing-command:echo',
+      1_800_000_000_000
+    )
+
+    expect(adapted.prepared.summary).toMatchObject({
+      schema: 'evm.transaction.v1',
+      fields: {
+        to: lowercaseContract,
+        valueWei: '0',
+        methodSelector: '0xa9059cbb'
+      }
+    })
+  })
+
+  test('rejects an echoed transaction that diverges from the reviewed input', async () => {
+    const mismatches = [
+      { value: '1' },
+      { input: `0xa9059cbb${'0'.repeat(64)}${'2'.padStart(64, '0')}` },
+      { chainId: '80094' }
+    ]
+    for (const change of mismatches) {
+      await expect(
+        adaptPreparedSigning(
+          {
+            ...rawPrepared(),
+            transaction: { ...transaction, to: checksumContract, ...change }
+          },
+          payload,
+          'signing-command:echo-mismatch',
+          1_800_000_000_000
+        )
+      ).rejects.toThrow(/does not match its input/)
+    }
+  })
 })

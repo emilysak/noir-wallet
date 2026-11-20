@@ -10,6 +10,7 @@ import {
   type AssetPriceQuote
 } from '@/core/prices'
 import { isBundledWalletAsset } from '@/popup/components/tokens/token-display-policy'
+import { getDisplayedAssetTotalRaw } from '@/popup/services/asset-domains'
 import { summarizeNearConfidentialHoldings } from '@/popup/services/near-confidential-holdings'
 
 export const LOW_VALUE_USD_THRESHOLD = new Big('0.1')
@@ -89,7 +90,9 @@ export function getPortfolioAssetUsdValue(
 ): string | null {
   const quote = findAssetPrice(prices, asset.asset.id)
   if (!quote) return null
-  return new Big(formatBaseUnitDecimalAmount(asset.balance.totalRaw, asset.metadata.decimals))
+  return new Big(
+    formatBaseUnitDecimalAmount(getDisplayedAssetTotalRaw(asset), asset.metadata.decimals)
+  )
     .times(quote.priceUsd)
     .toFixed()
 }

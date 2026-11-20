@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
@@ -37,6 +38,32 @@ const assets = createAssetRegistry(
   filterAssetDefinitionsForChains(getBundledInitialProductAssetDefinitions('testnet'), chains)
 )
 const solanaUsdcMint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+const shownSolanaMint = 'So11111111111111111111111111111111111111112'
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
+function encodeBase58(bytes) {
+  const digits = [0]
+  for (const byte of bytes) {
+    let carry = byte
+    for (let index = 0; index < digits.length; index += 1) {
+      carry += digits[index] * 256
+      digits[index] = carry % 58
+      carry = Math.floor(carry / 58)
+    }
+    while (carry > 0) {
+      digits.push(carry % 58)
+      carry = Math.floor(carry / 58)
+    }
+  }
+  let zeros = 0
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros += 1
+  return `${'1'.repeat(zeros)}${digits
+    .reverse()
+    .map(digit => BASE58_ALPHABET[digit])
+    .join('')}`
+}
+
+const solanaCatalogMints = Array.from({ length: 300 }, () => encodeBase58(randomBytes(32)))
 const assetsWithSolanaUsdc = createAssetRegistry(chains, [
   ...filterAssetDefinitionsForChains(getBundledInitialProductAssetDefinitions('testnet'), chains),
   {
@@ -50,6 +77,29 @@ const assetsWithSolanaUsdc = createAssetRegistry(chains, [
   }
 ])
 const nearUsdtContract = 'usdt.tether-token.near'
+function assetsWithNearCatalog(count) {
+  const tokens = Array.from({ length: count }, (_, index) => {
+    const contractId =
+      index === 0 ? nearUsdtContract : `token${String(index).padStart(2, '0')}.testnet`
+    return {
+      chainId: nearChainId,
+      namespace: 'nep141',
+      reference: contractId,
+      kind: 'token',
+      metadata: {
+        name: index === 0 ? 'Tether USD' : `Token ${index}`,
+        symbol: index === 0 ? 'USDT' : `T${index}`,
+        decimals: 6
+      },
+      source: 'protocol',
+      verification: 'trusted'
+    }
+  })
+  return createAssetRegistry(chains, [
+    ...filterAssetDefinitionsForChains(getBundledInitialProductAssetDefinitions('testnet'), chains),
+    ...tokens
+  ])
+}
 const assetsWithNearUsdt = createAssetRegistry(chains, [
   ...filterAssetDefinitionsForChains(getBundledInitialProductAssetDefinitions('testnet'), chains),
   {
@@ -265,13 +315,20 @@ test.describe('Solana and NEAR address-only Portfolio', () => {
     ).resolves.toMatchObject({ status: 'error', errorCode: 'rate-limited', balances: [] })
   })
 
-  test('keeps an enabled SPL Token visible with a zero balance until a token account exists', async () => {
-    const getTokenAccountsByMints = async () => ({ contextSlot: 10, accounts: [] })
+  test('keeps a user-shown SPL token visible with a zero balance until a token account exists', async () => {
+    let mintReads = 0
     await expect(
       readSolanaPortfolioSource({
         chainAccount: solanaChainAccount,
         assets: assetsWithSolanaUsdc,
-        rpc: solanaRpc({ getTokenAccountsByMints }),
+        trackedAssetIds: new Set([`${solanaChainId}/token:${solanaUsdcMint}`]),
+        rpc: solanaRpc({
+          getTokenAccountsByMints: async () => {
+            mintReads += 1
+            throw new Error('Shown SPL tokens must not be queried by mint')
+          },
+          getTokenAccountsByOwner: async () => ({ contextSlot: 10, accounts: [] })
+        }),
         now: () => 2_000
       })
     ).resolves.toMatchObject({
@@ -286,6 +343,90 @@ test.describe('Solana and NEAR address-only Portfolio', () => {
         }
       ]
     })
+    expect(mintReads).toBe(0)
+  })
+
+  test('discovers held SPL tokens by owner and omits the rest of a large catalog', async () => {
+    const extraMint = shownSolanaMint
+    const catalog = createAssetRegistry(chains, [
+      ...filterAssetDefinitionsForChains(
+        getBundledInitialProductAssetDefinitions('testnet'),
+        chains
+      ),
+      {
+        chainId: solanaChainId,
+        namespace: 'token',
+        reference: solanaUsdcMint,
+        kind: 'token',
+        metadata: { name: 'USD Coin', symbol: 'USDC', decimals: 6 },
+        source: 'protocol',
+        verification: 'trusted'
+      },
+      ...Array.from({ length: 300 }, (_, index) => ({
+        chainId: solanaChainId,
+        namespace: 'token',
+        reference: solanaCatalogMints[index],
+        kind: 'token',
+        metadata: { name: `Token ${index}`, symbol: `T${index}`, decimals: 6 },
+        source: 'protocol',
+        verification: 'trusted'
+      })),
+      {
+        chainId: solanaChainId,
+        namespace: 'token',
+        reference: extraMint,
+        kind: 'token',
+        metadata: { name: 'Shown', symbol: 'SHOWN', decimals: 9 },
+        source: 'protocol',
+        verification: 'trusted'
+      }
+    ])
+    let mintReads = 0
+    let ownerReads = 0
+    const result = await readSolanaPortfolioSource({
+      chainAccount: solanaChainAccount,
+      assets: catalog,
+      trackedAssetIds: new Set([`${solanaChainId}/token:${extraMint}`]),
+      rpc: solanaRpc({
+        getTokenAccountsByMints: async () => {
+          mintReads += 1
+          throw new Error('Catalog mints must not be queried')
+        },
+        getTokenAccountsByOwner: async () => {
+          ownerReads += 1
+          return {
+            contextSlot: 10,
+            accounts:
+              ownerReads === 1
+                ? [
+                    {
+                      accountAddress: solanaAddress,
+                      program: 'legacy',
+                      mint: solanaUsdcMint,
+                      owner: solanaAddress,
+                      state: 'initialized',
+                      isNative: false,
+                      amountRaw: '2500000',
+                      decimals: 6
+                    }
+                  ]
+                : []
+          }
+        }
+      }),
+      now: () => 2_000
+    })
+
+    expect(mintReads).toBe(0)
+    expect(ownerReads).toBe(2)
+    expect(result.status).toBe('ready')
+    expect(result.balances.map(balance => balance.assetId)).toEqual([
+      `${solanaChainId}/slip44:501`,
+      `${solanaChainId}/token:${solanaUsdcMint}`,
+      `${solanaChainId}/token:${extraMint}`
+    ])
+    expect(result.balances[1]).toMatchObject({ totalRaw: '2500000' })
+    expect(result.balances[2]).toMatchObject({ totalRaw: '0' })
   })
 
   test('uses the FastNear inventory for registered NEP-141 balances without per-token RPC reads', async () => {
@@ -319,33 +460,49 @@ test.describe('Solana and NEAR address-only Portfolio', () => {
     })
   })
 
-  test('falls back to one NEP-141 RPC read when FastNear has no usable balance', async () => {
+  test('falls back to one NEP-141 RPC read only for a user-shown token', async () => {
     let rpcReads = 0
+    const rpc = nearRpc({
+      getFungibleTokenBalance: async (contractId, requestedAccountId) => {
+        rpcReads += 1
+        return {
+          contractId,
+          accountId: requestedAccountId,
+          amountRaw: '7000000',
+          blockHash,
+          blockHeight: 40
+        }
+      }
+    })
+    const tokenInventory = {
+      getFungibleTokenBalances: async () => [
+        {
+          contractId: nearUsdtContract,
+          amountRaw: null,
+          lastUpdateBlockHeight: null
+        }
+      ]
+    }
     await expect(
       readNearPortfolioSource({
         chainAccount: nearChainAccount,
         assets: assetsWithNearUsdt,
-        rpc: nearRpc({
-          getFungibleTokenBalance: async (contractId, requestedAccountId) => {
-            rpcReads += 1
-            return {
-              contractId,
-              accountId: requestedAccountId,
-              amountRaw: '7000000',
-              blockHash,
-              blockHeight: 40
-            }
-          }
-        }),
-        tokenInventory: {
-          getFungibleTokenBalances: async () => [
-            {
-              contractId: nearUsdtContract,
-              amountRaw: null,
-              lastUpdateBlockHeight: null
-            }
-          ]
-        },
+        rpc,
+        tokenInventory,
+        now: () => 2_000
+      })
+    ).resolves.toMatchObject({
+      balances: [{ assetId: `${nearChainId}/slip44:397`, totalRaw: '120' }]
+    })
+    expect(rpcReads).toBe(0)
+
+    await expect(
+      readNearPortfolioSource({
+        chainAccount: nearChainAccount,
+        assets: assetsWithNearUsdt,
+        trackedAssetIds: new Set([`${nearChainId}/nep141:${nearUsdtContract}`]),
+        rpc,
+        tokenInventory,
         now: () => 2_000
       })
     ).resolves.toMatchObject({
@@ -355,6 +512,75 @@ test.describe('Solana and NEAR address-only Portfolio', () => {
       ]
     })
     expect(rpcReads).toBe(1)
+  })
+
+  test('reads a NEAR catalog above the RPC cap from FastNear without per-token RPC', async () => {
+    let rpcReads = 0
+    const result = await readNearPortfolioSource({
+      chainAccount: nearChainAccount,
+      assets: assetsWithNearCatalog(65),
+      rpc: nearRpc({
+        getFungibleTokenBalance: async () => {
+          rpcReads += 1
+          throw new Error('Indexed NEAR catalog must not query ft_balance_of')
+        }
+      }),
+      tokenInventory: {
+        getFungibleTokenBalances: async () => [
+          {
+            contractId: nearUsdtContract,
+            amountRaw: '1153920',
+            lastUpdateBlockHeight: 39
+          }
+        ]
+      },
+      now: () => 2_000
+    })
+
+    expect(result.status).toBe('ready')
+    expect(result.balances).toHaveLength(2)
+    expect(
+      result.balances.find(balance => balance.assetId === `${nearChainId}/slip44:397`)
+    ).toMatchObject({ totalRaw: '120' })
+    expect(
+      result.balances.find(
+        balance => balance.assetId === `${nearChainId}/nep141:${nearUsdtContract}`
+      )
+    ).toMatchObject({
+      totalRaw: '1153920',
+      spendableRaw: '1153920',
+      availableRaw: '1153920'
+    })
+    expect(
+      result.balances.find(balance => balance.assetId === `${nearChainId}/nep141:token01.testnet`)
+    ).toBeUndefined()
+    expect(rpcReads).toBe(0)
+  })
+
+  test('keeps native NEAR available when a large catalog cannot be indexed', async () => {
+    let rpcReads = 0
+    await expect(
+      readNearPortfolioSource({
+        chainAccount: nearChainAccount,
+        assets: assetsWithNearCatalog(300),
+        rpc: nearRpc({
+          getFungibleTokenBalance: async () => {
+            rpcReads += 1
+            throw new Error('Unavailable FastNear must not fan out ft_balance_of')
+          }
+        }),
+        tokenInventory: {
+          getFungibleTokenBalances: async () => {
+            throw new Error('FastNear unavailable')
+          }
+        },
+        now: () => 2_000
+      })
+    ).resolves.toMatchObject({
+      status: 'ready',
+      balances: [{ assetId: `${nearChainId}/slip44:397`, totalRaw: '120' }]
+    })
+    expect(rpcReads).toBe(0)
   })
 
   test('reads a saved custom NEP-141 with ft_balance_of when FastNear has not indexed it', async () => {
@@ -426,6 +652,7 @@ test.describe('Solana and NEAR address-only Portfolio', () => {
       readNearPortfolioSource({
         chainAccount: nearChainAccount,
         assets: assetsWithNearUsdt,
+        trackedAssetIds: new Set([`${nearChainId}/nep141:${nearUsdtContract}`]),
         privateAddress,
         rpc: nearRpc({
           getAccount: async requestedAccountId => {

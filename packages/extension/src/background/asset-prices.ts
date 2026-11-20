@@ -20,6 +20,7 @@ import {
   ASSET_MARKET_CHANGE_SOURCE,
   ASSET_MARKET_CHANGE_SOURCES,
   ASSET_PRICE_QUOTE_SOURCES,
+  MAXIMUM_ASSET_PRICE_ITEMS,
   type AssetPriceReadModel
 } from '@/core/prices'
 import {
@@ -218,6 +219,29 @@ export class BackgroundAssetPriceService {
       : mergeAssetMarketChanges(prices, market)
     return userAssets ? mergeAssetPriceModels(bundled, userAssets) : bundled
   }
+}
+
+// History mappings include every bundled asset plus each user and detected ERC-20.
+// Protocol mappings share that 2048 budget, so the catalog cannot be installed whole.
+export function maximumProtocolPriceMappings(
+  userEvmAssets: readonly AssetDefinitionInput[] = [],
+  customEvmNetworks: readonly EvmNetworkConfig[] = []
+): number {
+  const chains = createBuildFeatureGatedChainRegistry(
+    createInitialProductChainRegistry(DEFAULT_NETWORK, customEvmNetworks)
+  )
+  const assets = createAssetRegistry(
+    chains,
+    filterAssetDefinitionsForChains(
+      [
+        ...getBundledInitialProductAssetDefinitions(DEFAULT_NETWORK, customEvmNetworks),
+        ...userEvmAssets
+      ],
+      chains
+    )
+  )
+  const reserved = getAssetMarketHistorySourceMappings(DEFAULT_NETWORK, assets).length
+  return Math.max(0, MAXIMUM_ASSET_PRICE_ITEMS - reserved)
 }
 
 export function createBackgroundAssetPriceService(

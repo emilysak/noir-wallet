@@ -1,6 +1,7 @@
 import { getEvmNetworkConfigs, getSolanaNetworkConfigs } from '@/config/networks'
 import type { Network } from '@/types'
 import type { PortfolioAssetView, PortfolioChainView } from '@/core/portfolio'
+import { getDisplayedAssetTotalRaw } from '@/popup/services/asset-domains'
 
 const ETHEREUM_CHAIN_IDS = new Set<string>(
   (['mainnet', 'testnet'] as const satisfies readonly Network[])
@@ -15,7 +16,7 @@ export function isAssetVisibleInAssetView(
   asset: PortfolioAssetView,
   options: { readonly includeZeroBalanceNativeAssets?: boolean } = {}
 ): boolean {
-  if (BigInt(asset.balance.totalRaw) !== 0n) return true
+  if (BigInt(getDisplayedAssetTotalRaw(asset)) !== 0n) return true
   if (asset.asset.kind === 'token') return true
   if (options.includeZeroBalanceNativeAssets) return true
 

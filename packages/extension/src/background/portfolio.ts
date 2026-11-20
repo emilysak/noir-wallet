@@ -80,7 +80,8 @@ export function createBackgroundPortfolioCoordinator(
   enrich: (
     model: PortfolioReadModel,
     refresh: false | 'if-stale' | true
-  ) => Promise<PortfolioReadModel> = async model => model
+  ) => Promise<PortfolioReadModel> = async model => model,
+  readTrackedAssetIds?: () => Promise<ReadonlySet<string>>
 ): BackgroundPortfolioService {
   let runtimeActive = true
   const storageRepository = new IndexedDbStorageV2Repository()
@@ -142,6 +143,14 @@ export function createBackgroundPortfolioCoordinator(
   const peaSigner = new EvmMultichainSigningClient({ credentials: credentialSession })
   const solanaPeaSigner = new SolanaMultichainSigningClient({ credentials: credentialSession })
   const nearPeaSigner = new NearMultichainSigningClient({ credentials: credentialSession })
+  const loadTrackedAssetIds = async (): Promise<ReadonlySet<string>> => {
+    if (!readTrackedAssetIds) return new Set()
+    try {
+      return await readTrackedAssetIds()
+    } catch {
+      return new Set()
+    }
+  }
   const isNetworkEnabled = (
     scope: { readonly keyDomainId: string; readonly accountId: string },
     family: Parameters<typeof isStoredAccountNetworkEnabled>[3],
@@ -203,6 +212,7 @@ export function createBackgroundPortfolioCoordinator(
         family: 'solana',
         isNetworkEnabled,
         readSource: async input => {
+          const trackedAssetIds = await loadTrackedAssetIds()
           const context = await loadActiveSolanaTransferContext(
             storageRepository,
             solanaNetwork.chainId
@@ -213,7 +223,7 @@ export function createBackgroundPortfolioCoordinator(
             context.chainAccount.scope.accountId === input.chainAccount.scope.accountId &&
             supportsSolanaPrivateExecution(context.keyDomainSource)
           if (!activePrivateAccount || !context) {
-            return readSolanaPortfolioSource({ ...input, rpc: solanaRpc })
+            return readSolanaPortfolioSource({ ...input, rpc: solanaRpc, trackedAssetIds })
           }
           if (!(await credentialSession.hasUnlockSession())) {
             return Object.freeze({
@@ -230,7 +240,8 @@ export function createBackgroundPortfolioCoordinator(
           return readSolanaPortfolioSource({
             ...input,
             rpc: solanaRpc,
-            privateAddress: pea.address
+            privateAddress: pea.address,
+            trackedAssetIds
           })
         }
       })
@@ -252,6 +263,7 @@ export function createBackgroundPortfolioCoordinator(
         family: 'near',
         isNetworkEnabled,
         readSource: async input => {
+          const trackedAssetIds = await loadTrackedAssetIds()
           const customTokens = await syncNearCustomTokens(input.chainAccount)
           const context = await loadActiveNearTransferContext(
             storageRepository,
@@ -274,6 +286,7 @@ export function createBackgroundPortfolioCoordinator(
             ...input,
             rpc: nearRpc,
             tokenInventory: nearTokenInventory,
+            trackedAssetIds,
             ...(customTokens.length > 0 ? { customTokens } : {})
           }
           if (!activePrivateAccount || !context) {

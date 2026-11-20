@@ -6,6 +6,7 @@ import { preferWalletEvmQuoteToken } from './token-address-discovery'
 import type { ConfidentialFundingPreview } from '@/core/services/confidential-funding'
 import { assertBitcoinPayableDepositAddress } from '@/core/services/confidential-funding/bitcoin-confidential-deposit'
 import { findShieldCatalogToken } from './shield-transfer'
+import { isWalletConfidentialDestinationToken } from './swap-page-model'
 import { formatBaseUnitDecimalAmount, formatFeeAmount } from '@/lib/number-format'
 import { evmWalletClient, type EvmFeeEstimate } from './evm-wallet-client'
 import { rheaSwapClient } from './rhea-swap-client'
@@ -265,7 +266,11 @@ async function quoteConfidentialChainMove(
   })
   input.signal.throwIfAborted()
   const token = findDirectConfidentialChainToken(catalog.tokens, input.asset)
-  if (!token || token.decimals !== input.asset.metadata.decimals) {
+  if (
+    !token ||
+    token.decimals !== input.asset.metadata.decimals ||
+    !isWalletConfidentialDestinationToken(token)
+  ) {
     throw new Error('Move route unavailable')
   }
   const asset = {

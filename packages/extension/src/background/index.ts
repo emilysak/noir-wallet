@@ -139,6 +139,7 @@ import {
   getActiveChainEndpointSettings,
   type ChainEndpointSettings
 } from '@/core/chains/chain-endpoint-settings'
+import type { EvmNetworkConfig } from '@/config/networks'
 import {
   resolveActiveEvmNetworkConfig,
   resolveEvmNetworkCatalog
@@ -175,7 +176,8 @@ import {
 } from './analytics/observations'
 import {
   createBackgroundAssetMarketHistoryService,
-  createBackgroundAssetPriceService
+  createBackgroundAssetPriceService,
+  maximumProtocolPriceMappings
 } from './asset-prices'
 import {
   createBackgroundRheaSwapService,
@@ -259,13 +261,20 @@ import {
 import { createBitcoinConfidentialDepositClient } from './bitcoin-confidential-deposit-client'
 import type { ConfidentialFundingCoordinator } from './confidential-funding-coordinator'
 import type { NativeZecIntentsSwapReview } from '@/core/services/native-zec-intents-swap'
-import { getConfidentialFundingMessageHandler } from './confidential-funding-messages'
+import {
+  getConfidentialFundingMessageHandler,
+  isExpectedConfidentialAuthorizationMiss
+} from './confidential-funding-messages'
 import { ExternalShieldDepositError } from '@/core/services/confidential-funding/confidential-external-deposit'
 import { ChromeConfidentialFundingStore } from './confidential-funding-store'
 import { createEvmWalletRuntimeError } from '@/core/chains/evm'
 import {
   applyTokenDisplayPolicy,
-  isPortfolioTokenVisible,
+  portfolioProtocolDefinitionId,
+  selectManagedProtocolAssetIds,
+  selectPortfolioProtocolDefinitions,
+  selectPricedProtocolMappings,
+  type PortfolioReadModel,
   type TokenDisplayPolicy,
   type PortfolioScope
 } from '@/core/portfolio'
@@ -514,6 +523,9 @@ subscribeTransactionPortfolioInvalidations(async ({ scope, chainIds }) => {
 let activityCoordinator!: ReturnType<typeof createBackgroundActivityCoordinator>
 let assetPriceService = createBackgroundAssetPriceService()
 setObservationPriceReader(() => assetPriceService.readCached())
+let pricedUserDefinitions: readonly AssetDefinitionInput[] = Object.freeze([])
+let pricedCustomEvmNetworks: readonly EvmNetworkConfig[] = Object.freeze([])
+let assetPriceInstallKey = ''
 let assetPriceRefreshTail: Promise<void> = Promise.resolve()
 const assetPriceRefreshes = new Map<
   string,
@@ -681,6 +693,69 @@ function refreshAssetPrices(assetId?: string) {
   })
   return operation
 }
+
+function heldPortfolioAssetIds(model: PortfolioReadModel | null): Set<string> {
+  const heldAssetIds = new Set<string>()
+  for (const asset of model?.assets ?? []) {
+    if (asset.balance.totalRaw !== '0') heldAssetIds.add(asset.asset.id)
+  }
+  for (const asset of model?.confidential?.assets ?? []) {
+    if (!asset.assetId) continue
+    if (
+      asset.availableRaw !== '0' ||
+      (asset.spendableRaw !== undefined && asset.spendableRaw !== '0')
+    ) {
+      heldAssetIds.add(asset.assetId)
+    }
+  }
+  return heldAssetIds
+}
+
+async function syncAssetPriceServices(model?: PortfolioReadModel | null): Promise<void> {
+  const visibleAssetIds = new Set<string>()
+  try {
+    const overrides = await tokenVisibility?.readUserOverrides()
+    for (const assetId of overrides?.visibleAssetIds ?? []) visibleAssetIds.add(assetId)
+  } catch {
+    // Visibility is optional. Holdings can still be priced.
+  }
+  let portfolio = model
+  if (portfolio === undefined) {
+    try {
+      portfolio = (await portfolioCoordinator?.readCachedActive()) ?? null
+    } catch {
+      // A cache miss must not reject runtime reload.
+      portfolio = null
+    }
+  }
+  const mappings = selectPricedProtocolMappings({
+    mappings: intentsProtocolPriceMappings,
+    visibleAssetIds,
+    heldAssetIds: heldPortfolioAssetIds(portfolio),
+    maximum: maximumProtocolPriceMappings(pricedUserDefinitions, pricedCustomEvmNetworks)
+  })
+  const key = JSON.stringify([
+    pricedCustomEvmNetworks.map(network => network.chainId),
+    pricedUserDefinitions.map(asset => `${asset.chainId}/${asset.namespace}:${asset.reference}`),
+    mappings.map(mapping => [mapping.assetId, mapping.marketAssetId, mapping.sourceAssetId])
+  ])
+  if (key === assetPriceInstallKey) return
+  const prices = createBackgroundAssetPriceService(
+    pricedUserDefinitions,
+    intentsProtocolAssets,
+    mappings
+  )
+  const history = createBackgroundAssetMarketHistoryService(
+    pricedUserDefinitions,
+    intentsProtocolAssets,
+    mappings,
+    pricedCustomEvmNetworks
+  )
+  assetPriceService = prices
+  assetMarketHistoryService = history
+  assetPriceInstallKey = key
+}
+
 const networkSwitchBitcoinDerivation = new BitcoinMultichainDerivationClient({
   credentials: credentialSession
 })
@@ -1297,6 +1372,10 @@ async function reloadMultichainRuntime(
         logger.warn('Confidential balance projection failed', undefined, undefined, error)
         return model
       }
+    },
+    async () => {
+      const overrides = await tokenVisibility?.readUserOverrides()
+      return new Set(overrides?.visibleAssetIds ?? [])
     }
   )
   activityCoordinator = createBackgroundActivityCoordinator(bitcoinRpcUrl, settings)
@@ -1549,17 +1628,9 @@ async function reloadMultichainRuntime(
         }),
     dispatch: dispatchDAppChainRequest
   })
-  assetPriceService = createBackgroundAssetPriceService(
-    userAssets.definitions,
-    intentsProtocolAssets,
-    intentsProtocolPriceMappings
-  )
-  assetMarketHistoryService = createBackgroundAssetMarketHistoryService(
-    userAssets.definitions,
-    intentsProtocolAssets,
-    intentsProtocolPriceMappings,
-    customEvmNetworks
-  )
+  pricedUserDefinitions = userAssets.definitions
+  pricedCustomEvmNetworks = customEvmNetworks
+  await syncAssetPriceServices()
   if (DEFAULT_NETWORK === 'mainnet') {
     nearIntentsTransactionMonitor ??= new BackgroundNearIntentsTransactionMonitor()
   } else {
@@ -1663,7 +1734,6 @@ function refreshIntentsProtocolAssets(force = false): Promise<void> {
         catalog.preferences.map(preference => preference.assetId)
       )
       intentsProtocolPriceMappings = catalog.priceMappings
-      await tokenVisibility?.synchronizeProtocolDefaults(catalog.preferences)
     } else {
       intentsProtocolAssets = Object.freeze([])
       intentsProtocolAssetIds = Object.freeze([])
@@ -3793,18 +3863,6 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
       for (const row of model?.confidential?.assets ?? []) {
         if (row.assetId && BigInt(row.availableRaw) > 0n) held.add(row.assetId)
       }
-      const ids = new Set([
-        ...policy.hiddenAssetIds,
-        ...userEvmAssetRecords.map(record => record.assetId),
-        ...detectedEvmAssetRecords.map(record => record.assetId),
-        ...intentsProtocolAssetIds,
-        ...getBundledInitialProductAssetDefinitions(DEFAULT_NETWORK)
-          .filter(asset => asset.kind === 'token')
-          .map(asset => `${asset.chainId}/${asset.namespace}:${asset.reference}`)
-      ])
-      const hiddenAssetIds = [...ids].filter(
-        id => !isPortfolioTokenVisible(id, held.has(id), policy)
-      )
       sendResponse({
         result: {
           userAssets: userEvmAssetRecords,
@@ -3813,8 +3871,12 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
               policy.allowedAssetIds.has(record.assetId) ||
               policy.visibleAssetIds.has(record.assetId)
           ),
-          hiddenAssetIds,
-          protocolAssetIds: intentsProtocolAssetIds
+          hiddenAssetIds: [...policy.hiddenAssetIds].sort(),
+          protocolAssetIds: selectManagedProtocolAssetIds({
+            protocolAssetIds: intentsProtocolAssetIds,
+            heldAssetIds: held,
+            visibleAssetIds: policy.visibleAssetIds
+          })
         }
       })
     })().catch(() => sendResponse({ error: 'Managed Tokens could not be loaded' }))
@@ -4009,6 +4071,12 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
       .then(async unlocked => {
         if (!unlocked) throw new Error('Unlock the wallet before changing Token visibility')
         await visibility.setHidden(message.assetId, message.hidden)
+        await syncAssetPriceServices().catch(error => {
+          console.warn(
+            '[Asset Prices] Price service update failed:',
+            error instanceof Error ? error.message : 'Unknown error'
+          )
+        })
         return { hidden: message.hidden as boolean }
       })
       .then(result => sendResponse({ result }))
@@ -4106,6 +4174,12 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
               automatic: message.automatic === true
             })
       if (!(await expectedScopeMatches())) throw new Error('Portfolio Account changed')
+      await syncAssetPriceServices(model).catch(error => {
+        console.warn(
+          '[Asset Prices] Price service update failed:',
+          error instanceof Error ? error.message : 'Unknown error'
+        )
+      })
       if (message.action === 'refresh' && model) {
         void assetPriceService
           .readCached()
@@ -4113,14 +4187,31 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
           .catch(() => {})
       }
       const policy = await readTokenDisplayPolicy()
+      const displayed = model ? applyTokenDisplayPolicy(model, policy) : null
+      const referencedAssetIds = new Set<string>()
+      for (const asset of displayed?.assets ?? []) referencedAssetIds.add(asset.asset.id)
+      for (const asset of displayed?.confidential?.assets ?? []) {
+        if (asset.assetId) referencedAssetIds.add(asset.assetId)
+      }
+      const knownAssetIds = new Set<string>([
+        ...getBundledInitialProductAssetDefinitions(DEFAULT_NETWORK).map(
+          portfolioProtocolDefinitionId
+        ),
+        ...userEvmAssetRecords.map(record => record.assetId),
+        ...detectedEvmAssetRecords.map(record => record.assetId)
+      ])
       return {
-        model: model ? applyTokenDisplayPolicy(model, policy) : null,
+        model: displayed,
         userAssets: userEvmAssetRecords,
         detectedAssets: detectedEvmAssetRecords,
-        protocolAssets: Object.freeze([
-          ...intentsProtocolAssets,
-          ...(confidentialFundingCoordinator?.getPortfolioAssetDefinitions(model) ?? [])
-        ])
+        protocolAssets: selectPortfolioProtocolDefinitions({
+          assetIds: referencedAssetIds,
+          knownAssetIds,
+          definitions: [
+            ...intentsProtocolAssets,
+            ...(confidentialFundingCoordinator?.getPortfolioAssetDefinitions(displayed) ?? [])
+          ]
+        })
       }
     }
     void operation()
@@ -4701,11 +4792,15 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
       .then(result => sendResponse({ result }))
       .catch(error => {
         console.log('confidential funding error: %o', error)
-        console.error('[Confidential Funding] Request failed', {
-          operation: message.type,
-          errorName: error instanceof Error ? error.name : 'UnknownError',
-          ...(error instanceof ExternalShieldDepositError ? { failureStage: error.stage } : {})
-        })
+        // A token page can ask for balances before Shield has created a session.
+        // That miss is a normal response, not a failed confidential request.
+        if (!isExpectedConfidentialAuthorizationMiss(message.type, error)) {
+          console.error('[Confidential Funding] Request failed', {
+            operation: message.type,
+            errorName: error instanceof Error ? error.name : 'UnknownError',
+            ...(error instanceof ExternalShieldDepositError ? { failureStage: error.stage } : {})
+          })
+        }
         sendResponse({
           error: error instanceof Error ? error.message : 'Confidential funding request failed',
           ...(message.type === 'REFRESH_CONFIDENTIAL_BALANCES' &&
@@ -7162,10 +7257,16 @@ async function handleAccountSwitched({
       nearDAppHandler?.notifyAccountsChanged(),
       multichainSessionDAppHandler?.notifyAllSessionsChanged()
     ])
-    if (refreshPortfolio) {
-      portfolioCoordinator?.refreshActive(undefined, { automatic: true }).catch(error => {
-        console.warn('[Portfolio] Account refresh failed:', error)
-      })
+    if (refreshPortfolio && portfolioCoordinator) {
+      void portfolioCoordinator
+        .refreshActive(undefined, { automatic: true })
+        .then(model => syncAssetPriceServices(model))
+        .catch(error => {
+          console.warn(
+            '[Portfolio] Account refresh failed:',
+            error instanceof Error ? error.message : 'Unknown error'
+          )
+        })
     }
   } catch (error) {
     console.warn('[Background] Account switch notification error:', error)

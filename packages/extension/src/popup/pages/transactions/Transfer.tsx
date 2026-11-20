@@ -85,6 +85,7 @@ import { resolveManagedIntentsCatalog } from '@/popup/services/intents-asset-man
 import type { IntentsManagedAsset } from '@/core/services/intents-managed-assets'
 import {
   buildShieldTransferRequest,
+  clusterNetworkFeeRequest,
   formatShieldQuoteTime,
   hasShieldTransferStarted,
   isClusterTransferRoute,
@@ -98,6 +99,7 @@ import {
   shieldPortfolioBalances,
   shieldQuoteFeeRaw
 } from '@/popup/services/shield-transfer'
+import { nextShieldSessionProbe } from '@/popup/services/shield-session-check'
 import { TransactionReviewView } from '@/popup/components/transaction/TransactionReviewView'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import { SendTransferForm } from './SendTransferForm'
@@ -467,6 +469,8 @@ function TransferForm() {
     connecting: shieldConnecting,
     error: shieldBalanceError,
     errorCode: shieldBalanceErrorCode,
+    sessionReady: shieldSessionReady,
+    readBalanceErrorCode: readShieldBalanceErrorCode,
     refreshBalances: loadShieldBalances
   } = useShieldBalances({
     active: true,
@@ -587,10 +591,14 @@ function TransferForm() {
   }, [canLoadShield, accountLoading, effective?.walletId, effective?.accountId])
 
   useEffect(() => {
-    if (!shieldBalances) return
+    if (!shieldSessionReady) {
+      setShieldConnection(current => (current === 'connected' ? 'checking' : current))
+      return
+    }
+    if (shieldBalanceError || shieldConnecting || !shieldBalances) return
     setShieldConnection('connected')
     setShieldError(null)
-  }, [shieldBalances])
+  }, [shieldBalanceError, shieldBalances, shieldConnecting, shieldSessionReady])
 
   useEffect(() => {
     if (!shieldBalanceError) return
@@ -1239,6 +1247,11 @@ function TransferForm() {
       ? 'supported'
       : 'unsupported'
   const methodAvailable = supportedPair && routeState === 'supported'
+  // Directly quotes the Intents route Swap will accept. Identical addresses stay on Cluster.
+  const confidentialDirectRoute = Boolean(
+    clusterPair && mainnetConfidentialChain && source && source.sender !== source.recipient
+  )
+  const directMethodAvailable = methodAvailable || confidentialDirectRoute
 
   const maximumRaw =
     selected?.asset.asset.kind === 'native' &&
@@ -1304,10 +1317,6 @@ function TransferForm() {
         })
       : null
   const amountError = fundingRoute ? shieldAmountState?.error : amountState?.error
-  const confidentialRouteError =
-    supportedPair && selected && amount.trim() && routeState === 'unsupported' && !clusterAvailable
-      ? 'Confidential transfers are unavailable for this asset.'
-      : null
   const estimateAmountRaw = useMemo(() => {
     if (!selected || currentAmount.length === 0 || currentAmount === '.') return null
     try {
@@ -1327,7 +1336,7 @@ function TransferForm() {
     (solanaClusterPair || (eligible && source))
   )
   const directEstimate = useMoveMethodEstimate({
-    enabled: canEstimateMethods && methodAvailable && !solanaClusterPair,
+    enabled: canEstimateMethods && directMethodAvailable,
     requestKey: methodEstimateKey,
     estimate: signal =>
       estimateDirectMove({
@@ -1372,15 +1381,20 @@ function TransferForm() {
     enabled:
       clusterSelected &&
       clusterQuoted &&
+      selected?.chain.chain.family === 'evm' &&
       from !== 'shield' &&
       Boolean(shieldAmountState?.amountRaw) &&
       !preparingShield,
     requestKey: `${clusterEstimateKey}:${JSON.stringify(evmMoveFee)}`,
-    estimate: () =>
-      confidentialFundingClient.previewClusterNetworkFee({
-        ...buildClusterPreviewRequest(),
-        feeSelection: evmMoveFee
-      })
+    estimate: () => {
+      const request = clusterNetworkFeeRequest(
+        selected!.chain.chain.family,
+        buildClusterPreviewRequest(),
+        evmMoveFee
+      )
+      if (!request) throw new Error('Cluster network fee is unavailable')
+      return confidentialFundingClient.previewClusterNetworkFee(request)
+    }
   }).value
   const clusterEstimateWithFee =
     clusterEstimate.value && clusterNetworkFee
@@ -1390,12 +1404,21 @@ function TransferForm() {
     ? (clusterEstimate.value?.sourceNetworkFee?.raw ?? null)
     : null
   if (quotedSolanaFee !== solanaClusterFeeRaw) setSolanaClusterFeeRaw(quotedSolanaFee)
-  const directQuoted = Boolean(canEstimateMethods && methodAvailable && directEstimate.value)
+  const directQuoted = Boolean(canEstimateMethods && directMethodAvailable && directEstimate.value)
   const selectedEstimate = method === 'cluster' ? clusterEstimate : directEstimate
   const clusterUnavailable = getSwapQuoteFailureMessage(clusterEstimate.errorMessage) === 'no route'
   const directUnavailable =
     directEstimate.errorMessage === 'Move route unavailable' ||
     getSwapQuoteFailureMessage(directEstimate.errorMessage) === 'no route'
+  const confidentialRouteError =
+    supportedPair &&
+    selected &&
+    amount.trim() &&
+    routeState === 'unsupported' &&
+    !clusterAvailable &&
+    (!confidentialDirectRoute || directUnavailable)
+      ? 'Confidential transfers are unavailable for this asset.'
+      : null
   const quoteMinimumError = useMemo(() => {
     if (!selected) return null
     const message = selectedEstimate.errorMessage
@@ -1411,6 +1434,7 @@ function TransferForm() {
     clusterPair &&
     selectedEstimate.error &&
     !quoteMinimumError &&
+    !confidentialRouteError &&
     !clusterEstimate.loading &&
     !directEstimate.loading
   const transferError =
@@ -1441,7 +1465,7 @@ function TransferForm() {
       if (next !== method) setMethod(next)
       return
     }
-    if (method === 'cluster' && clusterUnavailable && (directQuoted || solanaClusterPair)) {
+    if (method === 'cluster' && clusterUnavailable && directQuoted) {
       userPickedMethod.current = false
       setMethod('directly')
     } else if (method === 'directly' && directUnavailable && clusterQuoted) {
@@ -1454,7 +1478,7 @@ function TransferForm() {
     directUnavailable,
     clusterQuoted,
     directQuoted,
-    solanaClusterPair
+    bitcoinClusterPair
   ])
   const shieldReviewKeyForFee = (feeSelection: EvmFeeSelection) =>
     `${routeKey}:${method}:${currentAmount}:${shieldAmountState?.amountRaw ?? ''}:${JSON.stringify(feeSelection)}`
@@ -1475,8 +1499,8 @@ function TransferForm() {
     selected &&
     eligible &&
     supportedPair &&
-    routeState === 'supported' &&
-    (!clusterPair || (method === 'directly' && (directQuoted || solanaClusterPair))) &&
+    (routeState === 'supported' || confidentialDirectRoute) &&
+    (!clusterPair || (method === 'directly' && directQuoted)) &&
     !tokenFeeBalanceError &&
     (direction === 'main-to-private' ? publicRaw !== null : privateRaw !== null) &&
     (!maxSelected || amount === currentAmount) &&
@@ -1519,6 +1543,7 @@ function TransferForm() {
     setDomainPicker(side)
   }
   const review = () => {
+    debugger
     if (!canReview || !selected || !mainAddress) return
     const wallet = useWalletStore.getState()
     if (
@@ -1631,7 +1656,7 @@ function TransferForm() {
     : !eligible ||
       !supportedPair ||
       (direction === 'main-to-private' ? publicRaw === null : privateRaw === null) ||
-      routeState !== 'supported' ||
+      (routeState !== 'supported' && !confidentialDirectRoute) ||
       !available ||
       BigInt(available.amountRaw) === 0n
   const handleMax = () => {
@@ -1667,12 +1692,30 @@ function TransferForm() {
     }
     const updated = await loadShieldBalances(true, authorize)
     if (!scopeStillCurrent()) return
+    if (
+      nextShieldSessionProbe({
+        ok: updated,
+        authorize,
+        errorCode: readShieldBalanceErrorCode(),
+        retries: 0
+      }) === 'authorize'
+    ) {
+      setShieldConnection('busy')
+      setShieldError(null)
+      const authorized = await loadShieldBalances(true, true)
+      if (!scopeStillCurrent()) return
+      setShieldConnection(authorized ? 'connected' : 'required')
+      if (authorized) setShieldError(null)
+      return
+    }
     setShieldConnection(updated ? 'connected' : 'required')
+    if (updated) setShieldError(null)
   }
   const prepareShield = async (
     feeSelection: EvmFeeSelection = evmMoveFee,
     replacingReview = false
   ): Promise<boolean> => {
+    debugger
     if (
       (!replacingReview && !canReviewShield) ||
       !selected ||
@@ -1733,6 +1776,7 @@ function TransferForm() {
       setPreparedShield({ key, review: result })
       return true
     } catch (error) {
+      console.log('prepareShield error: %o', error)
       if (scopeStillCurrent()) {
         const message = error instanceof Error ? error.message : ''
         if (message.includes('Bitcoin private deposit signing is unavailable')) {
@@ -2408,62 +2452,53 @@ function TransferForm() {
             {transferError}
           </p>
         )}
-        {(selected?.chain.chain.family === 'evm' || solanaClusterPair) &&
-          clusterPair &&
-          (clusterAvailable || methodAvailable || solanaClusterPair) && (
-            <div
-              role="radiogroup"
-              aria-label="Transfer method"
-              className={cn(
-                'mt-auto grid shrink-0 gap-2.5 pt-4',
-                clusterAvailable && (methodAvailable || solanaClusterPair)
-                  ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'
-                  : 'grid-cols-1'
-              )}
-            >
-              {clusterAvailable && (
-                <MethodCard
-                  title="Cluster"
-                  detail="Multiple transactions"
-                  recommended
-                  selected={method === 'cluster'}
-                  disabled={clusterUnavailable}
-                  estimate={clusterEstimate.value}
-                  loading={
-                    canEstimateMethods &&
-                    shieldConnection === 'connected' &&
-                    clusterEstimate.loading
-                  }
-                  fee={formatMoveMethodFee(clusterEstimateWithFee, selected?.asset ?? null)}
-                  onClick={() => {
-                    userPickedMethod.current = true
-                    setMethod('cluster')
-                  }}
-                />
-              )}
-              {(methodAvailable || solanaClusterPair) && (
-                <MethodCard
-                  title="Directly"
-                  detail="One transaction"
-                  recommended={false}
-                  selected={method === 'directly'}
-                  disabled={solanaClusterPair ? false : directUnavailable}
-                  estimate={solanaClusterPair ? null : directEstimate.value}
-                  loading={
-                    canEstimateMethods &&
-                    methodAvailable &&
-                    !solanaClusterPair &&
-                    directEstimate.loading
-                  }
-                  fee={formatMoveMethodFee(directEstimate.value, selected?.asset ?? null)}
-                  onClick={() => {
-                    userPickedMethod.current = true
-                    setMethod('directly')
-                  }}
-                />
-              )}
-            </div>
-          )}
+        {clusterPair && (clusterAvailable || directMethodAvailable) && (
+          <div
+            role="radiogroup"
+            aria-label="Transfer method"
+            className={cn(
+              'mt-auto grid shrink-0 gap-2.5 pt-4',
+              clusterAvailable && directMethodAvailable
+                ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'
+                : 'grid-cols-1'
+            )}
+          >
+            {clusterAvailable && (
+              <MethodCard
+                title="Cluster"
+                detail="Multiple transactions"
+                recommended
+                selected={method === 'cluster'}
+                disabled={clusterUnavailable}
+                estimate={clusterEstimate.value}
+                loading={
+                  canEstimateMethods && shieldConnection === 'connected' && clusterEstimate.loading
+                }
+                fee={formatMoveMethodFee(clusterEstimateWithFee, selected?.asset ?? null)}
+                onClick={() => {
+                  userPickedMethod.current = true
+                  setMethod('cluster')
+                }}
+              />
+            )}
+            {directMethodAvailable && (
+              <MethodCard
+                title="Directly"
+                detail="One transaction"
+                recommended={false}
+                selected={method === 'directly'}
+                disabled={directUnavailable}
+                estimate={directEstimate.value}
+                loading={canEstimateMethods && directMethodAvailable && directEstimate.loading}
+                fee={formatMoveMethodFee(directEstimate.value, selected?.asset ?? null)}
+                onClick={() => {
+                  userPickedMethod.current = true
+                  setMethod('directly')
+                }}
+              />
+            )}
+          </div>
+        )}
         {fundingRoute &&
           selected?.chain.chain.family === 'evm' &&
           from !== 'shield' &&

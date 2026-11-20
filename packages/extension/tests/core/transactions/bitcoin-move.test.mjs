@@ -174,7 +174,8 @@ test('a failed Bitcoin quote does not produce a wallet-to-wallet transfer', asyn
     symbol: 'BTC',
     rheaChainId: 'btc',
     rheaAddress: 'btc',
-    isNative: true
+    isNative: true,
+    sources: ['nearintents']
   }
   const input = {
     asset,
@@ -214,6 +215,20 @@ test('a failed Bitcoin quote does not produce a wallet-to-wallet transfer', asyn
     }
   })
   expect(failed).toEqual({ kind: 'stop', error: 'no route' })
+  const quoteCalls = []
+  const unavailable = await settleBitcoinDirectMove(input, {
+    listTokens: async () => ({ tokens: [{ ...token, sources: [] }] }),
+    quote: async () => {
+      quoteCalls.push('quote')
+      return { quoteHandle: 'unused', estimatedOut: '900', expiresAt: null }
+    },
+    prepare: async () => {
+      throw new Error('prepare should not run without an Intents route')
+    },
+    discard: async () => {}
+  })
+  expect(unavailable).toEqual({ kind: 'stop', error: 'Move route unavailable' })
+  expect(quoteCalls).toEqual([])
   expect(outputAddresses(failed)).toEqual([])
   expect(transferCalls).toEqual([])
   expect(JSON.stringify(failed)).not.toContain(PUBLIC_ADDRESS)

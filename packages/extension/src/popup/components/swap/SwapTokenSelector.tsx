@@ -30,7 +30,9 @@ import { safeBig } from '@/lib/big'
 import {
   getSwapCatalogDisplaySeeds,
   mergeTokenCatalogs,
-  readCachedTokenCatalogByChain
+  readCachedTokenCatalogByChain,
+  selectUnsearchedSwapCatalog,
+  usesFullSwapCatalogNetwork
 } from '@/popup/services/swap-catalog-loading'
 
 interface SelectorFilter {
@@ -372,7 +374,11 @@ export function SwapTokenSelector({
   useEffect(() => {
     const { search, network } = filter
     const requestKey = `${network}:${search}`
-    if (scopeInvalidated.current || !search || loadedNetworks.current.has(network)) {
+    if (
+      scopeInvalidated.current ||
+      (!search && !usesFullSwapCatalogNetwork(network)) ||
+      loadedNetworks.current.has(network)
+    ) {
       setLoadingNetwork(null)
       return
     }
@@ -430,7 +436,11 @@ export function SwapTokenSelector({
         tokenKey={swapTokenKey}
         tokens={resolvedItems.tokens}
         extraItems={guardedExtraItems}
-        defaultTokens={defaultTokens}
+        defaultTokens={selectUnsearchedSwapCatalog({
+          network: filter.network,
+          tokens: resolvedItems.tokens,
+          defaultTokens
+        })}
         defaultCatalogLoading={false}
         balances={balances}
         pricesByTokenKey={pricesByTokenKey}

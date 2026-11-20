@@ -3,6 +3,7 @@ import { expect } from '@playwright/test'
 import { withTimeout } from '../../../src/lib/async-utils.ts'
 
 import { ConfidentialFundingCoordinator } from '../../../src/background/confidential-funding-coordinator.ts'
+import { getSolanaNetworkConfig } from '../../../src/config/networks.ts'
 import {
   buildConfidentialPortfolioView,
   excludeDeprecatedConfidentialAssets,
@@ -25,6 +26,7 @@ import { findAssetPrice } from '../../../src/core/prices/asset-price.ts'
 import { listStandaloneNearConfidentialHoldings } from '../../../src/popup/services/near-confidential-holdings.ts'
 import { withConfidentialAssetPrices } from '../../../src/popup/components/portfolio/portfolio-prices.ts'
 import { getAssetDetailCategories } from '../../../src/popup/pages/portfolio/asset-detail-balance.ts'
+import { getDisplayedAssetTotalRaw } from '../../../src/popup/services/asset-domains.ts'
 
 test('projects Shield-only holdings independently of Public assets and preserves unknown tokens', () => {
   const protocolAssetId = 'nep141:usdc.omft.near'
@@ -201,6 +203,227 @@ test('keeps NEAR, Solana, and Bitcoin Shield mappings and does not fold them int
   expect(bitcoinMerged.assets[0].balance.confidentialRaw).toBe('7')
   expect(merged.assets[1].balance).toEqual({ ...solanaAsset.balance, confidentialRaw: '2' })
   expect(merged.chains[0].assets[0].balance.confidentialRaw).toBe('7')
+})
+
+test('folds contract-backed NEAR, SOL, and BTC Shield balances into the native row', () => {
+  const nearChainId = 'near:mainnet'
+  const solanaChainId = getSolanaNetworkConfig('mainnet').chainId
+  const bitcoinChainId = getBitcoinChainId('mainnet')
+  const nearAssetId = `${nearChainId}/slip44:397`
+  const solanaAssetId = `${solanaChainId}/slip44:501`
+  const bitcoinAssetId = `${bitcoinChainId}/slip44:0`
+  const nearTokenId = `${nearChainId}/nep141:wrap.near`
+  const solanaTokenId = `${solanaChainId}/token:So11111111111111111111111111111111111111112`
+  const registry = {
+    [nearAssetId]: {
+      asset: {
+        id: nearAssetId,
+        chainId: nearChainId,
+        kind: 'native',
+        namespace: 'slip44',
+        reference: '397'
+      },
+      metadata: { decimals: 24, symbol: 'NEAR', name: 'NEAR' },
+      source: 'bundled'
+    },
+    [solanaAssetId]: {
+      asset: {
+        id: solanaAssetId,
+        chainId: solanaChainId,
+        kind: 'native',
+        namespace: 'slip44',
+        reference: '501'
+      },
+      metadata: { decimals: 9, symbol: 'SOL', name: 'SOL' },
+      source: 'bundled'
+    },
+    [bitcoinAssetId]: {
+      asset: {
+        id: bitcoinAssetId,
+        chainId: bitcoinChainId,
+        kind: 'native',
+        namespace: 'slip44',
+        reference: '0'
+      },
+      metadata: { decimals: 8, symbol: 'BTC', name: 'Bitcoin' },
+      source: 'bundled'
+    }
+  }
+  const assets = { get: id => registry[id] }
+  const protocolToken = (assetId, blockchain, contractAddress, decimals, symbol) => ({
+    assetId,
+    blockchain,
+    contractAddress,
+    decimals,
+    symbol,
+    price: 2
+  })
+  const managed = (protocolAssetId, assetId, chainId, decimals) => ({
+    protocolAssetId,
+    assetId,
+    chainId,
+    decimals
+  })
+  const mappings = [
+    { assetId: nearTokenId, protocolAssetId: 'nep141:wrap.near' },
+    { assetId: nearAssetId, protocolAssetId: 'nep141:wrap.near' },
+    { assetId: solanaTokenId, protocolAssetId: 'nep141:sol.omft.near' },
+    { assetId: solanaAssetId, protocolAssetId: 'nep141:sol.omft.near' },
+    { assetId: bitcoinAssetId, protocolAssetId: 'nep141:btc.omft.near' }
+  ]
+  const view = buildConfidentialPortfolioView(
+    [
+      { tokenId: 'nep141:wrap.near', available: '7' },
+      { tokenId: 'nep141:sol.omft.near', available: '5' },
+      { tokenId: 'nep141:btc.omft.near', available: '3' }
+    ],
+    [
+      protocolToken('nep141:wrap.near', 'near', 'wrap.near', 24, 'wNEAR'),
+      protocolToken(
+        'nep141:sol.omft.near',
+        'sol',
+        'So11111111111111111111111111111111111111112',
+        9,
+        'wSOL'
+      ),
+      protocolToken('nep141:btc.omft.near', 'btc', null, 8, 'BTC')
+    ],
+    [
+      managed('nep141:wrap.near', nearTokenId, nearChainId, 24),
+      managed('nep141:sol.omft.near', solanaTokenId, solanaChainId, 9)
+    ],
+    mappings,
+    assets
+  )
+  expect(view.assets.map(asset => [asset.assetId, asset.symbol, asset.availableRaw])).toEqual([
+    [nearAssetId, 'NEAR', '7'],
+    [solanaAssetId, 'SOL', '5'],
+    [bitcoinAssetId, 'BTC', '3']
+  ])
+
+  const portfolioAsset = (assetId, balance) => ({
+    asset: registry[assetId].asset,
+    metadata: registry[assetId].metadata,
+    balance,
+    chainAccountIds: ['chain-account:1'],
+    freshness: 'fresh',
+    updatedAt: 1
+  })
+  const onChain = {
+    totalRaw: '14',
+    mainRaw: '10',
+    privateRaw: '4',
+    spendableRaw: '14',
+    availableRaw: '14',
+    pendingRaw: '0'
+  }
+  const wrappedNear = {
+    asset: {
+      id: nearTokenId,
+      chainId: nearChainId,
+      kind: 'token',
+      namespace: 'nep141',
+      reference: 'wrap.near'
+    },
+    metadata: { decimals: 24, symbol: 'wNEAR', name: 'Wrapped NEAR' },
+    balance: {
+      totalRaw: '3',
+      mainRaw: '3',
+      privateRaw: '0',
+      spendableRaw: '3',
+      availableRaw: '3',
+      pendingRaw: '0'
+    },
+    chainAccountIds: ['chain-account:1'],
+    freshness: 'fresh',
+    updatedAt: 1
+  }
+  const near = portfolioAsset(nearAssetId, onChain)
+  const solana = portfolioAsset(solanaAssetId, onChain)
+  const bitcoin = portfolioAsset(bitcoinAssetId, onChain)
+  const chain = asset => ({
+    chain: { id: asset.asset.chainId, family: asset.asset.chainId.split(':')[0] },
+    assets: [asset]
+  })
+  const merged = mergeConfidentialBalancesIntoPortfolio(
+    {
+      assets: [near, wrappedNear, solana, bitcoin],
+      chains: [chain(near), chain(wrappedNear), chain(solana), chain(bitcoin)]
+    },
+    mappings,
+    [
+      { tokenId: 'nep141:wrap.near', available: '7' },
+      { tokenId: 'nep141:sol.omft.near', available: '5' },
+      { tokenId: 'nep141:btc.omft.near', available: '3' }
+    ]
+  )
+  expect(merged.assets[0].balance).toEqual({ ...onChain, confidentialRaw: '7' })
+  expect(merged.assets[1].balance).toEqual(wrappedNear.balance)
+  expect(merged.assets[2].balance).toEqual({ ...onChain, confidentialRaw: '5' })
+  expect(merged.assets[3].balance).toEqual({ ...onChain, confidentialRaw: '3' })
+  const withHoldings = { ...merged, confidential: view }
+  expect(listStandaloneNearConfidentialHoldings(withHoldings, withHoldings, null)).toEqual([])
+  expect(getDisplayedAssetTotalRaw(merged.assets[0])).toBe('21')
+  expect(getDisplayedAssetTotalRaw(merged.assets[2])).toBe('19')
+  expect(getDisplayedAssetTotalRaw(merged.assets[3])).toBe('17')
+  expect(getAssetDetailCategories(merged.assets[0], withHoldings, true).raw).toEqual({
+    all: '21',
+    public: '10',
+    shield: '7',
+    private: '4'
+  })
+
+  const confidentialOnlyBalance = {
+    totalRaw: '0',
+    mainRaw: '0',
+    privateRaw: '0',
+    spendableRaw: '0',
+    availableRaw: '0',
+    pendingRaw: '0'
+  }
+  const confidentialOnly = portfolioAsset(nearAssetId, confidentialOnlyBalance)
+  const confidentialOnlyMerged = mergeConfidentialBalancesIntoPortfolio(
+    { assets: [confidentialOnly], chains: [chain(confidentialOnly)] },
+    mappings,
+    [{ tokenId: 'nep141:wrap.near', available: '7' }]
+  )
+  const confidentialOnlyModel = {
+    ...confidentialOnlyMerged,
+    confidential: {
+      status: 'ready',
+      assets: view.assets.filter(asset => asset.assetId === nearAssetId)
+    }
+  }
+  expect(confidentialOnlyMerged.assets[0].balance.confidentialRaw).toBe('7')
+  expect(getDisplayedAssetTotalRaw(confidentialOnlyMerged.assets[0])).toBe('7')
+  expect(
+    listStandaloneNearConfidentialHoldings(confidentialOnlyModel, confidentialOnlyModel, null)
+  ).toEqual([])
+  expect(getAssetDetailCategories(confidentialOnlyMerged.assets[0], confidentialOnlyModel, false).raw).toEqual({
+    all: '7',
+    public: '0',
+    shield: '7',
+    private: '0'
+  })
+
+  const publicOnly = portfolioAsset(nearAssetId, {
+    ...onChain,
+    totalRaw: '10',
+    privateRaw: '0'
+  })
+  const privateOnly = portfolioAsset(solanaAssetId, {
+    ...onChain,
+    totalRaw: '4',
+    mainRaw: '0'
+  })
+  const onChainOnly = {
+    assets: [publicOnly, privateOnly],
+    chains: [chain(publicOnly), chain(privateOnly)],
+    confidential: { status: 'ready', assets: [] }
+  }
+  expect(listStandaloneNearConfidentialHoldings(onChainOnly, onChainOnly, null)).toEqual([])
+  expect(getDisplayedAssetTotalRaw(publicOnly)).toBe('10')
+  expect(getDisplayedAssetTotalRaw(privateOnly)).toBe('4')
 })
 
 test('only counts the verified treasury token as Shield balance', () => {
@@ -490,6 +713,143 @@ test('projects a Confidential-only EVM token as its registered portfolio asset',
   ).toEqual([nativeAssetId])
 })
 
+test('projects Shield-only NEAR, Solana, and Bitcoin assets without spending the on-chain total', () => {
+  const nearChainId = 'near:mainnet'
+  const solanaChainId = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'
+  const bitcoinChainId = getBitcoinChainId('mainnet')
+  const nearTokenId = `${nearChainId}/nep141:token.near`
+  const solanaTokenId = `${solanaChainId}/slip44:501`
+  const bitcoinAssetId = `${bitcoinChainId}/slip44:0`
+  const nearDefinition = {
+    chainId: nearChainId,
+    namespace: 'nep141',
+    reference: 'token.near',
+    kind: 'token',
+    metadata: { name: 'Token', symbol: 'TOK', decimals: 18 },
+    source: 'protocol',
+    verification: 'trusted'
+  }
+  const chains = createInitialProductChainRegistry('mainnet')
+  const registry = createAssetRegistry(chains, [
+    ...getBundledInitialProductAssetDefinitions('mainnet'),
+    nearDefinition
+  ])
+  const scope = { keyDomainId: 'key-domain:1', accountId: 'account:1' }
+  const source = (chainId, assetId) => ({
+    chainAccount: {
+      id: `chain-account:${chainId}`,
+      scope: { ...scope, chainId },
+      derivation: { scheme: 'test', path: 'm/0' },
+      identity: { kind: 'account-identifier', value: 'public-only' },
+      createdAt: 1_700_000_000_000
+    },
+    status: 'ready',
+    balances: [
+      {
+        assetId,
+        totalRaw: '0',
+        spendableRaw: '0',
+        availableRaw: '0',
+        pendingRaw: '0',
+        mainRaw: '0',
+        privateRaw: '0',
+        updatedAt: 1_700_000_000_000
+      }
+    ]
+  })
+  const baseModel = buildPortfolioReadModel(
+    scope,
+    [
+      source(nearChainId, `${nearChainId}/slip44:397`),
+      source(solanaChainId, solanaTokenId),
+      source(bitcoinChainId, bitcoinAssetId)
+    ],
+    chains,
+    registry
+  )
+  const holding = (assetId, chainId, protocolAssetId, decimals) => ({
+    tokenId: protocolAssetId,
+    protocolAssetId,
+    assetId,
+    chainId,
+    decimals,
+    symbol: 'TOK',
+    availableRaw: '9'
+  })
+  const confidential = {
+    status: 'ready',
+    assets: [
+      holding(nearTokenId, nearChainId, 'nep141:token.near', 18),
+      holding(solanaTokenId, solanaChainId, 'nep141:sol.omft.near', 9),
+      holding(bitcoinAssetId, bitcoinChainId, 'nep141:btc.omft.near', 8)
+    ]
+  }
+  const mappings = confidential.assets.map(asset => ({
+    assetId: asset.assetId,
+    protocolAssetId: asset.protocolAssetId
+  }))
+  const withoutSolanaAndBitcoin = {
+    ...baseModel,
+    assets: baseModel.assets.filter(asset => asset.asset.chainId === nearChainId),
+    chains: baseModel.chains.map(chain =>
+      chain.chain.id === solanaChainId || chain.chain.id === bitcoinChainId
+        ? { ...chain, assets: chain.assets }
+        : chain
+    )
+  }
+  const solanaAndBitcoinOnly = {
+    ...baseModel,
+    assets: [],
+    chains: baseModel.chains.map(chain =>
+      chain.chain.id === nearChainId ? { ...chain, assets: chain.assets } : chain
+    )
+  }
+  const projectedToken = projectConfidentialOnlyEvmAssets(
+    withoutSolanaAndBitcoin,
+    { ...confidential, assets: confidential.assets.filter(asset => asset.assetId === nearTokenId) },
+    mappings,
+    registry
+  )
+  const token = projectedToken.assets.find(asset => asset.asset.id === nearTokenId)
+  expect(token?.balance).toMatchObject({
+    totalRaw: '0',
+    mainRaw: '0',
+    privateRaw: '0',
+    confidentialRaw: '9',
+    spendableRaw: '0',
+    availableRaw: '0'
+  })
+  expect(parsePortfolioReadModel(structuredClone(projectedToken), chains, registry)).toEqual(
+    projectedToken
+  )
+  const projectedNatives = projectConfidentialOnlyEvmAssets(
+    solanaAndBitcoinOnly,
+    {
+      ...confidential,
+      assets: confidential.assets.filter(asset => asset.assetId !== nearTokenId)
+    },
+    mappings,
+    registry
+  )
+  for (const assetId of [solanaTokenId, bitcoinAssetId]) {
+    const projected = projectedNatives.assets.findLast(asset => asset.asset.id === assetId)
+    expect(projected?.balance).toMatchObject({
+      totalRaw: '0',
+      mainRaw: '0',
+      privateRaw: '0',
+      confidentialRaw: '9'
+    })
+  }
+  const nativeHoldings = confidential.assets.filter(asset => asset.assetId !== nearTokenId)
+  expect(
+    listStandaloneNearConfidentialHoldings(
+      { ...projectedNatives, confidential: { status: 'ready', assets: nativeHoldings } },
+      { ...projectedNatives, confidential: { status: 'ready', assets: nativeHoldings } },
+      null
+    )
+  ).toEqual([])
+})
+
 test('only projects Confidential zero after a confirmed empty balance read', async () => {
   const asset = {
     asset: { id: 'eip155:1/erc20:0x1111111111111111111111111111111111111111' },
@@ -600,9 +960,8 @@ test('notifies Portfolio only after a successful Confidential refresh for the ac
     runtime: { sendMessage: async message => updates.push(message) }
   }
   const { useWalletStore } = await import('../../../src/store/wallet-store.ts')
-  const { getConfidentialFundingMessageHandler } = await import(
-    '../../../src/background/confidential-funding-messages.ts'
-  )
+  const { getConfidentialFundingMessageHandler, isExpectedConfidentialAuthorizationMiss } =
+    await import('../../../src/background/confidential-funding-messages.ts')
   const wallet = useWalletStore.getState()
   const previousScope = {
     currentNetwork: wallet.currentNetwork,
@@ -661,6 +1020,29 @@ test('notifies Portfolio only after a successful Confidential refresh for the ac
       message
     )
     expect(updates).toEqual([])
+
+    const authorizationError = new Error('Confidential authorization is required')
+    Object.assign(authorizationError, { balanceErrorCode: 'authorization_required' })
+    expect(
+      isExpectedConfidentialAuthorizationMiss('REFRESH_CONFIDENTIAL_BALANCES', authorizationError)
+    ).toBe(true)
+    expect(
+      isExpectedConfidentialAuthorizationMiss(
+        'REFRESH_CONFIDENTIAL_BALANCES',
+        new Error('Confidential authorization is required')
+      )
+    ).toBe(false)
+    await expect(
+      handler(
+        context(async () => {
+          throw new Error('Confidential authorization is required')
+        }),
+        { ...message, authorize: false }
+      )
+    ).rejects.toMatchObject({
+      message: 'Confidential authorization is required',
+      balanceErrorCode: 'authorization_required'
+    })
 
   } finally {
     Object.assign(wallet, previousScope)

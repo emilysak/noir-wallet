@@ -29,6 +29,13 @@ test.describe('Portfolio asset-mode visibility', () => {
       isAssetVisibleInAssetView(chain('near:mainnet', 'near', 'NEAR'), asset({ symbol: 'NEAR' }))
     ).toBe(false)
     expect(
+      isAssetVisibleInAssetView(chain('near:mainnet', 'near', 'NEAR'), {
+        asset: { id: 'near:mainnet/slip44:397', chainId: 'near:mainnet', kind: 'native' },
+        metadata: { symbol: 'NEAR' },
+        balance: { totalRaw: '0', confidentialRaw: '5' }
+      })
+    ).toBe(true)
+    expect(
       isAssetVisibleInAssetView(
         chain('eip155:1', 'evm', 'Ethereum'),
         asset({ kind: 'token', symbol: 'USDC' })

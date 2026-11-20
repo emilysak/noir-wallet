@@ -1,15 +1,18 @@
 import Big from '@/lib/big'
 import type {
   PortfolioAssetView,
+  PortfolioBalanceView,
+  PortfolioChainView,
   PortfolioReadModel,
   ConfidentialPortfolioView
 } from '@/core/portfolio'
-import type { AssetRegistry } from '@/core/chains/registry'
+import type { AssetRegistry, AssetRegistryEntry } from '@/core/chains/registry'
 import { getBitcoinChainId, getZcashChainId } from '@/core/chains/registry'
 import type { SwapToken } from '@/core/services/intents-api'
 import { isDeprecatedIntentsToken } from '@/core/services/intents-evm-assets'
 import type { IntentsManagedAsset } from '@/core/services/intents-managed-assets'
 import type { Network } from '@/types'
+import { NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS } from './native-confidential-protocol-assets'
 
 export interface ConfidentialPortfolioBalance {
   readonly tokenId: string
@@ -19,6 +22,66 @@ export interface ConfidentialPortfolioBalance {
 export interface ConfidentialPortfolioAssetMapping {
   readonly assetId: string
   readonly protocolAssetId: string
+}
+
+function nativeConfidentialPortfolioAssetId(protocolAssetId: string): string | null {
+  const alias = NATIVE_CONFIDENTIAL_PROTOCOL_ASSETS.find(
+    item => item.protocolAssetId === protocolAssetId
+  )
+  return alias ? `${alias.chainId}/slip44:${alias.reference}` : null
+}
+
+function readRegistryAsset(assets: AssetRegistry, assetId: string) {
+  try {
+    return assets.get(assetId)
+  } catch {
+    return undefined
+  }
+}
+
+function hasNativeConfidentialMapping(
+  mappings: readonly ConfidentialPortfolioAssetMapping[],
+  protocolAssetId: string
+): boolean {
+  const nativeAssetId = nativeConfidentialPortfolioAssetId(protocolAssetId)
+  return (
+    nativeAssetId !== null &&
+    mappings.some(
+      mapping => mapping.assetId === nativeAssetId && mapping.protocolAssetId === protocolAssetId
+    )
+  )
+}
+
+// A wrapped catalog row and the native coin share one protocol asset. The home
+// list keeps that balance on the native asset, so a later NEP-141 mapping must
+// not replace slip44:397, slip44:501, or Bitcoin slip44:0.
+function mappedConfidentialAssetId(
+  mappings: readonly ConfidentialPortfolioAssetMapping[],
+  protocolAssetId: string
+): string | undefined {
+  if (hasNativeConfidentialMapping(mappings, protocolAssetId)) {
+    return nativeConfidentialPortfolioAssetId(protocolAssetId) ?? undefined
+  }
+  return mappings.find(mapping => mapping.protocolAssetId === protocolAssetId)?.assetId
+}
+
+function registeredNativeConfidentialAsset(
+  protocolAssetId: string,
+  assets: AssetRegistry,
+  tokenDecimals: number | undefined
+) {
+  const assetId = nativeConfidentialPortfolioAssetId(protocolAssetId)
+  if (!assetId) return undefined
+  const registered = readRegistryAsset(assets, assetId)
+  if (!registered) return undefined
+  if (
+    tokenDecimals !== undefined &&
+    registered.metadata?.decimals !== undefined &&
+    registered.metadata.decimals !== tokenDecimals
+  ) {
+    return undefined
+  }
+  return registered
 }
 
 export function filterConfidentialPortfolioMappings(
@@ -128,16 +191,17 @@ export function buildConfidentialPortfolioView(
 
   const tokenById = new Map(tokens.map(token => [token.assetId, token]))
   const managedById = new Map(managedAssets.map(asset => [asset.protocolAssetId, asset]))
-  const mappedById = new Map(mappings.map(mapping => [mapping.protocolAssetId, mapping.assetId]))
   const entries = [...byProtocolId].flatMap(([protocolAssetId, { balance }]) => {
     if (balance.available === '0') return []
     const token = tokenById.get(protocolAssetId)
     if (isDeprecatedIntentsToken({ assetId: protocolAssetId, symbol: token?.symbol })) return []
     const managed = managedById.get(protocolAssetId)
-    const mappedAssetId = mappedById.get(protocolAssetId)
-    const registered = mappedAssetId ? assets.get(mappedAssetId) : undefined
-    const assetId = managed?.assetId ?? registered?.asset.id
-    const chainId = managed?.chainId ?? registered?.asset.chainId
+    const mappedAssetId = mappedConfidentialAssetId(mappings, protocolAssetId)
+    const mapped = mappedAssetId ? readRegistryAsset(assets, mappedAssetId) : undefined
+    const native = registeredNativeConfidentialAsset(protocolAssetId, assets, token?.decimals)
+    const registered = native ?? mapped
+    const assetId = native?.asset.id ?? managed?.assetId ?? mapped?.asset.id
+    const chainId = native?.asset.chainId ?? managed?.chainId ?? mapped?.asset.chainId
     const bundledMetadata =
       token &&
       registered?.source === 'bundled' &&
@@ -184,6 +248,14 @@ function mergeAsset(
 ): PortfolioAssetView {
   const mapping = mappings.find(candidate => candidate.assetId === asset.asset.id)
   if (!mapping) return asset
+  const nativeAssetId = nativeConfidentialPortfolioAssetId(mapping.protocolAssetId)
+  if (
+    nativeAssetId &&
+    asset.asset.id !== nativeAssetId &&
+    hasNativeConfidentialMapping(mappings, mapping.protocolAssetId)
+  ) {
+    return asset
+  }
   const confidentialRaw = isDeprecatedIntentsToken({ assetId: mapping.protocolAssetId })
     ? '0'
     : (getConfidentialAvailableForAsset(balances, mapping.protocolAssetId) ?? '0')
@@ -261,6 +333,52 @@ export function mergeConfidentialBalancesIntoPortfolio(
   })
 }
 
+function canProjectConfidentialOnlyAsset(
+  entry: AssetRegistryEntry,
+  chain: PortfolioChainView
+): boolean {
+  if (entry.asset.chainId !== chain.chain.id) return false
+  if (chain.status !== 'ready' && chain.status !== 'partial') return false
+  if (chain.chain.family === 'evm') return entry.asset.kind === 'token'
+  if (chain.chain.network.kind !== 'mainnet') return false
+  if (chain.chain.family === 'near') {
+    return entry.asset.kind === 'native' || entry.asset.namespace === 'nep141'
+  }
+  if (chain.chain.family === 'solana') return true
+  if (chain.chain.family === 'bitcoin') {
+    return entry.asset.id === `${entry.asset.chainId}/slip44:0`
+  }
+  return false
+}
+
+function confidentialOnlyBalance(
+  family: PortfolioChainView['chain']['family'],
+  availableRaw: string
+): PortfolioBalanceView {
+  if (family === 'evm') {
+    return Object.freeze({
+      totalRaw: availableRaw,
+      spendableRaw: '0',
+      availableRaw: '0',
+      pendingRaw: '0',
+      mainRaw: '0',
+      privateRaw: availableRaw,
+      privateOnchainRaw: '0',
+      confidentialRaw: availableRaw
+    })
+  }
+  // On-chain total stays zero. The home list adds confidentialRaw for display.
+  return Object.freeze({
+    totalRaw: '0',
+    spendableRaw: '0',
+    availableRaw: '0',
+    pendingRaw: '0',
+    mainRaw: '0',
+    privateRaw: '0',
+    confidentialRaw: availableRaw
+  })
+}
+
 export function projectConfidentialOnlyEvmAssets(
   model: PortfolioReadModel,
   confidential: ConfidentialPortfolioView,
@@ -270,7 +388,10 @@ export function projectConfidentialOnlyEvmAssets(
   if (confidential.status !== 'ready') return model
   const existing = new Set<string>(model.assets.map(asset => asset.asset.id))
   const mappedByProtocolId = new Map(
-    mappings.map(mapping => [mapping.protocolAssetId, mapping.assetId])
+    mappings.map(mapping => [
+      mapping.protocolAssetId,
+      mappedConfidentialAssetId(mappings, mapping.protocolAssetId)
+    ])
   )
   const holdingCountByAssetId = new Map<string, number>()
   for (const holding of confidential.assets) {
@@ -287,8 +408,7 @@ export function projectConfidentialOnlyEvmAssets(
       !assetId ||
       existing.has(assetId) ||
       mappedByProtocolId.get(holding.protocolAssetId) !== assetId ||
-      holdingCountByAssetId.get(assetId) !== 1 ||
-      !assetId.startsWith('eip155:')
+      holdingCountByAssetId.get(assetId) !== 1
     )
       return []
     const entry = assets.get(assetId)
@@ -298,12 +418,9 @@ export function projectConfidentialOnlyEvmAssets(
     )?.chainAccountIds
     if (
       !entry ||
-      entry.asset.kind !== 'token' ||
-      entry.asset.chainId !== holding.chainId ||
       entry.metadata.decimals !== holding.decimals ||
       !chain ||
-      chain.chain.family !== 'evm' ||
-      (chain.status !== 'ready' && chain.status !== 'partial') ||
+      !canProjectConfidentialOnlyAsset(entry, chain) ||
       !chainAccountIds
     )
       return []
@@ -313,16 +430,7 @@ export function projectConfidentialOnlyEvmAssets(
         asset: entry.asset,
         metadata: entry.metadata,
         source: entry.source,
-        balance: Object.freeze({
-          totalRaw: holding.availableRaw,
-          spendableRaw: '0',
-          availableRaw: '0',
-          pendingRaw: '0',
-          mainRaw: '0',
-          privateRaw: holding.availableRaw,
-          privateOnchainRaw: '0',
-          confidentialRaw: holding.availableRaw
-        }),
+        balance: confidentialOnlyBalance(chain.chain.family, holding.availableRaw),
         chainAccountIds,
         freshness: confidential.freshness === 'stale' ? ('stale' as const) : ('fresh' as const),
         updatedAt: confidential.updatedAt ?? Date.now()

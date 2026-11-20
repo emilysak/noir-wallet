@@ -18,6 +18,18 @@ export type ConfidentialBalanceErrorCode =
   | 'account_unavailable'
   | 'balance_unavailable'
 
+export function isExpectedConfidentialAuthorizationMiss(
+  messageType: string,
+  error: unknown
+): boolean {
+  return (
+    messageType === 'REFRESH_CONFIDENTIAL_BALANCES' &&
+    error instanceof Error &&
+    'balanceErrorCode' in error &&
+    error.balanceErrorCode === 'authorization_required'
+  )
+}
+
 function classifyBalanceReadError(error: unknown): ConfidentialBalanceErrorCode {
   if (error instanceof ConfidentialFundingApiError && error.status === 401)
     return 'authorization_required'
