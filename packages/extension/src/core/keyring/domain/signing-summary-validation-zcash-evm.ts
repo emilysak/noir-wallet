@@ -17,6 +17,7 @@ import {
   assertOpaqueContentReview,
   assertReviewIssuesAllowed,
   readArray,
+  readBoolean,
   readBoundedString,
   readCanonicalContent,
   readHex,
@@ -27,6 +28,34 @@ import {
   readUnsignedDecimal,
   type ParsedSigningSummaryEnvelope
 } from './signing-summary-validation'
+import {
+  decodeEvmAuthorizationCall,
+  evmContractCallReviewIssues
+} from '@/infrastructure/chains/evm/evm-contract-call-classification'
+import { isPriorityFeeElevated } from '@/infrastructure/chains/evm/evm-fee-tier'
+
+function l1DataFeeWei(fields: EvmTransactionSummary['fields']): bigint {
+  return fields.l1DataFeeWei === undefined ? 0n : BigInt(fields.l1DataFeeWei)
+}
+
+function validatePriorityFeeWarning(
+  fields: EvmTransactionSummary['fields'],
+  chosenFeePerGasWei: bigint
+): void {
+  const suggested = fields.suggestedFeePerGasWei
+  const elevated = fields.priorityFeeElevated
+  if (suggested === undefined && elevated === undefined) return
+  if (suggested === undefined || elevated === undefined) {
+    throw new Error('EVM priority fee warning is incomplete')
+  }
+  if (suggested === null) {
+    if (elevated) throw new Error('EVM priority fee warning is incomplete')
+    return
+  }
+  if (isPriorityFeeElevated(chosenFeePerGasWei, BigInt(suggested)) !== elevated) {
+    throw new Error('EVM priority fee warning does not match the prepared fee')
+  }
+}
 
 function hasReviewIssue(
   review: SigningReview,
@@ -224,9 +253,13 @@ function validateEvmFeeFields(fields: EvmTransactionSummary['fields']): void {
     if (BigInt(fields.maxPriorityFeePerGasWei) > BigInt(fields.maxFeePerGasWei)) {
       throw new Error('EIP-1559 priority fee exceeds max fee')
     }
-    if (BigInt(fields.gasLimit) * BigInt(fields.maxFeePerGasWei) !== BigInt(fields.maximumFeeWei)) {
+    if (
+      BigInt(fields.gasLimit) * BigInt(fields.maxFeePerGasWei) + l1DataFeeWei(fields) !==
+      BigInt(fields.maximumFeeWei)
+    ) {
       throw new Error('EIP-1559 maximum fee does not match gas limit and max fee per gas')
     }
+    validatePriorityFeeWarning(fields, BigInt(fields.maxPriorityFeePerGasWei))
     return
   }
   if (
@@ -236,16 +269,25 @@ function validateEvmFeeFields(fields: EvmTransactionSummary['fields']): void {
   ) {
     throw new Error('Legacy/EIP-2930 summary contains an invalid fee field combination')
   }
-  if (BigInt(fields.gasLimit) * BigInt(fields.gasPriceWei) !== BigInt(fields.maximumFeeWei)) {
+  if (
+    BigInt(fields.gasLimit) * BigInt(fields.gasPriceWei) + l1DataFeeWei(fields) !==
+    BigInt(fields.maximumFeeWei)
+  ) {
     throw new Error('EVM maximum fee does not match gas limit and gas price')
   }
+  validatePriorityFeeWarning(fields, BigInt(fields.gasPriceWei))
   if (fields.transactionType === 'legacy' && fields.accessList.length !== 0) {
     throw new Error('Legacy EVM transaction cannot contain an access list')
   }
 }
 
 function parseEvmTransaction(envelope: ParsedSigningSummaryEnvelope): EvmTransactionSummary {
-  assertReviewIssuesAllowed(envelope.review, ['contract-creation', 'unrecognized-call'])
+  assertReviewIssuesAllowed(envelope.review, [
+    'contract-creation',
+    'unrecognized-call',
+    'token-approval',
+    'unlimited-token-approval'
+  ])
   const fields = envelope.fields
   assertExactKeys(
     fields,
@@ -264,7 +306,7 @@ function parseEvmTransaction(envelope: ParsedSigningSummaryEnvelope): EvmTransac
       'calldata',
       'methodSelector'
     ],
-    [],
+    ['l1DataFeeWei', 'suggestedFeePerGasWei', 'priorityFeeElevated'],
     'EvmSummary.fields'
   )
   const calldata = readCanonicalContent(fields.calldata, 'EvmSummary.fields.calldata')
@@ -291,6 +333,30 @@ function parseEvmTransaction(envelope: ParsedSigningSummaryEnvelope): EvmTransac
     valueWei: readUnsignedDecimal(fields.valueWei, 'EvmSummary.fields.valueWei'),
     gasLimit: readUnsignedDecimal(fields.gasLimit, 'EvmSummary.fields.gasLimit'),
     maximumFeeWei: readUnsignedDecimal(fields.maximumFeeWei, 'EvmSummary.fields.maximumFeeWei'),
+    ...(fields.l1DataFeeWei === undefined
+      ? {}
+      : {
+          l1DataFeeWei: readUnsignedDecimal(fields.l1DataFeeWei, 'EvmSummary.fields.l1DataFeeWei')
+        }),
+    ...(fields.suggestedFeePerGasWei === undefined
+      ? {}
+      : {
+          suggestedFeePerGasWei:
+            fields.suggestedFeePerGasWei === null
+              ? null
+              : readUnsignedDecimal(
+                  fields.suggestedFeePerGasWei,
+                  'EvmSummary.fields.suggestedFeePerGasWei'
+                )
+        }),
+    ...(fields.priorityFeeElevated === undefined
+      ? {}
+      : {
+          priorityFeeElevated: readBoolean(
+            fields.priorityFeeElevated,
+            'EvmSummary.fields.priorityFeeElevated'
+          )
+        }),
     gasPriceWei:
       fields.gasPriceWei === null
         ? null
@@ -316,9 +382,41 @@ function parseEvmTransaction(envelope: ParsedSigningSummaryEnvelope): EvmTransac
   if (parsedFields.to === null) requireReviewIssue(envelope.review, 'contract-creation')
   else assertNoUnexpectedIssue(envelope.review, 'contract-creation')
   if (calldata.byteLength > 0 && parsedFields.to !== null) {
-    requireReviewIssue(envelope.review, 'unrecognized-call')
+    const authorization = decodeEvmAuthorizationCall(calldata.value, parsedFields.to)
+    const expectedIssues = evmContractCallReviewIssues(calldata.value, parsedFields.to)
+    if (authorization?.kind === 'permit2-lockdown') {
+      assertNoUnexpectedIssue(envelope.review, 'unrecognized-call')
+      assertNoUnexpectedIssue(envelope.review, 'token-approval')
+      assertNoUnexpectedIssue(envelope.review, 'unlimited-token-approval')
+    } else if (authorization) {
+      requireReviewIssue(envelope.review, 'token-approval')
+      assertNoUnexpectedIssue(envelope.review, 'unrecognized-call')
+      if (authorization.kind === 'erc20-approve' && authorization.unlimited) {
+        requireReviewIssue(envelope.review, 'unlimited-token-approval')
+      } else if (authorization.kind === 'permit2-approve' && authorization.unlimited) {
+        requireReviewIssue(envelope.review, 'unlimited-token-approval')
+      } else {
+        assertNoUnexpectedIssue(envelope.review, 'unlimited-token-approval')
+      }
+    }
+    if (authorization) {
+      if (
+        envelope.review.issues.length !== expectedIssues.length ||
+        expectedIssues.some(
+          (expected, index) => envelope.review.issues[index]?.code !== expected.code
+        )
+      ) {
+        throw new Error('EVM authorization review issues do not match calldata')
+      }
+    } else {
+      requireReviewIssue(envelope.review, 'unrecognized-call')
+      assertNoUnexpectedIssue(envelope.review, 'token-approval')
+      assertNoUnexpectedIssue(envelope.review, 'unlimited-token-approval')
+    }
   } else {
     assertNoUnexpectedIssue(envelope.review, 'unrecognized-call')
+    assertNoUnexpectedIssue(envelope.review, 'token-approval')
+    assertNoUnexpectedIssue(envelope.review, 'unlimited-token-approval')
   }
   return Object.freeze({
     schema: 'evm.transaction.v1',

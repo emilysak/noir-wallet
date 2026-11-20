@@ -7,8 +7,11 @@ import {
   type TransactionId,
   type TransactionSegmentId
 } from '@/core/transactions/domain'
-import type { PreparedEvmTransfer } from './evm-transaction-builder'
-import { isErc20ApproveCalldata } from './evm-contract-call-classification'
+import { evmPreparedMaximumFeeWei, type PreparedEvmTransfer } from './evm-transaction-builder'
+import {
+  decodeErc20CalldataRequest,
+  isErc20ApproveCalldata
+} from './evm-contract-call-classification'
 import {
   bindNearIntentsTransactionGraph,
   bindRheaSwapTransactionGraph,
@@ -40,10 +43,14 @@ function maximumNetworkFeeRaw(prepared: PreparedEvmTransfer): string {
     prepared.transaction.type === 'legacy'
       ? prepared.transaction.gasPrice
       : prepared.transaction.maxFeePerGas
-  if (!/^[1-9][0-9]{0,19}$/.test(gasLimit) || !/^(0|[1-9][0-9]{0,19})$/.test(maxFeePerGas)) {
+  if (
+    !/^[1-9][0-9]{0,19}$/.test(gasLimit) ||
+    !/^(0|[1-9][0-9]{0,19})$/.test(maxFeePerGas) ||
+    !/^(0|[1-9][0-9]{0,77})$/.test(prepared.l1DataFeeWei)
+  ) {
     throw new Error('Invalid prepared EVM fee limit')
   }
-  return (BigInt(gasLimit) * BigInt(maxFeePerGas)).toString()
+  return evmPreparedMaximumFeeWei(prepared)
 }
 
 function resolveFeeAssetId(input: CreateEvmTransferGraphInput) {
@@ -54,10 +61,17 @@ function resolveFeeAssetId(input: CreateEvmTransferGraphInput) {
   return feeAsset.asset.id
 }
 
-export function classifyEvmContractCall(prepared: PreparedEvmTransfer) {
+export function classifyEvmContractCall(prepared: PreparedEvmTransfer): {
+  readonly kind: 'approve' | 'contract-call'
+  readonly amountRaw?: string
+} | null {
   if (prepared.kind !== 'contract-call') return null
   if (isErc20ApproveCalldata(prepared.transaction.input)) {
     return Object.freeze({ kind: 'approve' as const })
+  }
+  const decoded = decodeErc20CalldataRequest(prepared.transaction.input)
+  if (decoded?.kind === 'transfer' || decoded?.kind === 'transferFrom') {
+    return Object.freeze({ kind: 'contract-call' as const, amountRaw: decoded.amountRaw })
   }
   return Object.freeze({ kind: 'contract-call' as const })
 }
@@ -152,6 +166,9 @@ export function createEvmTransferGraph(input: CreateEvmTransferGraphInput): Tran
               ? '0'
               : input.prepared.transaction.maxPriorityFeePerGas,
           gasLimit: input.prepared.transaction.gasLimit,
+          ...(input.prepared.l1DataFeeWei === '0'
+            ? {}
+            : { l1DataFeeWei: input.prepared.l1DataFeeWei }),
           unsignedTransaction: input.prepared.transaction,
           ...(input.prepared.transaction.input.length >= 10
             ? { methodSelector: input.prepared.transaction.input.slice(0, 10).toLowerCase() }

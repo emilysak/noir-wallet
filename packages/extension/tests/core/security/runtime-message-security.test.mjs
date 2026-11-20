@@ -458,6 +458,12 @@ test.describe('Runtime message security', () => {
     expect(
       isTrustedRuntimeMessageSender('GET_EVM_TOKEN_ALLOWANCE', contentScriptSender, extensionId)
     ).toBe(false)
+    expect(
+      isTrustedRuntimeMessageSender('GET_EVM_PERMIT2_ALLOWANCES', popupSender, extensionId)
+    ).toBe(true)
+    expect(
+      isTrustedRuntimeMessageSender('GET_EVM_PERMIT2_ALLOWANCES', contentScriptSender, extensionId)
+    ).toBe(false)
     expect(isTrustedRuntimeMessageSender('GET_PORTFOLIO', popupSender, extensionId)).toBe(true)
     expect(isTrustedRuntimeMessageSender('GET_ACTIVITY', popupSender, extensionId)).toBe(true)
     const shieldRefresh = {
@@ -655,12 +661,62 @@ test.describe('Runtime message security', () => {
     expect(getContentScriptSenderOrigin(sender, extensionId)).toBe('https://wallet.example')
     expect(
       getContentScriptSenderOrigin(
+        {
+          ...sender,
+          url: 'https://wallet.example/other?q=1#section',
+          documentUrl: 'https://wallet.example/docs',
+          tab: { id: 4, url: 'https://wallet.example/app?from=tab' }
+        },
+        extensionId
+      )
+    ).toBe('https://wallet.example')
+    // A missing frameId is not a subframe. Only a provided non-zero frameId is rejected.
+    expect(getContentScriptSenderOrigin({ ...sender, frameId: undefined }, extensionId)).toBe(
+      'https://wallet.example'
+    )
+    expect(
+      getContentScriptSenderOrigin(
         { ...sender, tab: { id: 4, url: 'https://forged.example/app' } },
         extensionId
       )
     ).toBeNull()
-    expect(getContentScriptSenderOrigin({ ...sender, frameId: 1 }, extensionId)).toBeNull()
+    for (const frameId of [1, 2, -1, 1.5]) {
+      expect(getContentScriptSenderOrigin({ ...sender, frameId }, extensionId)).toBeNull()
+    }
     expect(getContentScriptSenderOrigin({ ...sender, origin: 'null' }, extensionId)).toBeNull()
+    for (const opaqueUrl of [
+      'null',
+      'about:blank',
+      'about:srcdoc',
+      'data:text/html,hello',
+      'blob:https://wallet.example/11111111-1111-1111-1111-111111111111',
+      'file:///tmp/page.html'
+    ]) {
+      expect(
+        getContentScriptSenderOrigin(
+          {
+            id: extensionId,
+            origin: opaqueUrl,
+            url: opaqueUrl,
+            documentUrl: opaqueUrl,
+            frameId: 0,
+            tab: { id: 4, url: opaqueUrl }
+          },
+          extensionId
+        )
+      ).toBeNull()
+    }
+    for (const conflictingSender of [
+      { ...sender, url: 'https://forged.example/app' },
+      { ...sender, documentUrl: 'https://forged.example/app' },
+      { ...sender, origin: 'https://forged.example' },
+      { ...sender, origin: 'http://wallet.example' },
+      { ...sender, url: 'https://wallet.example:8443/app' },
+      { ...sender, id: 'other-extension' },
+      { ...sender, tab: { id: 4.5, url: 'https://wallet.example/app' } }
+    ]) {
+      expect(getContentScriptSenderOrigin(conflictingSender, extensionId)).toBeNull()
+    }
   })
 
   test('accepts only the exact dApp request envelope and bounded params', () => {
@@ -1455,6 +1511,15 @@ test.describe('Runtime message security', () => {
       expectedOwner: '0x3333333333333333333333333333333333333333',
       executionMode: 'private'
     }
+    const permit2Request = {
+      type: 'GET_EVM_PERMIT2_ALLOWANCES',
+      walletId: 'wallet-1',
+      accountId: 'account-1'
+    }
+    expect(parseTrustedExtensionRuntimeMessage(permit2Request)).toEqual(permit2Request)
+    expect(() =>
+      parseTrustedExtensionRuntimeMessage({ ...permit2Request, walletId: 'x'.repeat(4_097) })
+    ).toThrow(/schema/i)
     expect(parseTrustedExtensionRuntimeMessage(allowanceRequest)).toEqual(allowanceRequest)
     expect(() =>
       parseTrustedExtensionRuntimeMessage({ ...allowanceRequest, token: 'not-an-address' })

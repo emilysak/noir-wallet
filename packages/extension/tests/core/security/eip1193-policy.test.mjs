@@ -3,6 +3,9 @@ import { expect } from '@playwright/test'
 
 import {
   Eip1193ProviderError,
+  inspectNearIntentsSigningPayload,
+  isNearIntentsSigningPayload,
+  MAX_NEAR_INTENTS_JSON_DEPTH,
   parseEip1193ChainRequest,
   parseEip1193Transfer,
   parseEthAccountsPermissionRequest,
@@ -276,4 +279,70 @@ test.describe('EIP-1193 request policy', () => {
       parseTypedDataV4Request([sender, typedData.replace('"chainId":1', '"chainId":2')], 1)
     ).toThrow(/active chain/)
   })
+
+  test('recognizes NEAR Intents signing payloads and ignores ordinary messages', () => {
+    const authPayload = JSON.stringify({
+      signer_id: sender,
+      verifying_contract: 'intents.near',
+      deadline: '2026-11-18T00:05:00.000Z',
+      nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+      intents: []
+    })
+    const withdrawPayload = JSON.stringify({
+      deadline: '2026-11-18T00:05:00.000Z',
+      intents: [{ intent: 'transfer' }],
+      nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+      signer_id: sender,
+      verifying_contract: 'intents.far'
+    })
+    expect(isNearIntentsSigningPayload(authPayload)).toBe(true)
+    expect(isNearIntentsSigningPayload(withdrawPayload)).toBe(true)
+    expect(
+      isNearIntentsSigningPayload(
+        JSON.stringify({ signer_id: sender, intents: [], nonce: 'n', deadline: 'd' })
+      )
+    ).toBe(true)
+    expect(isNearIntentsSigningPayload('{"verifying_contract":"\\u0069ntents.near"}')).toBe(true)
+    expect(isNearIntentsSigningPayload(JSON.stringify({ note: '{"payload":"intents.far"}' }))).toBe(
+      true
+    )
+    expect(
+      isNearIntentsSigningPayload(JSON.stringify({ signer_id: sender, intents: [], nonce: 'n' }))
+    ).toBe(false)
+    expect(isNearIntentsSigningPayload('Authorize read-only access to swap history.')).toBe(false)
+    expect(isNearIntentsSigningPayload('Hello')).toBe(false)
+    expect(isNearIntentsSigningPayload('The signer_id sets intents nonce and deadline.')).toBe(
+      false
+    )
+  })
+
+  test('trims nested JSON and treats an unread JSON layer as incomplete', () => {
+    const spaced = JSON.stringify({
+      note: ' {"verifying_contract":"\\u0069ntents.near"} '
+    })
+    expect(inspectNearIntentsSigningPayload(spaced)).toBe('match')
+    const escaped = '{"verifying_contract":"\\u0069ntents.near"}'
+    expect(
+      inspectNearIntentsSigningPayload(wrapNearIntentsLayers(escaped, MAX_NEAR_INTENTS_JSON_DEPTH))
+    ).toBe('match')
+    expect(
+      inspectNearIntentsSigningPayload(
+        wrapNearIntentsLayers(escaped, MAX_NEAR_INTENTS_JSON_DEPTH + 1)
+      )
+    ).toBe('incomplete')
+    expect(
+      inspectNearIntentsSigningPayload(
+        wrapNearIntentsLayers('{"note":"hello"}', MAX_NEAR_INTENTS_JSON_DEPTH + 1)
+      )
+    ).toBe('incomplete')
+    expect(
+      isNearIntentsSigningPayload(wrapNearIntentsLayers(escaped, MAX_NEAR_INTENTS_JSON_DEPTH + 1))
+    ).toBe(true)
+  })
 })
+
+function wrapNearIntentsLayers(inner, layers) {
+  let payload = inner
+  for (let layer = 1; layer < layers; layer += 1) payload = JSON.stringify({ note: payload })
+  return payload
+}

@@ -22,6 +22,7 @@ import type {
   BackgroundEvmTransferReview,
   EvmTransferExecutionMode
 } from './evm-transfer-controller'
+import type { Erc20RevokeCall } from '@/infrastructure/chains/evm/evm-token-revoke'
 
 export interface BackgroundEvmTransferRouteController {
   readonly estimateTransferFee: (
@@ -57,6 +58,11 @@ export interface BackgroundEvmTransferRouteController {
     expectedOwner: string,
     executionModeValue?: unknown
   ) => Promise<string>
+  readonly selectTokenRevoke: (
+    token: string,
+    spender: string,
+    expectedOwner: string
+  ) => Promise<Erc20RevokeCall>
   readonly getTokenBalance: (
     token: string,
     expectedWalletId: string,
@@ -263,6 +269,17 @@ export class BackgroundEvmTransferRouter {
       expectedOwner,
       executionMode
     )
+  }
+
+  async selectTokenRevoke(
+    chainIdValue: string,
+    token: string,
+    spender: string,
+    expectedOwner: string
+  ): Promise<Erc20RevokeCall> {
+    const chain = parseChainId(chainIdValue)
+    if (chain.namespace !== 'eip155') throw new Error('EVM allowance requires an EVM chain')
+    return this.requireController(chain.id).selectTokenRevoke(token, spender, expectedOwner)
   }
 
   async getTokenBalance(

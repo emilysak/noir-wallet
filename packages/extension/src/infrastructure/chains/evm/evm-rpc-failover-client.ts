@@ -8,9 +8,13 @@ import {
   type EvmContractRpc,
   type EvmDAppReadRpc,
   type EvmDAppRpcCall,
+  type EvmBlockHeader,
   type EvmLatestBlockFee,
+  type EvmLogQuery,
+  type EvmLogRpc,
   type EvmNonceQueueEndpointSelector,
   type EvmNonceQueueRpc,
+  type EvmQueriedLog,
   type EvmRpcBlockTag,
   type EvmRpcCall,
   type EvmTransactionLocation,
@@ -18,7 +22,12 @@ import {
   type EvmTransactionRpc
 } from './evm-rpc-client'
 
-type EvmRpc = EvmBalanceRpc & EvmContractRpc & EvmTransactionRpc & EvmBroadcastRpc & EvmDAppReadRpc
+type EvmRpc = EvmBalanceRpc &
+  EvmContractRpc &
+  EvmTransactionRpc &
+  EvmBroadcastRpc &
+  EvmDAppReadRpc &
+  EvmLogRpc
 
 export interface EvmRpcFailoverClientConfig {
   readonly chainId: string
@@ -174,6 +183,12 @@ export function createEvmRpcFailoverClient(
       run(state => state.client.getCode(address, signal), signal),
     callContract: (address: string, data: string, signal?: AbortSignal) =>
       run(state => state.client.callContract(address, data, signal), signal),
+    getCodeAt: (address: string, blockNumber: string, signal?: AbortSignal) =>
+      run(state => state.client.getCodeAt(address, blockNumber, signal), signal),
+    getBlockHeader: (block: 'latest' | string, signal?: AbortSignal): Promise<EvmBlockHeader> =>
+      run(state => state.client.getBlockHeader(block, signal), signal),
+    getLogs: (query: EvmLogQuery, signal?: AbortSignal): Promise<readonly EvmQueriedLog[]> =>
+      run(state => state.client.getLogs(query, signal), signal),
     call: (call: EvmDAppRpcCall, blockTag: EvmRpcBlockTag, signal?: AbortSignal) =>
       run(state => state.client.call(call, blockTag, signal), signal),
     getTransactionCount: (address: string, blockTag: EvmRpcBlockTag, signal?: AbortSignal) =>

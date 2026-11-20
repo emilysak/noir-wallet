@@ -233,6 +233,25 @@ function solanaSignature(item: ActivityItem): string | null {
   return item.id.startsWith(prefix) ? item.id.slice(prefix.length) : null
 }
 
+async function readPlantedEvmParties(
+  scope: ActivityScope,
+  field: 'plantedRecipients' | 'plantedSenders'
+): Promise<readonly { chainId: string; address: string }[]> {
+  const records = await listEvmHistoryCacheByScope(scope)
+  const planted: { chainId: string; address: string }[] = []
+  const seen = new Set<string>()
+  for (const record of records) {
+    for (const address of record[field] ?? []) {
+      const key = `${record.chainId}:${address}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      planted.push({ chainId: record.chainId, address })
+      if (planted.length === 2_000) return Object.freeze(planted)
+    }
+  }
+  return Object.freeze(planted)
+}
+
 export function createBackgroundActivityCoordinator(
   bitcoinCustomRpcUrl?: string,
   endpointSettings?: ChainEndpointSettings
@@ -822,6 +841,8 @@ export function createBackgroundActivityCoordinator(
     loadSupplementalItems,
     loadCachedSupplementalItems,
     loadSupplementalHasMore,
+    loadPlantedRecipients: scope => readPlantedEvmParties(scope, 'plantedRecipients'),
+    loadPlantedSenders: scope => readPlantedEvmParties(scope, 'plantedSenders'),
     ...(evmHistorySources.length > 0
       ? {
           loadPrivateExecutionAddresses: async (

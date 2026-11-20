@@ -23,6 +23,7 @@ import {
   createEvmSigningSummary,
   createEvmSigningPreparePayload,
   createEvmTransferGraph,
+  estimateEvmTransferFee,
   parseEvmContractCallIntent,
   parsePreparedEvmTransfer,
   parseEvmTransferIntent
@@ -159,6 +160,9 @@ test.describe('EVM transfer builder', () => {
         input: '0x',
         accessList: []
       },
+      l1DataFeeWei: '0',
+      suggestedFeePerGasWei: '1000000000',
+      priorityFeeElevated: false,
       createdAt: 1_800_000_000_000
     })
     expect(calls[0]).toBe('chain')
@@ -177,7 +181,10 @@ test.describe('EVM transfer builder', () => {
       kind: 'evm-transaction',
       chainId: 'eip155:1',
       addressIndex: 2,
-      transaction: prepared.transaction
+      transaction: prepared.transaction,
+      l1DataFeeWei: '0',
+      suggestedFeePerGasWei: '1000000000',
+      priorityFeeElevated: false
     })
 
     const signingSummary = {
@@ -196,6 +203,9 @@ test.describe('EVM transfer builder', () => {
         gasPriceWei: null,
         maxFeePerGasWei: '5000000000',
         maxPriorityFeePerGasWei: '1000000000',
+        l1DataFeeWei: '0',
+        suggestedFeePerGasWei: '1000000000',
+        priorityFeeElevated: false,
         accessList: [],
         calldata: {
           encoding: 'hex',
@@ -538,7 +548,10 @@ test.describe('EVM transfer builder', () => {
       kind: 'pea-evm-transaction',
       chainId: 'eip155:1',
       addressIndex: 2,
-      transaction: prepared.transaction
+      transaction: prepared.transaction,
+      l1DataFeeWei: '0',
+      suggestedFeePerGasWei: '1000000000',
+      priorityFeeElevated: false
     })
     const signerSummary = await createEvmSigningSummary(prepared)
     await expect(
@@ -666,6 +679,18 @@ test.describe('EVM transfer builder', () => {
       assets
     })
     expect(approvalGraph.root.kind).toBe('approve')
+
+    const approvalSummary = await createEvmSigningSummary({
+      ...prepared,
+      transaction: {
+        ...prepared.transaction,
+        input: `0x095ea7b3${'0'.repeat(24)}${recipient.slice(2)}${'f'.repeat(64)}`
+      }
+    })
+    expect(approvalSummary.review).toEqual({
+      level: 'caution',
+      issues: [{ code: 'token-approval' }, { code: 'unlimited-token-approval' }]
+    })
   })
 
   test('rejects a reverting contract call before signing', async () => {
@@ -974,5 +999,179 @@ test.describe('EVM transfer builder', () => {
     )
     expect(stale).toBeInstanceOf(EvmTransactionError)
     expect(stale.code).toBe('stale-nonce')
+  })
+
+  test('keeps an Ethereum quote when an OP Stack oracle is not part of the chain', async () => {
+    const prepared = await buildEvmTransfer({
+      chainId,
+      chainAccount: account,
+      assets,
+      intent: { assetId: 'eip155:1/slip44:60', recipient, amountRaw: '123' },
+      rpc: transactionRpc({
+        callContract: async () => {
+          throw new Error('Ethereum must not query the OP Stack oracle')
+        }
+      }),
+      now: () => 1
+    })
+    expect(prepared.l1DataFeeWei).toBe('0')
+    expect(prepared.priorityFeeElevated).toBe(false)
+    expect(prepared.transaction.maxFeePerGas).toBe('5000000000')
+  })
+
+  test('adds buffered OP Stack L1 data and operator fees without changing the signed gas price', async () => {
+    const optimismId = parseChainId('eip155:10').id
+    const optimismAccount = { ...account, scope: { ...account.scope, chainId: optimismId } }
+    const calls = []
+    const rpc = transactionRpc({
+      callContract: async (oracle, data) => {
+        calls.push([oracle, data])
+        return data.startsWith('0x49948e0e')
+          ? `0x${1000n.toString(16).padStart(64, '0')}`
+          : `0x${50n.toString(16).padStart(64, '0')}`
+      }
+    })
+    const prepared = await buildEvmTransfer({
+      chainId: optimismId,
+      chainAccount: optimismAccount,
+      assets,
+      intent: { assetId: 'eip155:10/slip44:60', recipient, amountRaw: '123' },
+      rpc,
+      now: () => 1
+    })
+    const executionFee = 21_000n * 5_000_000_000n
+    expect(prepared.transaction.maxFeePerGas).toBe('5000000000')
+    expect(prepared.l1DataFeeWei).toBe('2050')
+    expect(calls).toHaveLength(2)
+    expect(calls[0][0].toLowerCase()).toBe('0x420000000000000000000000000000000000000f')
+    expect(calls[0][1].startsWith('0x49948e0e')).toBe(true)
+    const summary = await createEvmSigningSummary(prepared)
+    expect(summary.fields.maximumFeeWei).toBe((executionFee + 2050n).toString())
+    expect(summary.fields.l1DataFeeWei).toBe('2050')
+    const graph = createEvmTransferGraph({
+      prepared,
+      scope: optimismAccount.scope,
+      transactionId: parseTransactionId('transaction:evm:optimism'),
+      segmentId: parseTransactionSegmentId('segment:evm:optimism'),
+      chainAccountId: account.id,
+      assets
+    })
+    expect(graph.root.intent?.feeLimit?.amountRaw).toBe((executionFee + 2050n).toString())
+    expect(graph.root.intent?.evm?.l1DataFeeWei).toBe('2050')
+    const { l1DataFeeWei, suggestedFeePerGasWei, priorityFeeElevated, ...stored } = prepared
+    expect(parsePreparedEvmTransfer(stored)).toMatchObject({
+      l1DataFeeWei: '0',
+      suggestedFeePerGasWei: null,
+      priorityFeeElevated: false
+    })
+    const estimate = await estimateEvmTransferFee({
+      chainId: optimismId,
+      chainAccount: optimismAccount,
+      assets,
+      intent: { assetId: 'eip155:10/slip44:60', recipient, amountRaw: '123' },
+      rpc
+    })
+    expect(estimate.maximumFeeWei).toBe((executionFee + 2050n).toString())
+    expect(estimate.l1DataFeeWei).toBe('2050')
+  })
+
+  test('reserves the buffered L1 fee when the operator fee method is absent', async () => {
+    const optimismId = parseChainId('eip155:10').id
+    const prepared = await buildEvmTransfer({
+      chainId: optimismId,
+      chainAccount: { ...account, scope: { ...account.scope, chainId: optimismId } },
+      assets,
+      intent: { assetId: 'eip155:10/slip44:60', recipient, amountRaw: '123' },
+      rpc: transactionRpc({
+        callContract: async (_oracle, data) => {
+          if (data.startsWith('0x49948e0e')) return `0x${1000n.toString(16).padStart(64, '0')}`
+          throw new EvmRpcError('rpc-error', 'execution reverted')
+        }
+      })
+    })
+    expect(prepared.l1DataFeeWei).toBe('2000')
+    expect(prepared.transaction.maxFeePerGas).toBe('5000000000')
+  })
+
+  test('fails preparation when the OP Stack L1 fee oracle is unavailable', async () => {
+    const optimismId = parseChainId('eip155:10').id
+    const error = await captureError(
+      buildEvmTransfer({
+        chainId: optimismId,
+        chainAccount: { ...account, scope: { ...account.scope, chainId: optimismId } },
+        assets,
+        intent: { assetId: 'eip155:10/slip44:60', recipient, amountRaw: '123' },
+        rpc: transactionRpc({
+          callContract: async () => {
+            throw new EvmRpcError('rpc-error', 'execution reverted')
+          }
+        })
+      })
+    )
+    expect(error).toBeInstanceOf(EvmTransactionError)
+    expect(error.code).toBe('invalid-intent')
+  })
+
+  test('includes the OP Stack fee in an insufficient balance', async () => {
+    const optimismId = parseChainId('eip155:10').id
+    const executionFee = 21_000n * 5_000_000_000n
+    const error = await captureError(
+      buildEvmTransfer({
+        chainId: optimismId,
+        chainAccount: { ...account, scope: { ...account.scope, chainId: optimismId } },
+        assets,
+        intent: { assetId: 'eip155:10/slip44:60', recipient, amountRaw: '123' },
+        rpc: transactionRpc({
+          getNativeBalance: async () => (executionFee + 123n + 2049n).toString(),
+          callContract: async (_oracle, data) =>
+            data.startsWith('0x49948e0e')
+              ? `0x${1000n.toString(16).padStart(64, '0')}`
+              : `0x${50n.toString(16).padStart(64, '0')}`
+        })
+      })
+    )
+    expect(error).toBeInstanceOf(EvmTransactionError)
+    expect(error.code).toBe('insufficient-funds')
+    expect(error.insufficientFunds.shortfallRaw).toBe('1')
+    expect(error.insufficientFunds.maximumGasCostRaw).toBe((executionFee + 2050n).toString())
+  })
+
+  test('marks an abnormally high priority fee without changing it', async () => {
+    const prepared = await buildEvmTransfer({
+      chainId,
+      chainAccount: account,
+      assets,
+      intent: { assetId: 'eip155:1/slip44:60', recipient, amountRaw: '123' },
+      feeSelection: {
+        kind: 'custom',
+        maxPriorityFeePerGasWei: '11000000000',
+        maxFeePerGasWei: '20000000000'
+      },
+      rpc: transactionRpc(),
+      now: () => 1
+    })
+    expect(prepared.transaction.maxPriorityFeePerGas).toBe('11000000000')
+    expect(prepared.priorityFeeElevated).toBe(true)
+    expect(prepared.suggestedFeePerGasWei).toBe('1000000000')
+    const fast = await buildEvmTransfer({
+      chainId,
+      chainAccount: account,
+      assets,
+      intent: { assetId: 'eip155:1/slip44:60', recipient, amountRaw: '123' },
+      feeTier: 'fast',
+      rpc: transactionRpc()
+    })
+    expect(fast.priorityFeeElevated).toBe(false)
+    const spiked = await buildEvmTransfer({
+      chainId,
+      chainAccount: account,
+      assets,
+      intent: { assetId: 'eip155:1/slip44:60', recipient, amountRaw: '123' },
+      rpc: transactionRpc({
+        getMaximumPriorityFeePerGas: async () => '201000000000'
+      })
+    })
+    expect(spiked.priorityFeeElevated).toBe(true)
+    expect(BigInt(spiked.transaction.maxPriorityFeePerGas) > 200n * 1_000_000_000n).toBe(true)
   })
 })

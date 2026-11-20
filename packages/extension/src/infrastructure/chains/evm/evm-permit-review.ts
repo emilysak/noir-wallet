@@ -15,6 +15,9 @@ export interface EvmPermitReview {
   readonly spender: string
   readonly verifyingContract: string
   readonly signatureDeadlineRaw: string
+  /** DAI permit uses expiry 0 for an allowance with no deadline. */
+  readonly deadlineUnbounded?: boolean
+  readonly witnessReceivers?: readonly string[]
   readonly tokens: readonly {
     readonly contractAddress: string
     readonly amountRaw: string
@@ -152,53 +155,39 @@ function tokenList(
     : null
 }
 
+function bool(value: EvmTypedDataValue): boolean | null {
+  if (value.kind !== 'scalar' || value.solidityType !== 'bool') return null
+  if (value.value === 'true') return true
+  if (value.value === 'false') return false
+  return null
+}
+
 function plainTypedValue(value: EvmTypedDataValue): unknown {
   if (value.kind === 'scalar') {
-    return /^uint[0-9]+$/.test(value.solidityType) ? BigInt(value.value) : value.value
+    if (/^uint[0-9]+$/.test(value.solidityType)) return BigInt(value.value)
+    if (value.solidityType === 'bool') return value.value === 'true'
+    return value.value
   }
   if (value.kind === 'array') return value.items.map(plainTypedValue)
   return Object.fromEntries(value.fields.map(field => [field.name, plainTypedValue(field.value)]))
 }
 
-function matchesCanonicalBatchDigest(summary: EvmTypedDataSummary): boolean {
-  const primaryType = summary.fields.primaryType
+export function matchesTypedDataDigest(
+  summary: EvmTypedDataSummary,
+  types: Readonly<Record<string, readonly { readonly name: string; readonly type: string }[]>>
+): boolean {
+  const { domain } = summary.fields
+  if (domain.kind !== 'struct') return false
+  const domainFields: { name: string; type: string }[] = []
+  for (const field of domain.fields) {
+    if (field.value.kind !== 'scalar') return false
+    domainFields.push({ name: field.name, type: field.value.solidityType })
+  }
   try {
     const typedData = {
-      domain: plainTypedValue(summary.fields.domain),
-      types: {
-        EIP712Domain: [
-          { name: 'name', type: 'string' },
-          { name: 'chainId', type: 'uint256' },
-          { name: 'verifyingContract', type: 'address' }
-        ],
-        ...(primaryType === 'PermitBatch'
-          ? {
-              PermitDetails: [
-                { name: 'token', type: 'address' },
-                { name: 'amount', type: 'uint160' },
-                { name: 'expiration', type: 'uint48' },
-                { name: 'nonce', type: 'uint48' }
-              ],
-              PermitBatch: [
-                { name: 'details', type: 'PermitDetails[]' },
-                { name: 'spender', type: 'address' },
-                { name: 'sigDeadline', type: 'uint256' }
-              ]
-            }
-          : {
-              TokenPermissions: [
-                { name: 'token', type: 'address' },
-                { name: 'amount', type: 'uint256' }
-              ],
-              PermitBatchTransferFrom: [
-                { name: 'permitted', type: 'TokenPermissions[]' },
-                { name: 'spender', type: 'address' },
-                { name: 'nonce', type: 'uint256' },
-                { name: 'deadline', type: 'uint256' }
-              ]
-            })
-      },
-      primaryType,
+      domain: plainTypedValue(domain),
+      types: { EIP712Domain: domainFields, ...types },
+      primaryType: summary.fields.primaryType,
       message: plainTypedValue(summary.fields.message)
     }
     return (
@@ -207,6 +196,200 @@ function matchesCanonicalBatchDigest(summary: EvmTypedDataSummary): boolean {
     )
   } catch {
     return false
+  }
+}
+
+function matchesCanonicalBatchDigest(summary: EvmTypedDataSummary): boolean {
+  const transfer = summary.fields.primaryType === 'PermitBatchTransferFrom'
+  return matchesTypedDataDigest(
+    summary,
+    transfer
+      ? {
+          TokenPermissions: [
+            { name: 'token', type: 'address' },
+            { name: 'amount', type: 'uint256' }
+          ],
+          PermitBatchTransferFrom: [
+            { name: 'permitted', type: 'TokenPermissions[]' },
+            { name: 'spender', type: 'address' },
+            { name: 'nonce', type: 'uint256' },
+            { name: 'deadline', type: 'uint256' }
+          ]
+        }
+      : {
+          PermitDetails: [
+            { name: 'token', type: 'address' },
+            { name: 'amount', type: 'uint160' },
+            { name: 'expiration', type: 'uint48' },
+            { name: 'nonce', type: 'uint48' }
+          ],
+          PermitBatch: [
+            { name: 'details', type: 'PermitDetails[]' },
+            { name: 'spender', type: 'address' },
+            { name: 'sigDeadline', type: 'uint256' }
+          ]
+        }
+  )
+}
+
+const MAX_UINT256 = ((1n << 256n) - 1n).toString()
+const PRIMITIVE_TYPE = /^(?:address|bool|string|bytes\d*|u?int\d*)$/
+const STRUCT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function valueType(value: EvmTypedDataValue): string | null {
+  if (value.kind === 'scalar') return value.solidityType
+  if (value.kind === 'array') return `${value.itemType}[]`
+  return STRUCT_NAME.test(value.typeName) ? value.typeName : null
+}
+
+function sameDefinition(
+  left: readonly { readonly name: string; readonly type: string }[],
+  right: readonly { readonly name: string; readonly type: string }[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (field, index) => field.name === right[index]?.name && field.type === right[index]?.type
+    )
+  )
+}
+
+function addStructTypes(
+  value: EvmTypedDataValue,
+  types: Record<string, { name: string; type: string }[]>
+): boolean {
+  if (value.kind === 'scalar') return true
+  if (value.kind === 'array') {
+    if (
+      value.items.some(item => {
+        if (item.kind === 'struct') return item.typeName !== value.itemType
+        if (item.kind === 'scalar') return item.solidityType !== value.itemType
+        return true
+      })
+    ) {
+      return false
+    }
+    if (value.items.length === 0) {
+      return (
+        PRIMITIVE_TYPE.test(value.itemType) ||
+        Object.prototype.hasOwnProperty.call(types, value.itemType)
+      )
+    }
+    return value.items.every(item => addStructTypes(item, types))
+  }
+  const definition: { name: string; type: string }[] = []
+  for (const field of value.fields) {
+    const type = valueType(field.value)
+    if (!type) return false
+    definition.push({ name: field.name, type })
+  }
+  const existing = types[value.typeName]
+  if (existing) {
+    if (!sameDefinition(existing, definition)) return false
+  } else {
+    types[value.typeName] = definition
+  }
+  return value.fields.every(field => addStructTypes(field.value, types))
+}
+
+function witnessTypeName(value: EvmTypedDataValue): string | null {
+  if (value.kind === 'scalar') {
+    return value.solidityType === 'bytes32' && /^0x[0-9a-fA-F]{64}$/.test(value.value)
+      ? 'bytes32'
+      : null
+  }
+  return value.kind === 'struct' && STRUCT_NAME.test(value.typeName) ? value.typeName : null
+}
+
+function matchesWitnessDigest(
+  summary: EvmTypedDataSummary,
+  witness: EvmTypedDataValue,
+  batch: boolean
+): boolean {
+  const witnessType = witnessTypeName(witness)
+  if (!witnessType) return false
+  const primaryType = summary.fields.primaryType
+  const types: Record<string, { name: string; type: string }[]> = {
+    TokenPermissions: [
+      { name: 'token', type: 'address' },
+      { name: 'amount', type: 'uint256' }
+    ],
+    [primaryType]: [
+      { name: 'permitted', type: batch ? 'TokenPermissions[]' : 'TokenPermissions' },
+      { name: 'spender', type: 'address' },
+      { name: 'nonce', type: 'uint256' },
+      { name: 'deadline', type: 'uint256' },
+      { name: 'witness', type: witnessType }
+    ]
+  }
+  // The witness type is chosen by the integrator. Rehashing binds that struct to the signed
+  // digest and rejects fixed-length permitted arrays, which the summary AST cannot represent.
+  if (witness.kind === 'struct' && !addStructTypes(witness, types)) return false
+  return matchesTypedDataDigest(summary, types)
+}
+
+function collectWitnessReceivers(value: EvmTypedDataValue, receivers: string[]): void {
+  if (value.kind === 'array') {
+    for (const item of value.items) collectWitnessReceivers(item, receivers)
+    return
+  }
+  if (value.kind !== 'struct') return
+  for (const field of value.fields) {
+    if (field.name === 'receiver' || field.name === 'recipient') {
+      const receiver = address(field.value)
+      if (receiver) receivers.push(receiver)
+    }
+    collectWitnessReceivers(field.value, receivers)
+  }
+}
+
+function decodeDaiPermit(
+  summary: EvmTypedDataSummary,
+  message: EvmTypedDataValue,
+  owner: string,
+  verifyingContract: string
+): EvmPermitReview | null {
+  const permit = fields(message, 'Permit', ['holder', 'spender', 'nonce', 'expiry', 'allowed'])
+  if (!permit) return null
+  const holder = address(permit[0])
+  const spender = address(permit[1])
+  const nonce = unsigned(permit[2], 256)
+  const expiry = unsigned(permit[3], 256)
+  const allowed = bool(permit[4])
+  if (
+    !holder ||
+    holder.toLowerCase() !== owner.toLowerCase() ||
+    !spender ||
+    nonce === null ||
+    expiry === null ||
+    allowed === null ||
+    !matchesTypedDataDigest(summary, {
+      Permit: [
+        { name: 'holder', type: 'address' },
+        { name: 'spender', type: 'address' },
+        { name: 'nonce', type: 'uint256' },
+        { name: 'expiry', type: 'uint256' },
+        { name: 'allowed', type: 'bool' }
+      ]
+    })
+  ) {
+    return null
+  }
+  return {
+    protocol: 'Permit',
+    kind: 'allowance',
+    owner,
+    spender,
+    verifyingContract,
+    signatureDeadlineRaw: expiry,
+    ...(expiry === '0' ? { deadlineUnbounded: true } : {}),
+    tokens: [
+      {
+        contractAddress: verifyingContract,
+        amountRaw: allowed ? MAX_UINT256 : '0',
+        amountBits: 256
+      }
+    ]
   }
 }
 
@@ -222,7 +405,7 @@ export function decodeEvmPermitReview(summary: EvmTypedDataSummary): EvmPermitRe
 
   if (primaryType === 'Permit') {
     const permit = fields(message, 'Permit', ['owner', 'spender', 'value', 'nonce', 'deadline'])
-    if (!permit) return null
+    if (!permit) return decodeDaiPermit(summary, message, owner, verifyingContract)
     const signedOwner = address(permit[0])
     const spender = address(permit[1])
     const amountRaw = unsigned(permit[2], 256)
@@ -249,16 +432,25 @@ export function decodeEvmPermitReview(summary: EvmTypedDataSummary): EvmPermitRe
     }
   }
 
+  const witnessSingle = primaryType === 'PermitWitnessTransferFrom'
+  const witnessBatch = primaryType === 'PermitBatchWitnessTransferFrom'
   const allowance = primaryType === 'PermitSingle' || primaryType === 'PermitBatch'
-  const transfer = primaryType === 'PermitTransferFrom' || primaryType === 'PermitBatchTransferFrom'
+  const transfer =
+    primaryType === 'PermitTransferFrom' ||
+    primaryType === 'PermitBatchTransferFrom' ||
+    witnessSingle ||
+    witnessBatch
   if (!allowance && !transfer) return null
-  const single = primaryType === 'PermitSingle' || primaryType === 'PermitTransferFrom'
+  const single =
+    primaryType === 'PermitSingle' || primaryType === 'PermitTransferFrom' || witnessSingle
   const signed = fields(
     message,
     primaryType,
     allowance
       ? ['details', 'spender', 'sigDeadline']
-      : ['permitted', 'spender', 'nonce', 'deadline']
+      : witnessSingle || witnessBatch
+        ? ['permitted', 'spender', 'nonce', 'deadline', 'witness']
+        : ['permitted', 'spender', 'nonce', 'deadline']
   )
   if (!signed) return null
   const spender = address(signed[1])
@@ -277,8 +469,17 @@ export function decodeEvmPermitReview(summary: EvmTypedDataSummary): EvmPermitRe
       ? tokenList(signed[0], 'PermitDetails', permitDetails)
       : tokenList(signed[0], 'TokenPermissions', tokenPermission)
   if (!tokens) return null
-  // The summary AST drops fixed array lengths, so confirm the original digest used dynamic arrays.
-  if (!single && !matchesCanonicalBatchDigest(summary)) return null
+  const witness = witnessSingle || witnessBatch ? signed[4] : null
+  let witnessReceivers: string[] | undefined
+  if (witness) {
+    if (!matchesWitnessDigest(summary, witness, witnessBatch)) return null
+    const receivers: string[] = []
+    collectWitnessReceivers(witness, receivers)
+    if (receivers.length > 0) witnessReceivers = receivers
+  } else if (!single && !matchesCanonicalBatchDigest(summary)) {
+    // The summary AST drops fixed array lengths, so confirm the original digest used dynamic arrays.
+    return null
+  }
   return {
     protocol: 'Permit2',
     kind: allowance ? 'allowance' : 'transfer',
@@ -286,6 +487,7 @@ export function decodeEvmPermitReview(summary: EvmTypedDataSummary): EvmPermitRe
     spender,
     verifyingContract,
     signatureDeadlineRaw,
+    ...(witnessReceivers ? { witnessReceivers } : {}),
     tokens
   }
 }

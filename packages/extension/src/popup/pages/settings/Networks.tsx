@@ -31,6 +31,7 @@ import {
   type CustomEvmNetworkField,
   type CustomEvmNetworkForm
 } from '../../services/custom-evm-network-model'
+import { evmRpcOriginLabel } from '@/core/chains/evm-rpc-origin'
 import { buildNetworkSettingsOptions } from '../../services/chain-settings-options'
 import { RpcEndpoint } from './RpcEndpoint'
 import { PreferredExplorer } from './PreferredExplorer'
@@ -294,6 +295,10 @@ export function Networks() {
                 <dt className="text-muted">Currency</dt>
                 <dd className="break-all text-right">{detail.currencySymbol}</dd>
               </div>
+              <div className="flex items-center justify-between gap-4">
+                <dt className="text-muted">RPC</dt>
+                <dd>{evmRpcOriginLabel(detail.rpcOrigin)}</dd>
+              </div>
             </dl>
             {ready && (
               <div key={detail.chainId} className="space-y-3">
@@ -341,6 +346,9 @@ export function Networks() {
                         <span className="block truncate text-sm font-medium" title={network.label}>
                           {network.label}
                         </span>
+                      </span>
+                      <span className="shrink-0 text-xs text-muted">
+                        {evmRpcOriginLabel(network.rpcOrigin)}
                       </span>
                       <Icon icon="lucide:chevron-right" className="size-4 shrink-0 text-muted" />
                     </button>

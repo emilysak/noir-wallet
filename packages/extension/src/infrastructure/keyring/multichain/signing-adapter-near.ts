@@ -1,6 +1,17 @@
+import { bytesToBase64 } from '@/lib/bytes'
+import {
+  INTERNAL_SIGNATURE_DOMAIN_REJECTION_MESSAGE,
+  nearMessageUsesInternalSignatureDomain
+} from '@/core/dapp/internal-signature-domains'
+import {
+  NEAR_DAPP_ADD_INTENTS_PUBLIC_KEY_REJECTION,
+  nearDappFunctionCallAddsIntentsPublicKey,
+  nearMessageAddsIntentsPublicKey
+} from '@/core/dapp/near-intents-add-public-key'
 import type { ChainId } from '@/core/chains/domain'
 import { parseSigningSummary } from '@/core/keyring/domain/signing-summary-validation'
 import type {
+  CanonicalContent,
   NearAccessKeyPermissionSummary,
   NearActionSummary
 } from '@/core/keyring/domain/signing-summary'
@@ -40,6 +51,7 @@ export type NearSigningPreparePayload =
       chainId: ChainId
       accountIndex: number
       transaction: UnknownRecord
+      source?: 'dapp'
     }>
   | Readonly<{
       kind: 'near-nep413-message'
@@ -47,6 +59,14 @@ export type NearSigningPreparePayload =
       accountIndex: number
       request: UnknownRecord
     }>
+
+const NEAR_DAPP_ADD_FULL_ACCESS_KEY_REJECTION = 'NEAR dApp requests cannot add a full-access key.'
+const NEAR_DAPP_DELETE_KEY_REJECTION =
+  'NEAR dApp requests cannot delete a full-access or wallet key.'
+const NEAR_DAPP_DELETE_ACCOUNT_REJECTION = 'NEAR dApp requests cannot delete this account.'
+const NEAR_DAPP_SELF_DEPLOY_REJECTION =
+  'NEAR dApp requests cannot deploy a contract to this account.'
+const NEAR_DAPP_STAKE_REJECTION = 'NEAR dApp requests cannot stake.'
 
 export type NearPendingSigningKind = NearSigningPreparePayload['kind']
 
@@ -84,7 +104,12 @@ export function parseNearSigningPreparePayload(value: unknown): NearSigningPrepa
     'signing.prepare kind'
   )
   if (kind === 'near-transaction') {
-    assertExactKeys(record, ['kind', 'chainId', 'accountIndex', 'transaction'], [], 'payload')
+    assertExactKeys(
+      record,
+      ['kind', 'chainId', 'accountIndex', 'transaction'],
+      ['source'],
+      'payload'
+    )
     const chainId = readChainId(record.chainId)
     const transaction = readRecord(record.transaction, 'transaction')
     assertExactKeys(
@@ -101,13 +126,21 @@ export function parseNearSigningPreparePayload(value: unknown): NearSigningPrepa
     if (transaction.chainId !== chainId || transaction.accountIndex !== accountIndex) {
       throw new Error('NEAR transaction account binding does not match the command')
     }
+    const source =
+      record.source === undefined ? undefined : readLiteral(record.source, ['dapp'], 'source')
     readArray(
       transaction.actions,
       'transaction.actions',
       item => readRecord(item, 'NEAR action'),
       100
     )
-    return Object.freeze({ kind, chainId, accountIndex, transaction: Object.freeze(transaction) })
+    return Object.freeze({
+      kind,
+      chainId,
+      accountIndex,
+      transaction: Object.freeze(transaction),
+      ...(source === undefined ? {} : { source })
+    })
   }
   assertExactKeys(record, ['kind', 'chainId', 'accountIndex', 'request'], [], 'payload')
   const chainId = readChainId(record.chainId)
@@ -253,6 +286,55 @@ async function nearAction(value: unknown): Promise<NearActionSummary> {
   }
 }
 
+function rejectForbiddenNearDAppActions(
+  actions: readonly NearActionSummary[],
+  signerId: unknown,
+  receiverId: unknown
+): void {
+  const deploysToSigner =
+    typeof signerId === 'string' && signerId.length > 0 && receiverId === signerId
+  for (const action of actions) {
+    switch (action.kind) {
+      case 'stake':
+        throw new Error(NEAR_DAPP_STAKE_REJECTION)
+      case 'delete-account':
+        throw new Error(NEAR_DAPP_DELETE_ACCOUNT_REJECTION)
+      case 'deploy-contract':
+        if (deploysToSigner) throw new Error(NEAR_DAPP_SELF_DEPLOY_REJECTION)
+        break
+      case 'add-key':
+        if (action.permission.kind === 'full-access') {
+          throw new Error(NEAR_DAPP_ADD_FULL_ACCESS_KEY_REJECTION)
+        }
+        break
+      case 'delete-key':
+        // The prepared action carries only the public key, so a dApp summary
+        // cannot prove the key is neither full-access nor wallet-held.
+        throw new Error(NEAR_DAPP_DELETE_KEY_REJECTION)
+      case 'function-call':
+        if (
+          typeof receiverId === 'string' &&
+          nearDappFunctionCallAddsIntentsPublicKey(
+            receiverId,
+            action.methodName,
+            functionCallArgumentBytes(action.args)
+          )
+        ) {
+          throw new Error(NEAR_DAPP_ADD_INTENTS_PUBLIC_KEY_REJECTION)
+        }
+        break
+      default:
+        break
+    }
+  }
+}
+
+function functionCallArgumentBytes(args: CanonicalContent): Uint8Array | null {
+  if (args.encoding === 'base64') return decodeBase64(args.value)
+  if (args.encoding === 'utf8') return utf8Bytes(args.value)
+  return null
+}
+
 async function adaptNearTransaction(
   raw: unknown,
   payload: Extract<NearSigningPreparePayload, { kind: 'near-transaction' }>,
@@ -298,6 +380,9 @@ async function adaptNearTransaction(
   const actions = await Promise.all(
     readArray(rawSummary.actions, 'actions', item => item, 100).map(nearAction)
   )
+  if (payload.source === 'dapp') {
+    rejectForbiddenNearDAppActions(actions, rawSummary.signerId, rawSummary.receiverId)
+  }
   const summary = parseSigningSummary(
     {
       schema: 'near.transaction.v1',
@@ -361,13 +446,41 @@ async function adaptNearMessage(
     [],
     'NEAR message summary'
   )
+  const request = payload.request
+  const nonce = readArray(
+    request.nonce,
+    'NEAR message nonce',
+    byte => readSafeInteger(byte, 'NEAR message nonce byte', 255),
+    32
+  )
+  if (nonce.length !== 32) throw new Error('NEAR message nonce must contain 32 bytes')
   if (
     rawSummary.chainId !== payload.chainId ||
     rawSummary.publicKey !== account.publicKey ||
-    rawSummary.signingImplicitAccountId !== account.address
+    rawSummary.signingImplicitAccountId !== account.address ||
+    rawSummary.accountId !== request.accountId ||
+    rawSummary.message !== request.message ||
+    rawSummary.recipient !== request.recipient ||
+    rawSummary.nonce !== bytesToBase64(Uint8Array.from(nonce)) ||
+    rawSummary.callbackUrl !== request.callbackUrl ||
+    rawSummary.state !== request.state
   )
-    throw new Error('Prepared NEAR message signer does not match')
-  const messageBytes = utf8Bytes(readString(rawSummary.message, 'message', 256 * 1024))
+    throw new Error('Prepared NEAR message does not match the request')
+  const messageText = readString(rawSummary.message, 'message', 256 * 1024)
+  const callbackUrl =
+    rawSummary.callbackUrl === null ? null : readString(rawSummary.callbackUrl, 'callbackUrl', 2048)
+  if (
+    nearMessageUsesInternalSignatureDomain({
+      message: messageText,
+      recipient: readString(rawSummary.recipient, 'recipient', 128),
+      callbackUrl
+    })
+  )
+    throw new Error(INTERNAL_SIGNATURE_DOMAIN_REJECTION_MESSAGE)
+  if (nearMessageAddsIntentsPublicKey({ message: messageText, callbackUrl })) {
+    throw new Error(NEAR_DAPP_ADD_INTENTS_PUBLIC_KEY_REJECTION)
+  }
+  const messageBytes = utf8Bytes(messageText)
   const message = await canonicalContent(messageBytes, 'utf8')
   const summary = parseSigningSummary(
     {

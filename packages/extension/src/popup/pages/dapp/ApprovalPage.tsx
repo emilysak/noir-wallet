@@ -16,11 +16,20 @@ import { StandardTransactionResult } from '../../components/transaction/Standard
 import { FeeTierPicker } from '../../components/transaction/FeeTierPicker'
 import { useFeeEstimate } from '../../hooks/useFeeEstimate'
 import { useSettingsStore } from '@/store/settings-store'
+import { DEFAULT_NETWORK } from '@/lib/runtime-network'
+import { resolveEvmRpcOrigin } from '@/core/chains/evm-rpc-origin'
+import { readEvmSimulationTransfers } from '@/core/chains/evm/evm-simulation-asset-changes'
 import { marginalFeeForTier } from '@/core/zcash/fee-policy'
 import type { FeeTier, QuotedFeeEstimate } from '@/config/fee'
 import type { AddressType } from '@/types/wallet'
 
 import { cn } from '@/lib/utils'
+import {
+  BROADCAST_MEMO_HIDDEN_CHARACTER_WARNING,
+  containsHiddenCharacters,
+  revealHiddenCharacters,
+  SIGNATURE_HIDDEN_CHARACTER_WARNING
+} from '@/lib/unicode-display'
 import { classifyError, getResponseErrorMessage } from '@/lib/errors'
 import { formatBaseUnitDecimalAmount } from '@/lib/number-format'
 import {
@@ -36,11 +45,17 @@ import {
 } from '@/popup/services/dapp-connection-presentation'
 import { EvmAddNetworkDetails } from '@/popup/components/dapp/EvmAddNetworkDetails'
 import {
+  ApprovalContextCard,
   ApprovalDetailCard,
   DAppConnectionHeader,
   DAppNetworkCard,
   DAppRequestHeader
 } from '@/popup/components/dapp/ApprovalRequestPresentation'
+import {
+  describeDAppMessageSigningMode,
+  parseZcashSignMessageApproval
+} from '@/background/dapp-message-signing'
+import { httpSignatureWarning } from '@/core/dapp/http-signature-warning'
 import { SigningSummaryReview } from '@/popup/components/signing/SigningSummaryReview'
 import { Skeleton } from '@/popup/components/ui/skeleton'
 import {
@@ -139,6 +154,14 @@ function ConnectionPermissionSummary({ includesActivity = false }: { includesAct
   )
 }
 
+function readEvmReviewExpiresAt(review: unknown): number | null {
+  if (typeof review !== 'object' || review === null || !('expiresAt' in review)) return null
+  const expiresAt = review.expiresAt
+  return typeof expiresAt === 'number' && Number.isSafeInteger(expiresAt) && expiresAt > 0
+    ? expiresAt
+    : null
+}
+
 export function ApprovalPage() {
   const { navigate } = useNavigate()
   const [searchParams] = useSearchParams()
@@ -210,6 +233,7 @@ export function ApprovalPage() {
   )
 
   const feeTier = useSettingsStore(state => state.feeTier)
+  const chainEndpointSettings = useSettingsStore(state => state.chainEndpointSettings)
   const setFeeTier = useSettingsStore(state => state.setFeeTier)
 
   const isSend = action === 'sendTransaction'
@@ -240,6 +264,16 @@ export function ApprovalPage() {
   const evmTransactionSummary = isEvmTransaction
     ? parseEvmTransactionSummary(data.review?.summary)
     : null
+  const evmReviewExpiresAt = isEvmTransaction ? readEvmReviewExpiresAt(data.review) : null
+  const [evmPreviewNow, setEvmPreviewNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (evmReviewExpiresAt === null) return
+    const timeout = setTimeout(
+      () => setEvmPreviewNow(Date.now()),
+      Math.max(0, evmReviewExpiresAt - Date.now())
+    )
+    return () => clearTimeout(timeout)
+  }, [evmReviewExpiresAt])
   const evmPrivateTransfer = isEvmPrivateTransfer ? parseEvmPrivateTransferApproval(data) : null
   const evmMessageSummary = isEvmMessage ? parseEvmMessageSummary(data.review?.summary) : null
   const evmExecutionMode =
@@ -250,6 +284,8 @@ export function ApprovalPage() {
     isEvmTransaction && evmExecutionMode === 'private' && typeof data.sendPrivately === 'boolean'
   const privacyTransferAvailable = privacyTransferEligible && data.privacyTransferAvailable === true
   const sendPrivately = privacyTransferAvailable && data.sendPrivately === true
+  const evmPreviewExpired =
+    evmReviewExpiresAt !== null && !sendPrivately && evmReviewExpiresAt <= evmPreviewNow
   const selectedPrivateTransfer = sendPrivately
     ? parseEvmPrivateTransferApproval(data.privateTransfer)
     : null
@@ -547,6 +583,7 @@ export function ApprovalPage() {
       (isLoading ||
         !!privacyUpdateError ||
         !privacyRevisionReady ||
+        evmPreviewExpired ||
         (sendPrivately && !privateTransferReady))
     )
       return
@@ -782,6 +819,8 @@ export function ApprovalPage() {
       />
     )
   }
+
+  const zcashSignMessage = action === 'signMessage' ? parseZcashSignMessageApproval(data) : null
 
   const renderInvalidSigningRequest = (message: string, messageRequest: boolean) => (
     <div className="space-y-5">
@@ -1205,8 +1244,11 @@ export function ApprovalPage() {
             </ApprovalDetailCard>
             {data.memo && (
               <ApprovalDetailCard title="Memo">
-                <p className="whitespace-pre-wrap break-words font-mono text-xs leading-5 text-foreground/90">
-                  {data.memo}
+                {containsHiddenCharacters(data.memo) ? (
+                  <WarningBox>{BROADCAST_MEMO_HIDDEN_CHARACTER_WARNING}</WarningBox>
+                ) : null}
+                <p className="whitespace-pre-wrap break-words font-mono text-xs leading-5 text-foreground/90 [unicode-bidi:isolate]">
+                  {revealHiddenCharacters(data.memo)}
                 </p>
               </ApprovalDetailCard>
             )}
@@ -1237,10 +1279,21 @@ export function ApprovalPage() {
           </div>
         )
 
-      case 'signMessage':
+      case 'signMessage': {
+        if (!zcashSignMessage) {
+          return renderInvalidSigningRequest(
+            'The request did not include a signing mode, address, and public key.',
+            true
+          )
+        }
+        const insecureHttpWarning = httpSignatureWarning(origin, 'message')
         return (
           <div className="space-y-5">
             <DAppRequestHeader domain={dappDomain} pageUrl={dappPageUrl} action="Sign message" />
+            {insecureHttpWarning ? <WarningBox>{insecureHttpWarning}</WarningBox> : null}
+            {containsHiddenCharacters(zcashSignMessage.message) ? (
+              <WarningBox>{SIGNATURE_HIDDEN_CHARACTER_WARNING}</WarningBox>
+            ) : null}
             <CopyToast show={showCopyToast} />
             <ApprovalDetailCard ariaLabel="Message">
               <div className="flex items-center justify-between gap-3">
@@ -1250,18 +1303,32 @@ export function ApprovalPage() {
                   aria-label="Copy message"
                   title="Copy message"
                   className="flex size-7 items-center justify-center rounded-lg text-muted transition-colors hover:bg-foreground/10 hover:text-foreground"
-                  onClick={() => void copyToClipboard(data.message)}
+                  onClick={() =>
+                    void copyToClipboard(revealHiddenCharacters(zcashSignMessage.message))
+                  }
                 >
                   <CopyFeedbackIcon copied={isCopied()} className="size-4" />
                 </button>
               </div>
-              <p className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground">
-                {data.message}
+              <p className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground [unicode-bidi:isolate]">
+                {revealHiddenCharacters(zcashSignMessage.message)}
               </p>
             </ApprovalDetailCard>
+            <ApprovalContextCard
+              ariaLabel="Signing identity"
+              rows={[
+                {
+                  label: 'Signing mode',
+                  value: describeDAppMessageSigningMode(zcashSignMessage.signingMode)
+                },
+                { label: 'Address', value: zcashSignMessage.address, code: true },
+                { label: 'Public key', value: zcashSignMessage.pubkey, code: true }
+              ]}
+            />
             <DAppNetworkCard chain="Zcash" network={NETWORKS[currentNetwork].name} />
           </div>
         )
+      }
 
       case 'shieldFunds':
         return (
@@ -1279,6 +1346,9 @@ export function ApprovalPage() {
                     <AmountDisplay value={data.amount} symbol="ZEC" />
                   </span>
                 </div>
+                <p className="text-xs text-muted">
+                  Shields the full confirmed transparent balance. The amount can change.
+                </p>
                 <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-3">
                   <span className="text-xs text-muted">Destination</span>
                   <span className="text-right text-xs text-foreground/90">Shielded pool</span>
@@ -1348,9 +1418,12 @@ export function ApprovalPage() {
     )
     .map(asset => ({
       contractAddress: asset.reference,
+      name: asset.metadata.name,
       symbol: asset.metadata.symbol,
-      decimals: asset.metadata.decimals
+      decimals: asset.metadata.decimals,
+      verification: 'trusted' as const
     }))
+  const simulationTransfers = readEvmSimulationTransfers(data.simulationTransfers)
 
   if (isEvmMessage && evmMessageSummary) {
     return (
@@ -1536,12 +1609,25 @@ export function ApprovalPage() {
         source={{ kind: 'dapp', domain: dappDomain, pageUrl: dappPageUrl }}
         accountMode={evmExecutionMode}
         isSubmitting={isLoading}
-        confirmDisabled={!!privacyUpdateError || !privacyRevisionReady}
-        notice={evmPrivacyControl}
+        confirmDisabled={!!privacyUpdateError || !privacyRevisionReady || evmPreviewExpired}
+        notice={
+          <>
+            {evmPrivacyControl}
+            {evmPreviewExpired ? (
+              <InlineError message="This transaction preview expired. Reject it and try again." />
+            ) : null}
+          </>
+        }
         evmPresentation={{
           nativeCurrency: { symbol: nativeSymbol, decimals: nativeDecimals },
           directContract: data.privacyRoute === 'direct-contract',
-          tokenMetadata: evmTokenMetadata
+          tokenMetadata: evmTokenMetadata,
+          ...(simulationTransfers === undefined ? {} : { simulationTransfers }),
+          rpcOrigin: resolveEvmRpcOrigin(
+            DEFAULT_NETWORK,
+            chainEndpointSettings,
+            evmTransactionSummary.chainId
+          )
         }}
         feeControl={
           data.feeEditingAvailable ? (
@@ -1743,6 +1829,7 @@ export function ApprovalPage() {
               ((isBitcoinTransaction || isBitcoinMessage) && bitcoinSigningSummary === null) ||
               ((isSolanaTransaction || isSolanaMessage || isNearTransaction || isNearMessage) &&
                 nativeSigningSummary === null) ||
+              (action === 'signMessage' && zcashSignMessage === null) ||
               (MULTI_ACCOUNT_CONNECT_ACTIONS.has(action) &&
                 (data.accounts?.length ?? 0) > 0 &&
                 selectedIds.length === 0) ||

@@ -7,7 +7,6 @@ import {
 import { parseNearAccountId } from '@/core/chains/near/identifiers'
 import { readRheaDestinationHash } from '@/core/services/rhea-swap/rhea-order-status'
 import { DedupPromise } from '@/lib/async-utils'
-import { parseSiweMessage } from 'viem/siwe'
 import { isAddress } from 'viem'
 import type {
   ConfidentialQuote,
@@ -356,6 +355,117 @@ function erc191ProofSignature(value: string): string {
   return `0x${bytes.map(byte => byte.toString(16).padStart(2, '0')).join('')}`
 }
 
+const READONLY_HISTORY_STATEMENT =
+  'Authorize read-only access to confidential Unified Swap history.'
+const SIWE_SIGN_IN_SUFFIX = ' wants you to sign in with your Ethereum account:'
+
+interface ReadonlyHistorySiweMessage {
+  readonly scheme?: string
+  readonly domain: string
+  readonly address: string
+  readonly statement: string
+  readonly uri: string
+  readonly version: string
+  readonly chainId: number
+  readonly nonce: string
+  readonly issuedAt: Date
+  readonly expirationTime: Date
+  readonly requestId: string
+  readonly resources: readonly string[]
+}
+
+function labeledSiweValue(line: string, label: string): string | undefined {
+  const prefix = `${label}: `
+  if (!line.startsWith(prefix)) return undefined
+  const value = line.slice(prefix.length)
+  return value ? value : undefined
+}
+
+function finiteSiweTimestamp(value: string | undefined): Date | undefined {
+  if (!value) return undefined
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? new Date(timestamp) : undefined
+}
+
+function parseSiweSchemeAndDomain(
+  header: string
+): Readonly<{ scheme?: string; domain: string }> | undefined {
+  if (!header.endsWith(SIWE_SIGN_IN_SUFFIX)) return undefined
+  const prefix = header.slice(0, -SIWE_SIGN_IN_SUFFIX.length)
+  const schemeSeparator = prefix.indexOf('://')
+  if (schemeSeparator === -1) return prefix ? { domain: prefix } : undefined
+  const scheme = prefix.slice(0, schemeSeparator)
+  const domain = prefix.slice(schemeSeparator + '://'.length)
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*$/.test(scheme) || !domain || domain.includes('://')) {
+    return undefined
+  }
+  return { scheme, domain }
+}
+
+// viem matches the SIWE preamble and field block separately, so text between
+// the statement and URI is still accepted. Signing requires one complete message.
+function parseReadonlyHistorySiweMessage(message: string): ReadonlyHistorySiweMessage | undefined {
+  if (message.includes('\r')) return undefined
+  const lines = message.split('\n')
+  const header = parseSiweSchemeAndDomain(lines[0] ?? '')
+  const address = lines[1] ?? ''
+  if (
+    !header ||
+    !/^0x[a-fA-F0-9]{40}$/.test(address) ||
+    lines[2] !== '' ||
+    lines[3] !== READONLY_HISTORY_STATEMENT ||
+    lines[4] !== ''
+  ) {
+    return undefined
+  }
+  const uri = labeledSiweValue(lines[5] ?? '', 'URI')
+  const version = labeledSiweValue(lines[6] ?? '', 'Version')
+  const chainIdRaw = labeledSiweValue(lines[7] ?? '', 'Chain ID')
+  const nonce = labeledSiweValue(lines[8] ?? '', 'Nonce')
+  const issuedAt = finiteSiweTimestamp(labeledSiweValue(lines[9] ?? '', 'Issued At'))
+  const expirationTime = finiteSiweTimestamp(labeledSiweValue(lines[10] ?? '', 'Expiration Time'))
+  const chainId =
+    chainIdRaw !== undefined && /^\d+$/.test(chainIdRaw) ? Number(chainIdRaw) : Number.NaN
+  if (
+    !uri ||
+    version !== '1' ||
+    !Number.isSafeInteger(chainId) ||
+    !nonce ||
+    !/^[a-zA-Z0-9]{8,}$/.test(nonce) ||
+    !issuedAt ||
+    !expirationTime
+  ) {
+    return undefined
+  }
+  let cursor = 11
+  if ((lines[cursor] ?? '').startsWith('Not Before: ')) {
+    if (!finiteSiweTimestamp(labeledSiweValue(lines[cursor] ?? '', 'Not Before'))) return undefined
+    cursor += 1
+  }
+  const requestId = labeledSiweValue(lines[cursor] ?? '', 'Request ID')
+  if (!requestId || lines[cursor + 1] !== 'Resources:') return undefined
+  const resourceLines = lines.slice(cursor + 2)
+  if (
+    resourceLines.length !== 3 ||
+    resourceLines.some(line => !line.startsWith('- ') || line.length < 3)
+  ) {
+    return undefined
+  }
+  return {
+    ...header,
+    address,
+    statement: READONLY_HISTORY_STATEMENT,
+    uri,
+    version: '1',
+    chainId,
+    nonce,
+    issuedAt,
+    expirationTime,
+    requestId,
+    resources: resourceLines.map(line => line.slice(2))
+  }
+}
+
 function assertReadonlyHistoryMessage(
   message: string,
   input: {
@@ -368,20 +478,22 @@ function assertReadonlyHistoryMessage(
 ): void {
   if (!requestOrigin) throw new Error('Wallet history request origin is unavailable')
   const origin = new URL(requestOrigin)
-  const parsed = parseSiweMessage(message)
-  const resources = parsed.resources ?? []
+  const parsed = parseReadonlyHistorySiweMessage(message)
+  const resources = parsed?.resources ?? []
   const walletResource = `urn:rhea:wallet:evm:${input.walletAddress.toLowerCase()}`
+  // URL.host is the origin authority and keeps a non-default port.
+  const authority = origin.host
   if (
-    parsed.domain !== origin.host ||
+    !parsed ||
+    parsed.domain !== authority ||
     parsed.uri !== requestOrigin ||
     (parsed.scheme !== undefined && parsed.scheme !== origin.protocol.slice(0, -1)) ||
     parsed.version !== '1' ||
-    parsed.address?.toLowerCase() !== input.walletAddress.toLowerCase() ||
+    parsed.address.toLowerCase() !== input.walletAddress.toLowerCase() ||
     parsed.chainId !== Number(input.chainId) ||
     parsed.requestId !== input.challengeId ||
-    parsed.statement !== 'Authorize read-only access to confidential Unified Swap history.' ||
-    parsed.expirationTime?.getTime() !== Date.parse(input.expiresAt) ||
-    !parsed.issuedAt ||
+    parsed.statement !== READONLY_HISTORY_STATEMENT ||
+    parsed.expirationTime.getTime() !== Date.parse(input.expiresAt) ||
     parsed.issuedAt.getTime() > Date.now() + 60_000 ||
     !parsed.nonce ||
     resources.length !== 3 ||

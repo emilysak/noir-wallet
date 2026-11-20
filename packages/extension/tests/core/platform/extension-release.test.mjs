@@ -834,7 +834,8 @@ describe('Extension release provenance gates', () => {
       [`contents/packages/extension/package.json?ref=${SOURCE_SHA}`]: {
         encoding: 'base64',
         content: Buffer.from('{"version":"2.0.0"}').toString('base64')
-      }
+      },
+      'tags?per_page=100&page=1': []
     }
     assert.deepEqual(
       await resolveReleaseSource({
@@ -885,6 +886,45 @@ describe('Extension release provenance gates', () => {
         request: requestFrom(candidateBase)
       }),
       /must match the current release branch HEAD/
+    )
+  })
+
+  it('accepts only a production version newer than published tags', async () => {
+    const resolveCandidate = (version, tags) =>
+      resolveReleaseSource({
+        mode: 'candidate',
+        source: `release/${version}`,
+        confirmSha: SOURCE_SHA,
+        request: requestFrom({
+          [`branches/release%2F${version}`]: { commit: { sha: SOURCE_SHA } },
+          [`contents/packages/extension/package.json?ref=${SOURCE_SHA}`]: {
+            encoding: 'base64',
+            content: Buffer.from(JSON.stringify({ version })).toString('base64')
+          },
+          ...tags
+        })
+      })
+    const page = [
+      { name: 'v2.0.0' },
+      { name: 'v2.0.0-beta.2' },
+      { name: 'v1.0.40' },
+      ...Array.from({ length: 97 }, (_, index) => ({ name: `nightly-${index}` }))
+    ]
+    assert.equal(
+      (await resolveCandidate('2.0.10', { 'tags?per_page=100&page=1': [{ name: 'v2.0.9' }] }))
+        .version,
+      '2.0.10'
+    )
+    await assert.rejects(
+      resolveCandidate('2.0.0', { 'tags?per_page=100&page=1': [{ name: 'v2.0.0' }] }),
+      /greater than the highest published tag v2\.0\.0/
+    )
+    await assert.rejects(
+      resolveCandidate('2.0.1', {
+        'tags?per_page=100&page=1': page,
+        'tags?per_page=100&page=2': [{ name: 'v2.0.2' }]
+      }),
+      /greater than the highest published tag v2\.0\.2/
     )
   })
 

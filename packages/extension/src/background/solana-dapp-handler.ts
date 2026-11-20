@@ -7,6 +7,7 @@ import {
   type SolanaDAppRuntimeMethod
 } from '@/core/dapp/native-transfer-provider'
 import { parseCanonicalBase64 } from '@/infrastructure/chains/solana/solana-rpc-codecs'
+import { solanaBytesParseAsTransaction } from '@/infrastructure/chains/solana/solana-transaction-codec'
 import type {
   SolanaBroadcastOptions,
   SolanaBroadcastRpc,
@@ -305,6 +306,12 @@ export class BackgroundSolanaDAppHandler {
       if (!decision.approved) {
         throw new NativeTransferProviderError(4001, 'User rejected the transaction request.')
       }
+      if (prepared.summary.review.level === 'blocked') {
+        throw new NativeTransferProviderError(
+          4200,
+          'This transaction reverted in simulation and cannot be signed.'
+        )
+      }
       approved = true
       const signed = await this.options.runActiveOperation(async () => {
         const current = await this.options.loadAuthorizedAccount(origin)
@@ -406,6 +413,12 @@ export class BackgroundSolanaDAppHandler {
     origin: string,
     tabInfo: NativeTransferDAppTabInfo
   ): Promise<Readonly<Record<string, string>>> {
+    if (solanaBytesParseAsTransaction(message)) {
+      throw new NativeTransferProviderError(
+        4200,
+        'Noir Wallet rejected this Solana message because it parses as a transaction.'
+      )
+    }
     const active = await this.options.loadAuthorizedAccount(origin)
     if (active.context.keyDomainSource.kind === 'hardware') {
       throw new NativeTransferProviderError(

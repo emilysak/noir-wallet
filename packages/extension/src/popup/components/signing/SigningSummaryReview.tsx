@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useRef, type ReactNode } from 'react'
 import { Icon } from '@iconify/react'
 import type { SigningSummary } from '@/core/keyring/domain'
 import { cn } from '@/lib/utils'
@@ -10,6 +10,8 @@ import {
 import { AmountDisplay } from '@/popup/components/common/AmountDisplay'
 import { TokenIcon } from '@/popup/components/tokens/TokenIcon'
 import { ApprovalWindowLayout } from '@/popup/components/dapp/ApprovalWindowLayout'
+import { WarningBox } from '@/popup/components/ui/WarningBox'
+import { httpSignatureWarning } from '@/core/dapp/http-signature-warning'
 import {
   ApprovalContextCard,
   ApprovalRequestHeader,
@@ -17,6 +19,13 @@ import {
   DAppRequestHeader
 } from '@/popup/components/dapp/ApprovalRequestPresentation'
 import { Button } from '@/popup/components/ui/button'
+import { useDialog } from '@/popup/hooks/useDialog'
+import {
+  reviewActionPresentation,
+  sensitiveOperationCategory,
+  UNKNOWN_SENSITIVE_CONFIRMATION,
+  type SecurityJudgment
+} from '@/core/security/sensitive-operation-policy'
 import {
   buildSigningSummaryReviewModel,
   type SigningSummaryReviewRow,
@@ -25,6 +34,10 @@ import {
 import type { DAppExecutionMode } from '@/core/dapp/dapp-execution-mode'
 import { ExecutionAccountBadge } from '@/popup/components/account/ExecutionAccountSelector'
 import type { EvmReviewPresentationOptions } from './signing-summary-review-model-other'
+import { UNLIMITED_AMOUNT_LABEL } from './signing-summary-review-model-types'
+import { presentUntrustedRpcCheckValue } from '@/core/chains/evm-rpc-origin'
+import { ELEVATED_PRIORITY_FEE_MESSAGE } from '@/infrastructure/chains/evm/evm-fee-tier'
+import { revealHiddenCharacters, SIGNATURE_HIDDEN_CHARACTER_WARNING } from '@/lib/unicode-display'
 
 export type SigningRequestSource =
   | { readonly kind: 'wallet' }
@@ -48,8 +61,17 @@ export interface SigningSummaryReviewProps {
   readonly feeControl?: ReactNode
   readonly notice?: ReactNode
   readonly evmPresentation?: EvmReviewPresentationOptions
+  readonly securityJudgment?: SecurityJudgment
   readonly onReject: () => void
   readonly onConfirm: () => void
+}
+
+function dappRequestOrigin(pageUrl: string): string {
+  try {
+    return new URL(pageUrl).origin
+  } catch {
+    return ''
+  }
 }
 
 function ReviewValue({
@@ -60,17 +82,18 @@ function ReviewValue({
   readonly accountMode?: DAppExecutionMode
 }) {
   const showPrivateAccount = row.label === 'From' && accountMode === 'private'
+  const value = presentUntrustedRpcCheckValue(row.label, row.value)
 
   return (
     <p
       className={cn(
-        'min-w-0 whitespace-pre-wrap text-right text-xs leading-5 text-foreground/90',
+        'min-w-0 whitespace-pre-wrap text-right text-xs leading-5 text-foreground/90 [unicode-bidi:isolate]',
         row.code && !row.amount && 'font-mono',
         row.breakAll && 'break-all',
         row.tone === 'warning' && 'text-warning',
         row.tone === 'danger' && 'text-danger'
       )}
-      title={row.title ?? row.value}
+      title={row.title ?? value}
     >
       {row.amount ? (
         <AmountDisplay
@@ -79,7 +102,7 @@ function ReviewValue({
           profile={row.amount.profile}
         />
       ) : (
-        row.value
+        value
       )}
       {showPrivateAccount && (
         <span
@@ -91,6 +114,20 @@ function ReviewValue({
       )}
     </p>
   )
+}
+
+const NETWORK_NODE_SECTION = 'Network node'
+
+function networkNodeRows(
+  model: ReturnType<typeof buildSigningSummaryReviewModel>
+): readonly SigningSummaryReviewRow[] | undefined {
+  return model.sections.find(section => section.title === NETWORK_NODE_SECTION)?.rows
+}
+
+function withoutNetworkNode(
+  sections: readonly SigningSummaryReviewSection[]
+): readonly SigningSummaryReviewSection[] {
+  return sections.filter(section => section.title !== NETWORK_NODE_SECTION)
 }
 
 function ReviewLabel({ label }: { label: string }) {
@@ -189,7 +226,10 @@ function DAppMessageReview({
   readonly networkName: string
 }) {
   const { copyToClipboard, showToast, isCopied } = useCopyToClipboard()
-  const primaryRows = model.sections.flatMap(section => section.rows.filter(isPrimaryMessageRow))
+  const recognized = model.sections.find(section => section.title === 'Recognized signature')
+  const primaryRows = recognized
+    ? recognized.rows
+    : model.sections.flatMap(section => section.rows.filter(isPrimaryMessageRow))
   const fallbackRows = model.sections.find(section => section.title !== 'Request')?.rows ?? []
   const messageRows = primaryRows.length > 0 ? primaryRows : fallbackRows
   const advancedSections = model.sections
@@ -205,7 +245,7 @@ function DAppMessageReview({
       <CopyToast show={showToast} />
       <section aria-label="Message" className="rounded-2xl bg-card/70 p-4">
         <div className="mb-3 flex items-center justify-between gap-3">
-          <h2 className="text-sm text-foreground/80">Message</h2>
+          <h2 className="text-sm text-foreground/80">{recognized ? model.title : 'Message'}</h2>
           <button
             type="button"
             aria-label="Copy message"
@@ -216,8 +256,10 @@ function DAppMessageReview({
             <CopyFeedbackIcon copied={isCopied()} width={16} height={16} />
           </button>
         </div>
-        {messageRows.length === 1 ? (
-          <p className="whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground">
+        {recognized ? (
+          <ReviewRows rows={recognized.rows} />
+        ) : messageRows.length === 1 ? (
+          <p className="whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground [unicode-bidi:isolate]">
             {messageRows[0]?.value}
           </p>
         ) : (
@@ -225,7 +267,7 @@ function DAppMessageReview({
             {messageRows.map((row, index) => (
               <div key={`${row.label}-${index}`} className="min-w-0">
                 <p className="text-xs text-muted">{row.label.replace(/^Message\./, '')}</p>
-                <p className="mt-1 whitespace-pre-wrap break-all font-mono text-sm leading-5 text-foreground">
+                <p className="mt-1 whitespace-pre-wrap break-all font-mono text-sm leading-5 text-foreground [unicode-bidi:isolate]">
                   {row.value}
                 </p>
               </div>
@@ -238,6 +280,41 @@ function DAppMessageReview({
       <AdvancedReview sections={advancedSections} />
     </>
   )
+}
+
+const RAW_INTEGER_AMOUNT = /^(?:0|[1-9][0-9]*)$/
+
+function isRawIntegerAmount(amount: string): boolean {
+  return RAW_INTEGER_AMOUNT.test(amount)
+}
+
+function AuthorizedTokenAmount({
+  token
+}: {
+  readonly token: NonNullable<
+    ReturnType<typeof buildSigningSummaryReviewModel>['tokenAuthorization']
+  >['tokens'][number]
+}) {
+  if (token.unlimitedUnit) {
+    return (
+      <>
+        <span className="break-words">
+          {token.symbol ? `Unlimited ${token.symbol}` : 'Unlimited'}
+        </span>
+        <p className="mt-1 text-xs font-normal leading-5">
+          {UNLIMITED_AMOUNT_LABEL[token.unlimitedUnit]}
+        </p>
+      </>
+    )
+  }
+  if (token.symbol === null) {
+    return (
+      <span className={isRawIntegerAmount(token.amount) ? 'break-all font-mono' : 'break-words'}>
+        {token.amount}
+      </span>
+    )
+  }
+  return <AmountDisplay value={token.amount} symbol={token.symbol} />
 }
 
 function DAppTokenAuthorizationReview({
@@ -274,7 +351,18 @@ function DAppTokenAuthorizationReview({
                 <div className="min-w-0 flex-1">
                   {token.symbol === null && (
                     <p className="mb-1 text-sm text-muted">
-                      {token.unlimited ? 'Unknown token' : 'Unknown token · raw amount'}
+                      {token.selfReportedName
+                        ? 'Self-reported'
+                        : token.unlimitedUnit
+                          ? 'Unknown token'
+                          : isRawIntegerAmount(token.amount)
+                            ? 'Unknown token · raw amount'
+                            : 'Unknown token'}
+                    </p>
+                  )}
+                  {token.symbol === null && token.selfReportedName && (
+                    <p className="mb-1 break-words text-base font-medium [unicode-bidi:isolate]">
+                      {revealHiddenCharacters(token.selfReportedName)}
                     </p>
                   )}
                   <div
@@ -284,12 +372,13 @@ function DAppTokenAuthorizationReview({
                       token.unlimited && 'text-warning'
                     )}
                   >
-                    {token.unlimited ? (
-                      <span className="break-words">Unlimited {token.symbol ?? ''}</span>
-                    ) : (
-                      <AmountDisplay value={token.amount} symbol={token.symbol ?? undefined} />
-                    )}
+                    <AuthorizedTokenAmount token={token} />
                   </div>
+                  {token.symbol !== null && token.selfReportedName && (
+                    <p className="mt-1 break-words text-sm text-muted [unicode-bidi:isolate]">
+                      Self-reported · {revealHiddenCharacters(token.selfReportedName)}
+                    </p>
+                  )}
                 </div>
               </div>
               <p className="mt-2 break-all font-mono text-[11px] leading-4 text-muted">
@@ -308,16 +397,44 @@ function DAppTokenAuthorizationReview({
       <section aria-label="Authorization details" className="rounded-2xl bg-card/70 px-4 py-1">
         <ReviewRows
           rows={[
+            ...(authorization.spender
+              ? [
+                  {
+                    label: 'Authorized spender',
+                    value: authorization.spender,
+                    code: true,
+                    breakAll: true
+                  }
+                ]
+              : []),
+            ...(authorization.validAfter
+              ? [{ label: 'Valid after', value: authorization.validAfter }]
+              : []),
             {
-              label: 'Authorized spender',
-              value: authorization.spender,
-              code: true,
-              breakAll: true
+              label: authorization.validAfter ? 'Valid before' : 'Signature submit by',
+              value: authorization.signatureDeadline
             },
-            { label: 'Signature submit by', value: authorization.signatureDeadline },
+            ...(authorization.submission
+              ? [{ label: 'Submission', value: authorization.submission }]
+              : []),
             ...(authorization.kind === 'transfer'
-              ? [{ label: 'Recipient', value: 'Not specified in signature' }]
-              : [])
+              ? [
+                  {
+                    label: 'Recipient',
+                    value: authorization.recipient ?? 'Not specified in signature',
+                    ...(authorization.recipient ? { code: true, breakAll: true } : {})
+                  }
+                ]
+              : []),
+            ...(authorization.witnessReceivers ?? []).map(receiver => ({
+              label: 'Witness receiver',
+              value: receiver,
+              code: true,
+              breakAll: true,
+              ...(receiver.toLowerCase() === authorization.owner.toLowerCase()
+                ? {}
+                : { tone: 'warning' as const })
+            }))
           ]}
         />
         <div className="grid grid-cols-[104px_minmax(0,1fr)] gap-3 py-2.5 text-xs leading-5">
@@ -333,8 +450,12 @@ function DAppTokenAuthorizationReview({
           </div>
         </div>
       </section>
-      <DAppNetworkCard chain={iconChain ?? chainName} network={networkName} />
-      <AdvancedReview sections={model.sections} />
+      <DAppNetworkCard
+        chain={iconChain ?? chainName}
+        network={networkName}
+        rpcChecks={networkNodeRows(model)}
+      />
+      <AdvancedReview sections={withoutNetworkNode(model.sections)} />
     </>
   )
 }
@@ -354,7 +475,8 @@ function DAppTransactionReview({
   readonly accountMode?: DAppExecutionMode
   readonly feeControl?: ReactNode
 }) {
-  const feeRow = model.sections
+  const sections = withoutNetworkNode(model.sections)
+  const feeRow = sections
     .flatMap(section => section.rows)
     .find(
       row => row.label === 'Fee' || row.label === 'Maximum fee' || row.label === 'RPC total fee'
@@ -369,7 +491,7 @@ function DAppTransactionReview({
         {feeRow.value}
       </span>
     ) : undefined)
-  const detailSections = model.sections
+  const detailSections = sections
     .filter(section => section.title !== 'Request')
     .map(section => ({
       ...section,
@@ -378,7 +500,7 @@ function DAppTransactionReview({
       )
     }))
     .filter(section => section.rows.length > 0)
-  const advancedSections = model.sections
+  const advancedSections = sections
     .map(section => ({
       ...section,
       rows: section.rows.filter(row => isAdvancedTransactionRow(section.title, row))
@@ -399,7 +521,12 @@ function DAppTransactionReview({
           </div>
         </section>
       ))}
-      <DAppNetworkCard chain={iconChain ?? chainName} network={networkName} fee={networkFee} />
+      <DAppNetworkCard
+        chain={iconChain ?? chainName}
+        network={networkName}
+        fee={networkFee}
+        rpcChecks={networkNodeRows(model)}
+      />
       {detailSections.slice(1).map(section => (
         <section
           key={section.title}
@@ -431,16 +558,31 @@ export function SigningSummaryReview({
   feeControl,
   notice,
   evmPresentation,
+  securityJudgment = 'unknown',
   onReject,
   onConfirm
 }: SigningSummaryReviewProps) {
+  const { confirm } = useDialog()
+  const confirmingRef = useRef(false)
   const model = buildSigningSummaryReviewModel(summary, evmPresentation)
-  const isBlocked = model.level === 'blocked'
+  const isBlocked = model.level === 'blocked' || securityJudgment === 'block'
+  const actions = reviewActionPresentation({
+    blocked: isBlocked,
+    category: sensitiveOperationCategory(summary),
+    judgment: securityJudgment
+  })
   const isDAppMessage = source.kind === 'dapp' && model.operation === 'message'
   const isDAppTransaction = source.kind === 'dapp' && model.operation === 'transaction'
   const isDAppTokenAuthorization = source.kind === 'dapp' && model.tokenAuthorization !== undefined
+  const recognizedSignature =
+    source.kind === 'dapp' &&
+    model.sections.some(section => section.title === 'Recognized signature')
   const hideReviewableUnknownEvmCall =
-    isDAppTransaction && summary.schema === 'evm.transaction.v1' && model.level === 'caution'
+    isDAppTransaction &&
+    summary.schema === 'evm.transaction.v1' &&
+    model.level === 'caution' &&
+    (model.tokenAuthorization !== undefined ||
+      model.issues.some(issue => issue.code === 'token-approval'))
   const visibleIssues = hideReviewableUnknownEvmCall
     ? model.issues.filter(issue => issue.code !== 'unrecognized-call')
     : model.issues
@@ -455,27 +597,52 @@ export function SigningSummaryReview({
           ? 'Sign message'
           : 'Confirm'
   const requestTone = isBlocked ? 'blocked' : isCaution ? 'caution' : 'standard'
+  const insecureHttpWarning =
+    source.kind === 'dapp' && model.operation === 'message'
+      ? httpSignatureWarning(dappRequestOrigin(source.pageUrl), 'message')
+      : null
+
+  const handleConfirm = async () => {
+    if (isBlocked || confirmDisabled || isSubmitting || confirmingRef.current) return
+    if (actions.confirmRequiresSecondStep) {
+      confirmingRef.current = true
+      try {
+        const accepted = await confirm({
+          title: UNKNOWN_SENSITIVE_CONFIRMATION.title,
+          message: UNKNOWN_SENSITIVE_CONFIRMATION.message,
+          confirmText: UNKNOWN_SENSITIVE_CONFIRMATION.confirmText,
+          cancelText: UNKNOWN_SENSITIVE_CONFIRMATION.cancelText,
+          variant: 'danger'
+        })
+        if (!accepted) return
+      } finally {
+        confirmingRef.current = false
+      }
+    }
+    onConfirm()
+  }
 
   return (
     <ApprovalWindowLayout
       footer={
         <div className="flex gap-3">
           <Button
-            variant="outline"
+            variant={actions.rejectVariant}
             size="lg"
             className="flex-1"
             disabled={isSubmitting}
+            autoFocus={actions.rejectAutoFocus}
             onClick={onReject}
           >
             Reject
           </Button>
           <Button
-            variant={isBlocked ? 'secondary' : 'default'}
+            variant={actions.confirmVariant}
             size="lg"
             className="flex-1"
             disabled={isBlocked || confirmDisabled}
             isLoading={isSubmitting}
-            onClick={onConfirm}
+            onClick={handleConfirm}
           >
             {confirmLabel}
           </Button>
@@ -488,7 +655,7 @@ export function SigningSummaryReview({
             domain={source.domain}
             pageUrl={source.pageUrl}
             action={
-              isDAppTokenAuthorization
+              isDAppTokenAuthorization || recognizedSignature
                 ? model.title
                 : model.operation === 'message'
                   ? 'Sign message'
@@ -536,6 +703,15 @@ export function SigningSummaryReview({
             </section>
           )}
 
+        {insecureHttpWarning ? <WarningBox>{insecureHttpWarning}</WarningBox> : null}
+        {model.sections.some(section => section.rows.some(row => row.hiddenCharacters)) ? (
+          <WarningBox>{SIGNATURE_HIDDEN_CHARACTER_WARNING}</WarningBox>
+        ) : null}
+        {summary.schema === 'evm.transaction.v1' && summary.fields.priorityFeeElevated ? (
+          <p role="status" className="text-xs leading-5 text-warning">
+            {ELEVATED_PRIORITY_FEE_MESSAGE}
+          </p>
+        ) : null}
         {notice}
 
         {source.kind === 'wallet' && feeControl && (

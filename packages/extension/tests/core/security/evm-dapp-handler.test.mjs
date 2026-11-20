@@ -1150,6 +1150,7 @@ test.describe('Background EVM dApp handler', () => {
   for (const scenario of [
     'failed quote',
     'contract recipient',
+    'delegated recipient',
     'cancel',
     'switch off',
     'account changed',
@@ -1165,7 +1166,14 @@ test.describe('Background EVM dApp handler', () => {
           address:
             mode === 'private' ? privateExecutionAddress : account.chainAccount.identity.value
         }),
-        rpc: { getCode: async () => (scenario === 'contract recipient' ? '0x6000' : '0x') },
+        rpc: {
+          getCode: async () =>
+            scenario === 'contract recipient'
+              ? '0x6000'
+              : scenario === 'delegated recipient'
+                ? `0xef0100${'ab'.repeat(20)}`
+                : '0x'
+        },
         ...(scenario === 'failed quote'
           ? {
               privateTransfer: {
@@ -1193,9 +1201,18 @@ test.describe('Background EVM dApp handler', () => {
         },
         approvalReview: async (_data, options) => {
           const updated = await options.onEvmTransferPrivacyChange(true)
-          if (scenario === 'failed quote' || scenario === 'contract recipient') {
+          if (
+            scenario === 'failed quote' ||
+            scenario === 'contract recipient' ||
+            scenario === 'delegated recipient'
+          ) {
             expect(updated.sendPrivately).toBe(true)
             expect(updated.privacyError).toBeTruthy()
+          }
+          if (scenario === 'contract recipient' || scenario === 'delegated recipient') {
+            expect(updated.privacyError).toBe(
+              'This recipient is a contract. Use a direct transfer.'
+            )
           }
           if (scenario === 'switch off') {
             const direct = await options.onEvmTransferPrivacyChange(false)
@@ -1704,6 +1721,228 @@ test.describe('Background EVM dApp handler', () => {
       )
     ).rejects.toMatchObject({ code: 4100 })
     expect(state.rejectedTransfers).toEqual([`0x${'33'.repeat(32)}`])
+  })
+
+  test('rejects NEAR Intents personal_sign and typed data before approval', async () => {
+    const state = harness()
+    const origin = 'https://dapp.example'
+    await state.handler.request({ method: 'eth_requestAccounts' }, origin, {})
+    const messages = [
+      JSON.stringify({
+        signer_id: account.chainAccount.identity.value,
+        verifying_contract: 'intents.near',
+        deadline: '2026-11-18T00:05:00.000Z',
+        nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+        intents: []
+      }),
+      JSON.stringify({
+        deadline: '2026-11-18T00:05:00.000Z',
+        intents: [{ intent: 'transfer' }],
+        nonce: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+        signer_id: account.chainAccount.identity.value,
+        verifying_contract: 'intents.far'
+      }),
+      JSON.stringify({
+        signer_id: account.chainAccount.identity.value,
+        intents: [],
+        nonce: 'n',
+        deadline: '2026-11-18T00:05:00.000Z'
+      }),
+      '{"verifying_contract":"\\u0069ntents.near"}'
+    ]
+    for (const message of messages) {
+      await expect(
+        state.handler.request(
+          {
+            method: 'personal_sign',
+            params: [
+              `0x${Buffer.from(message, 'utf8').toString('hex')}`,
+              account.chainAccount.identity.value
+            ]
+          },
+          origin,
+          {}
+        )
+      ).rejects.toMatchObject({
+        code: 4200,
+        message: 'Noir Wallet rejected this NEAR Intents signature request.'
+      })
+    }
+    const opaque = Buffer.concat([Buffer.from([0xff]), Buffer.from('intents.near', 'utf8')])
+    await expect(
+      state.handler.request(
+        {
+          method: 'personal_sign',
+          params: [`0x${opaque.toString('hex')}`, account.chainAccount.identity.value]
+        },
+        origin,
+        {}
+      )
+    ).rejects.toMatchObject({ code: 4200 })
+    const typedData = [
+      JSON.stringify({
+        types: {
+          EIP712Domain: [{ name: 'chainId', type: 'uint256' }],
+          Note: [{ name: 'text', type: 'string' }]
+        },
+        primaryType: 'Note',
+        domain: { chainId: 1 },
+        message: { text: 'intents.far' }
+      }),
+      JSON.stringify({
+        types: {
+          EIP712Domain: [{ name: 'chainId', type: 'uint256' }],
+          Intent: [{ name: 'payload', type: 'string' }]
+        },
+        primaryType: 'Intent',
+        domain: { chainId: 1 },
+        message: { signer_id: 'a', intents: 'b', nonce: 'c', deadline: 'd' }
+      })
+    ]
+    for (const data of typedData) {
+      await expect(
+        state.handler.request(
+          {
+            method: 'eth_signTypedData_v4',
+            params: [account.chainAccount.identity.value, data]
+          },
+          origin,
+          {}
+        )
+      ).rejects.toMatchObject({ code: 4200 })
+    }
+    await state.handler.request(
+      {
+        method: 'personal_sign',
+        params: [
+          `0x${Buffer.from(JSON.stringify({ signer_id: 'a', intents: [], nonce: 'n' }), 'utf8').toString('hex')}`,
+          account.chainAccount.identity.value
+        ]
+      },
+      origin,
+      {}
+    )
+    expect(state.approvalCalls.map(call => call.action)).toEqual(['evmConnect', 'evmMessage'])
+    expect(state.signerPreparePayloads).toHaveLength(1)
+    expect(state.analyticsEvents.map(event => event.name)).not.toContain('dapp_request_rejected')
+  })
+
+  test('rejects a bare Intents add_public_key signature before approval', async () => {
+    const state = harness()
+    const origin = 'https://dapp.example'
+    await state.handler.request({ method: 'eth_requestAccounts' }, origin, {})
+    const intent = JSON.stringify({ intent: 'add_public_key', public_key: 'ed25519:abc' })
+    const escaped = '{"intent":"\\u0061dd_public_key","public_key":"ed25519:abc"}'
+    await expect(
+      state.handler.request(
+        {
+          method: 'personal_sign',
+          params: [
+            `0x${Buffer.from(intent, 'utf8').toString('hex')}`,
+            account.chainAccount.identity.value
+          ]
+        },
+        origin,
+        {}
+      )
+    ).rejects.toMatchObject({
+      code: 4200,
+      message: 'NEAR dApp requests cannot add an Intents public key.'
+    })
+    await expect(
+      state.handler.request(
+        {
+          method: 'personal_sign',
+          params: [
+            `0x${Buffer.from(escaped, 'utf8').toString('hex')}`,
+            account.chainAccount.identity.value
+          ]
+        },
+        origin,
+        {}
+      )
+    ).rejects.toMatchObject({
+      code: 4200,
+      message: 'NEAR dApp requests cannot add an Intents public key.'
+    })
+    const typedData = JSON.stringify({
+      types: {
+        EIP712Domain: [{ name: 'chainId', type: 'uint256' }],
+        Note: [{ name: 'text', type: 'string' }]
+      },
+      primaryType: 'Note',
+      domain: { chainId: 1 },
+      message: { text: intent }
+    })
+    await expect(
+      state.handler.request(
+        {
+          method: 'eth_signTypedData_v4',
+          params: [account.chainAccount.identity.value, typedData]
+        },
+        origin,
+        {}
+      )
+    ).rejects.toMatchObject({
+      code: 4200,
+      message: 'NEAR dApp requests cannot add an Intents public key.'
+    })
+    await state.handler.request(
+      {
+        method: 'personal_sign',
+        params: [
+          `0x${Buffer.from('Please review add_public_key before continuing.', 'utf8').toString('hex')}`,
+          account.chainAccount.identity.value
+        ]
+      },
+      origin,
+      {}
+    )
+    expect(state.approvalCalls.map(call => call.action)).toEqual(['evmConnect', 'evmMessage'])
+    expect(state.signerPreparePayloads).toHaveLength(1)
+  })
+
+  test('rejects padded and deeply nested NEAR Intents payloads before approval', async () => {
+    const state = harness()
+    const origin = 'https://dapp.example'
+    await state.handler.request({ method: 'eth_requestAccounts' }, origin, {})
+    const spaced = JSON.stringify({
+      note: ' {"verifying_contract":"\\u0069ntents.near"} '
+    })
+    let deep = '{"verifying_contract":"\\u0069ntents.near"}'
+    for (let layer = 0; layer < 4; layer += 1) deep = JSON.stringify({ note: deep })
+    const requests = [spaced, deep].flatMap(payload => [
+      {
+        method: 'personal_sign',
+        params: [
+          `0x${Buffer.from(payload, 'utf8').toString('hex')}`,
+          account.chainAccount.identity.value
+        ]
+      },
+      {
+        method: 'eth_signTypedData_v4',
+        params: [
+          account.chainAccount.identity.value,
+          JSON.stringify({
+            types: {
+              EIP712Domain: [{ name: 'chainId', type: 'uint256' }],
+              Note: [{ name: 'text', type: 'string' }]
+            },
+            primaryType: 'Note',
+            domain: { chainId: 1 },
+            message: { text: payload }
+          })
+        ]
+      }
+    ])
+    for (const request of requests) {
+      await expect(state.handler.request(request, origin, {})).rejects.toMatchObject({
+        code: 4200,
+        message: 'Noir Wallet rejected this NEAR Intents signature request.'
+      })
+    }
+    expect(state.approvalCalls.map(call => call.action)).toEqual(['evmConnect'])
+    expect(state.signerPreparePayloads).toEqual([])
   })
 
   test('allows Keystone account discovery but rejects dApp signing before any software signer call', async () => {

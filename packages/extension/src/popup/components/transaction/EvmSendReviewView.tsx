@@ -11,6 +11,10 @@ import { SendRecipientAddress } from '@/popup/components/transaction/SendInputCa
 import { ExecutionAccountBadge } from '@/popup/components/account/ExecutionAccountSelector'
 import { TransactionReviewView } from '@/popup/components/transaction/TransactionReviewView'
 import { formatEvmWeiAsGwei } from '@/infrastructure/chains/evm'
+import { ELEVATED_PRIORITY_FEE_MESSAGE } from '@/infrastructure/chains/evm/evm-fee-tier'
+import { formatBaseUnitAmount } from '@/lib/number-format'
+import { AddressPoisoningNotice } from '@/popup/components/transaction/AddressPoisoningNotice'
+import { addressPoisoningNeedsCaution } from '@/popup/services/use-address-poisoning'
 import type { EvmSendTransferState } from '@/popup/hooks/useEvmSendTransfer'
 
 export function EvmSendReviewView({ state }: { readonly state: EvmSendTransferState }) {
@@ -30,6 +34,8 @@ export function EvmSendReviewView({ state }: { readonly state: EvmSendTransferSt
     recipientContactName,
     fee,
     nativeSymbol,
+    nativeDecimals,
+    addressPoisoning,
     handleReviewFeeSelectionChange,
     updatingFee,
     confirmationTime,
@@ -200,6 +206,25 @@ export function EvmSendReviewView({ state }: { readonly state: EvmSendTransferSt
                               </div>
                             </>
                           )}
+                          {summary.fields.l1DataFeeWei !== undefined &&
+                          BigInt(summary.fields.l1DataFeeWei) > 0n ? (
+                            <div className="flex justify-between gap-3">
+                              <span className="text-muted">L1 data fee</span>
+                              <AmountDisplay
+                                value={formatBaseUnitAmount(
+                                  summary.fields.l1DataFeeWei,
+                                  nativeDecimals
+                                )}
+                                symbol={nativeSymbol}
+                                profile="fee"
+                              />
+                            </div>
+                          ) : null}
+                          {summary.fields.priorityFeeElevated ? (
+                            <p role="status" className="text-warning">
+                              {ELEVATED_PRIORITY_FEE_MESSAGE}
+                            </p>
+                          ) : null}
                         </div>
                       }
                     />
@@ -222,11 +247,20 @@ export function EvmSendReviewView({ state }: { readonly state: EvmSendTransferSt
                     ]
                   : [])
               ]}
-              confirmLabel={review.privacyWarning ? 'Send anyway' : 'Confirm'}
+              afterRows={
+                addressPoisoningNeedsCaution(addressPoisoning) ? (
+                  <AddressPoisoningNotice />
+                ) : undefined
+              }
+              confirmLabel={
+                review.privacyWarning || addressPoisoningNeedsCaution(addressPoisoning)
+                  ? 'Send anyway'
+                  : 'Confirm'
+              }
               confirming={approving}
               submitting={approving}
               preparing={updatingFee}
-              confirmDisabled={review.intentKey !== intentKey}
+              confirmDisabled={review.intentKey !== intentKey || addressPoisoning === 'pending'}
               error={error ? <InlineError message={error} className="mt-3" /> : undefined}
               cancelDisabled={approving}
               onCancel={() => void handleCloseReview()}

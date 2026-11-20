@@ -24,6 +24,8 @@ export function CrossChainSendReviewView({
   quoteChanges,
   transferPreparationError,
   insufficientFunds,
+  inputCount = null,
+  inputReviewNotice = null,
   onRefresh,
   onAccept,
   onRetryPreparation,
@@ -47,6 +49,8 @@ export function CrossChainSendReviewView({
   readonly quoteChanges?: ReactNode
   readonly transferPreparationError: string | null
   readonly insufficientFunds: boolean
+  readonly inputCount?: number | null
+  readonly inputReviewNotice?: string | null
   readonly onRefresh: () => void
   readonly onAccept: () => void
   readonly onRetryPreparation: () => void
@@ -158,6 +162,14 @@ export function CrossChainSendReviewView({
               }
             ]
           : []),
+        ...(inputCount === null
+          ? []
+          : [
+              {
+                label: 'Inputs',
+                content: inputCount
+              }
+            ]),
         { label: 'Provider', content: review.router }
       ]}
       afterRows={
@@ -184,6 +196,8 @@ export function CrossChainSendReviewView({
           <InlineError message="Quote expired. Refresh it." onRetry={onRetryExpired} />
         ) : insufficientFunds ? (
           <InlineError message="Amount exceeds balance at this fee." />
+        ) : inputReviewNotice ? (
+          <InlineError message={inputReviewNotice} />
         ) : undefined
       }
       confirmLabel={quoteAcceptanceLabel ?? (approval ? 'Approve Token' : 'Confirm Send')}

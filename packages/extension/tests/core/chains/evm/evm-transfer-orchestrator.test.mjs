@@ -14,8 +14,10 @@ import { parseTransactionId } from '../../../../src/core/transactions/domain/ind
 import {
   ChromeSessionEvmPendingTransferStore,
   computeEvmSigningPayloadFingerprint,
+  EVM_SIMULATION_PREVIEW_TTL_MS,
   EvmTransferOrchestrator,
   assertEvmTransferFresh,
+  evmSimulationPreviewExpiresAt,
   parsePendingEvmTransfer
 } from '../../../../src/infrastructure/chains/evm/index.ts'
 import { InMemoryTransactionRepository } from '../../../../src/infrastructure/persistence/repositories/index.ts'
@@ -145,8 +147,16 @@ function signer(calls, options = {}) {
             valueWei: payload.transaction.value,
             gasLimit: payload.transaction.gasLimit,
             maximumFeeWei: (
-              BigInt(payload.transaction.gasLimit) * BigInt(payload.transaction.maxFeePerGas)
+              BigInt(payload.transaction.gasLimit) * BigInt(payload.transaction.maxFeePerGas) +
+              BigInt(payload.l1DataFeeWei ?? '0')
             ).toString(),
+            ...(payload.l1DataFeeWei === undefined
+              ? {}
+              : {
+                  l1DataFeeWei: payload.l1DataFeeWei,
+                  suggestedFeePerGasWei: payload.suggestedFeePerGasWei,
+                  priorityFeeElevated: payload.priorityFeeElevated
+                }),
             gasPriceWei: null,
             maxFeePerGasWei: payload.transaction.maxFeePerGas,
             maxPriorityFeePerGasWei: payload.transaction.maxPriorityFeePerGas,
@@ -162,7 +172,7 @@ function signer(calls, options = {}) {
         },
         payloadFingerprint: { algorithm: 'sha256', digestHex: fingerprint },
         execution: { kind: 'internal' },
-        expiresAt: 5_000
+        expiresAt: options.expiresAt ?? 5_000
       }
     },
     confirm: async (keyDomainId, requestedCommandId) => {
@@ -191,7 +201,7 @@ function harness(options = {}) {
     signer: options.signer ?? signer(calls),
     rpc: options.rpc ?? rpc(),
     assets: options.assets ?? assets,
-    now: () => 1_000,
+    now: options.now ?? (() => 1_000),
     createId: () => `test-${++id}`,
     createExternalRequestId:
       options.createExternalRequestId ?? (() => '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d'),
@@ -855,6 +865,96 @@ test('binds a RHEA ERC-20 swap amount to its EVM contract-call review', async ()
     },
     signing: { payloadFingerprint: prepared.signing.payloadFingerprint }
   })
+})
+
+test('rejects a quote contract call whose native value exceeds the approved spend', async () => {
+  const { orchestrator } = harness()
+  const prepared = await orchestrator.prepare({
+    chainAccount: account,
+    intent: {
+      chainId,
+      contractAddress: recipient,
+      valueRaw: '999',
+      calldata: '0x12345678'
+    },
+    rheaSwapBinding: {
+      ...rheaSwapBinding(),
+      origin: {
+        ...rheaSwapBinding().origin,
+        assetId: 'eip155:1/slip44:60',
+        protocolAssetId: 'native'
+      }
+    }
+  })
+
+  await expect(
+    orchestrator.approve({
+      scope,
+      transactionId: prepared.graph.root.id,
+      payloadFingerprint: prepared.signing.payloadFingerprint.digestHex
+    })
+  ).rejects.toThrow('Approved spend changed. Review the transaction again.')
+})
+
+test('keeps a quote contract call inside the approved native spend', async () => {
+  const { orchestrator, calls } = harness()
+  const prepared = await orchestrator.prepare({
+    chainAccount: account,
+    intent: {
+      chainId,
+      contractAddress: recipient,
+      valueRaw: '100',
+      calldata: '0x12345678'
+    },
+    rheaSwapBinding: {
+      ...rheaSwapBinding(),
+      origin: {
+        ...rheaSwapBinding().origin,
+        assetId: 'eip155:1/slip44:60',
+        protocolAssetId: 'native'
+      }
+    }
+  })
+
+  await expect(
+    orchestrator.approve({
+      scope,
+      transactionId: prepared.graph.root.id,
+      payloadFingerprint: prepared.signing.payloadFingerprint.digestHex
+    })
+  ).rejects.toThrow()
+  expect(calls.some(call => call[0] === 'confirm')).toBe(true)
+})
+
+test('rejects a quote contract call when its prepared token spend exceeds the approval', async () => {
+  const testHarness = harness({ assets: customAssets })
+  const prepared = await testHarness.orchestrator.prepare({
+    chainAccount: account,
+    intent: {
+      chainId,
+      contractAddress: recipient,
+      valueRaw: '0',
+      calldata: '0x12345678'
+    },
+    rheaSwapBinding: rheaSwapBinding()
+  })
+  const pending = await testHarness.pendingStore.get(prepared.graph.root.id)
+  expect(pending.quotedSpend).toEqual({
+    assetId: `eip155:1/erc20:${customToken}`,
+    amountRaw: '123'
+  })
+  await testHarness.pendingStore.put({
+    ...pending,
+    quotedSpend: { ...pending.quotedSpend, amountRaw: '999' }
+  })
+
+  await expect(
+    testHarness.orchestrator.approve({
+      scope,
+      transactionId: prepared.graph.root.id,
+      payloadFingerprint: prepared.signing.payloadFingerprint.digestHex
+    })
+  ).rejects.toThrow('Approved spend changed. Review the transaction again.')
 })
 
 test('completed RHEA destination rechecks the EVM origin and blocks replacement reviews', async () => {
@@ -1811,4 +1911,130 @@ test('fails the graph when a stored review summary no longer matches the prepare
   ).rejects.toThrow(/integrity check failed/)
   await expect(testHarness.repository.get(scope, prepared.graph.root.id)).resolves.toBeNull()
   expect(testHarness.calls.map(call => call[0])).toEqual(['prepare', 'cancel'])
+})
+
+test('keeps the EVM signing session longer than the 30 second simulation preview', () => {
+  expect(evmSimulationPreviewExpiresAt(1_000, 1_000 + 5 * 60_000)).toBe(
+    1_000 + EVM_SIMULATION_PREVIEW_TTL_MS
+  )
+  expect(evmSimulationPreviewExpiresAt(1_000, 5_000)).toBe(5_000)
+})
+
+test('simulates the reviewed EVM transaction again before signing', async () => {
+  let simulations = 0
+  const testHarness = harness({
+    rpc: rpc({
+      simulateCall: async () => {
+        simulations += 1
+        return '0x'
+      }
+    })
+  })
+  const prepared = await prepare(testHarness.orchestrator)
+  expect(simulations).toBe(1)
+
+  await testHarness.orchestrator.approve({
+    scope,
+    transactionId: prepared.graph.root.id,
+    payloadFingerprint: prepared.signing.payloadFingerprint.digestHex
+  })
+
+  expect(simulations).toBe(2)
+  expect(testHarness.calls.map(call => call[0])).toEqual(['prepare', 'confirm'])
+})
+
+test('does not sign when the confirmation simulation reverts', async () => {
+  let simulations = 0
+  const testHarness = harness({
+    rpc: rpc({
+      simulateCall: async () => {
+        simulations += 1
+        if (simulations > 1) throw new Error('execution reverted')
+        return '0x'
+      }
+    })
+  })
+  const prepared = await prepare(testHarness.orchestrator)
+
+  await expect(
+    testHarness.orchestrator.approve({
+      scope,
+      transactionId: prepared.graph.root.id,
+      payloadFingerprint: prepared.signing.payloadFingerprint.digestHex
+    })
+  ).rejects.toMatchObject({
+    code: 'simulation-failed',
+    message: 'EVM transaction simulation failed'
+  })
+  expect(simulations).toBe(2)
+  expect(testHarness.calls.map(call => call[0])).toEqual(['prepare', 'cancel'])
+  await expect(testHarness.pendingStore.get(prepared.graph.root.id)).resolves.toBeNull()
+})
+
+test('rejects an expired EVM preview before signing', async () => {
+  let now = 1_000
+  const calls = []
+  const signingExpiresAt = now + 5 * 60_000
+  const testHarness = harness({
+    now: () => now,
+    signer: signer(calls, { expiresAt: signingExpiresAt })
+  })
+  const prepared = await prepare(testHarness.orchestrator)
+  expect(prepared.signing.expiresAt).toBe(signingExpiresAt)
+  expect(
+    evmSimulationPreviewExpiresAt(prepared.graph.root.createdAt, prepared.signing.expiresAt)
+  ).toBe(prepared.graph.root.createdAt + EVM_SIMULATION_PREVIEW_TTL_MS)
+  expect(prepared.signing.expiresAt - prepared.graph.root.createdAt).toBeGreaterThan(
+    EVM_SIMULATION_PREVIEW_TTL_MS
+  )
+
+  now = prepared.graph.root.createdAt + EVM_SIMULATION_PREVIEW_TTL_MS
+  await expect(
+    testHarness.orchestrator.approve({
+      scope,
+      transactionId: prepared.graph.root.id,
+      payloadFingerprint: prepared.signing.payloadFingerprint.digestHex
+    })
+  ).rejects.toThrow('EVM transaction preview expired')
+  expect(calls.map(call => call[0])).toEqual(['prepare', 'cancel'])
+  await expect(testHarness.pendingStore.get(prepared.graph.root.id)).resolves.toBeNull()
+})
+
+test('simulates again before handing an EVM transaction to hardware', async () => {
+  let simulations = 0
+  const testHarness = harness({
+    rpc: rpc({
+      simulateCall: async () => {
+        simulations += 1
+        return '0x'
+      }
+    })
+  })
+  const prepared = await testHarness.orchestrator.prepare({
+    chainAccount: account,
+    intent: { assetId: 'eip155:1/slip44:60', recipient, amountRaw: '123' },
+    signingMode: 'keystone',
+    externalSigner: {
+      derivationPath: "m/44'/60'/0'/0/0",
+      masterFingerprintHex: 'e9181cf3',
+      address: from
+    }
+  })
+  expect(simulations).toBe(1)
+
+  const handoff = await testHarness.orchestrator.approve({
+    scope,
+    transactionId: prepared.graph.root.id,
+    payloadFingerprint: prepared.signing.payloadFingerprint.digestHex
+  })
+
+  expect(simulations).toBe(2)
+  expect(handoff).toMatchObject({
+    status: 'external-signature-required',
+    expiresAt: prepared.signing.expiresAt
+  })
+  expect(handoff.expiresAt - prepared.graph.root.createdAt).toBeGreaterThan(
+    EVM_SIMULATION_PREVIEW_TTL_MS
+  )
+  expect(testHarness.calls).toEqual([])
 })

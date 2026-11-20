@@ -331,13 +331,16 @@ export function parseTransactionIntentSnapshot(value: unknown): TransactionInten
                   'maxPriorityFeePerGasWei',
                   'gasLimit'
                 ],
-                ['methodSelector', 'unsignedTransaction']
+                ['l1DataFeeWei', 'methodSelector', 'unsignedTransaction']
               ) ||
               value.evm.schemaVersion !== 1 ||
               typeof value.evm.nonce !== 'string' ||
               typeof value.evm.maxFeePerGasWei !== 'string' ||
               typeof value.evm.maxPriorityFeePerGasWei !== 'string' ||
               typeof value.evm.gasLimit !== 'string' ||
+              (value.evm.l1DataFeeWei !== undefined &&
+                (typeof value.evm.l1DataFeeWei !== 'string' ||
+                  !RAW_AMOUNT_PATTERN.test(value.evm.l1DataFeeWei))) ||
               (value.evm.methodSelector !== undefined &&
                 (typeof value.evm.methodSelector !== 'string' ||
                   !/^0x[0-9a-f]{8}$/.test(value.evm.methodSelector))) ||
@@ -380,6 +383,9 @@ export function parseTransactionIntentSnapshot(value: unknown): TransactionInten
               maxFeePerGasWei: value.evm.maxFeePerGasWei,
               maxPriorityFeePerGasWei: value.evm.maxPriorityFeePerGasWei,
               gasLimit: value.evm.gasLimit,
+              ...(value.evm.l1DataFeeWei === undefined
+                ? {}
+                : { l1DataFeeWei: value.evm.l1DataFeeWei }),
               ...(value.evm.methodSelector === undefined
                 ? {}
                 : { methodSelector: value.evm.methodSelector }),

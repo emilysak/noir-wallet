@@ -10,6 +10,7 @@ import {
   type TransactionGraph
 } from '@/core/transactions/domain'
 import {
+  evmSimulationPreviewExpiresAt,
   parseEvmContractCallIntent,
   parseEvmFeeSelection,
   parseEvmTransferIntent,
@@ -25,6 +26,11 @@ import {
   type PreparedEvmTransferApproval,
   parseEvmAccountBinding
 } from '@/infrastructure/chains/evm'
+import {
+  selectErc20RevokeCall,
+  type Erc20RevokeCall,
+  type Erc20RevokeEthCall
+} from '@/infrastructure/chains/evm/evm-token-revoke'
 import { accountContextTransition } from './account-context-transition'
 import { traceDebugStage } from '@/lib/debug-performance'
 import { DedupPromise } from '@/lib/async-utils'
@@ -44,6 +50,7 @@ export interface BackgroundEvmTransferControllerOptions {
     context: ActiveEvmPortfolioContext
   ) => Promise<PeaEvmExecutionAccount>
   readonly readTokenAllowance: (token: string, owner: string, spender: string) => Promise<string>
+  readonly probeTokenCall: (call: Erc20RevokeEthCall) => Promise<string>
   readonly readTokenBalance: (token: string, owner: string) => Promise<string>
   readonly validateRheaSwapQuote?: (
     quoteHandle: string,
@@ -81,7 +88,7 @@ function toBackgroundReview(value: PreparedEvmTransferApproval): BackgroundEvmTr
       operation: 'transaction' as const,
       summary: value.signing.summary,
       payloadFingerprint: value.signing.payloadFingerprint,
-      expiresAt: value.signing.expiresAt
+      expiresAt: evmSimulationPreviewExpiresAt(value.graph.root.createdAt, value.signing.expiresAt)
     })
   })
 }
@@ -92,6 +99,7 @@ export class BackgroundEvmTransferController {
   private readonly resolveExternalSigner: BackgroundEvmTransferControllerOptions['resolveExternalSigner']
   private readonly resolvePrivateExecutionAccount?: BackgroundEvmTransferControllerOptions['resolvePrivateExecutionAccount']
   private readonly readTokenAllowance: BackgroundEvmTransferControllerOptions['readTokenAllowance']
+  private readonly probeTokenCall: BackgroundEvmTransferControllerOptions['probeTokenCall']
   private readonly readTokenBalance: BackgroundEvmTransferControllerOptions['readTokenBalance']
   private readonly tokenBalanceCache = new Map<string, { raw: string; expiresAt: number }>()
   private readonly tokenBalanceReads = new Map<string, DedupPromise<string>>()
@@ -103,6 +111,7 @@ export class BackgroundEvmTransferController {
     this.resolveExternalSigner = options.resolveExternalSigner
     this.resolvePrivateExecutionAccount = options.resolvePrivateExecutionAccount
     this.readTokenAllowance = options.readTokenAllowance
+    this.probeTokenCall = options.probeTokenCall
     this.readTokenBalance = options.readTokenBalance
     this.validateRheaSwapQuote = options.validateRheaSwapQuote
   }
@@ -156,6 +165,33 @@ export class BackgroundEvmTransferController {
         throw new Error('EVM allowance owner does not match the selected wallet address')
       }
       return this.readTokenAllowance(token, owner, spender)
+    })
+  }
+
+  async selectTokenRevoke(
+    token: string,
+    spender: string,
+    expectedOwner: string
+  ): Promise<Erc20RevokeCall> {
+    if (typeof expectedOwner !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(expectedOwner)) {
+      throw new Error('Invalid EVM allowance owner')
+    }
+    return accountContextTransition.runActiveOperation(async () => {
+      const context = await this.requireActiveContext()
+      const owner = parseEvmAccountBinding(
+        context.chainAccount,
+        context.chainAccount.scope.chainId
+      ).address
+      if (owner.toLowerCase() !== expectedOwner.toLowerCase()) {
+        throw new Error('EVM allowance owner does not match the selected wallet address')
+      }
+      return selectErc20RevokeCall({
+        token,
+        owner,
+        spender,
+        readAllowance: () => this.readTokenAllowance(token, owner, spender),
+        ethCall: call => this.probeTokenCall(call)
+      })
     })
   }
 

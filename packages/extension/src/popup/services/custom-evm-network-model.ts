@@ -94,6 +94,7 @@ export function buildCustomEvmNetwork(
       decimals: Number(values.decimals)
     },
     rpc: { protocol: 'evm-json-rpc', label: values.name, url: values.rpcUrl },
+    addedBy: 'user',
     ...(values.explorerUrl
       ? {
           explorer: {

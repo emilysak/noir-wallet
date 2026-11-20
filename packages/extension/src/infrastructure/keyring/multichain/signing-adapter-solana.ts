@@ -1,5 +1,8 @@
 import type { ChainId } from '@/core/chains/domain'
-import { parseSolanaTransactionEnvelope } from '@/infrastructure/chains/solana/solana-transaction-codec'
+import {
+  parseSolanaTransactionEnvelope,
+  solanaBytesParseAsTransaction
+} from '@/infrastructure/chains/solana/solana-transaction-codec'
 import { parseSigningSummary } from '@/core/keyring/domain/signing-summary-validation'
 import type {
   SolanaInstructionInterpretation,
@@ -193,11 +196,16 @@ export function parseSolanaSigningPreparePayload(value: unknown): SolanaSigningP
     })
   }
   assertExactKeys(record, ['kind', 'chainId', 'accountIndex', 'message'], [], 'payload')
+  const message = readMessage(record.message, 256 * 1024)
+  // A raw signature over these bytes authorizes the transaction they encode.
+  if (solanaBytesParseAsTransaction(message)) {
+    throw new Error('Solana message parses as a transaction')
+  }
   return Object.freeze({
     kind,
     chainId: readChainId(record.chainId),
     accountIndex: readSafeInteger(record.accountIndex, 'accountIndex', MAX_SIGNING_ACCOUNT_INDEX),
-    message: readMessage(record.message, 256 * 1024)
+    message
   })
 }
 
@@ -561,7 +569,14 @@ async function adaptSolanaTransaction(
       schema: 'solana.transaction.v1',
       chainId: payload.chainId,
       operation: 'transaction',
-      review: { level: issues.length === 0 ? 'standard' : 'caution', issues },
+      review: {
+        level: issues.some(issue => issue.code === 'simulation-failed')
+          ? 'blocked'
+          : issues.length === 0
+            ? 'standard'
+            : 'caution',
+        issues
+      },
       fields: {
         messageVersion,
         feePayer: readString(rawSummary.feePayer, 'feePayer', 64),

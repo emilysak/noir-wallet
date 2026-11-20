@@ -11,6 +11,7 @@ const integerPattern = /^[1-9][0-9]*$/
 const releaseBranchPattern = /^release\/[0-9]+\.[0-9]+\.[0-9]+$/
 const versionPattern =
   /^(?:2|[3-9]|[1-9][0-9]+)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-beta\.[1-9][0-9]*)?$/
+const productionTagPattern = /^v((?:2|[3-9]|[1-9][0-9]+)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$/
 
 function requireSha(value, name) {
   if (typeof value !== 'string' || !shaPattern.test(value)) {
@@ -39,6 +40,51 @@ function requireBranch(value) {
     throw new Error('Source must be a branch name or a full commit SHA')
   }
   return value
+}
+
+function compareProductionVersions(left, right) {
+  const parts = value => {
+    const numbers = value.split('.')
+    if (numbers.length !== 3 || numbers.some(part => !/^(?:0|[1-9][0-9]*)$/.test(part))) {
+      throw new Error('Invalid production version')
+    }
+    return numbers.map(part => BigInt(part))
+  }
+  const leftParts = parts(left)
+  const rightParts = parts(right)
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) return leftParts[index] > rightParts[index] ? 1 : -1
+  }
+  return 0
+}
+
+async function publishedProductionVersions(request) {
+  const versions = []
+  for (let page = 1; page <= 20; page += 1) {
+    const result = await request(`tags?per_page=100&page=${page}`)
+    if (!Array.isArray(result) || result.length > 100) {
+      throw new Error('Invalid production tag response')
+    }
+    for (const tag of result) {
+      if (!tag || typeof tag !== 'object' || Array.isArray(tag) || typeof tag.name !== 'string') {
+        throw new Error('Invalid production tag response')
+      }
+      const match = productionTagPattern.exec(tag.name)
+      if (match) versions.push(match[1])
+    }
+    if (result.length < 100) return versions
+  }
+  throw new Error('Production tag inventory exceeds the supported limit')
+}
+
+async function assertNewerThanPublishedTags(version, request) {
+  let highest = null
+  for (const published of await publishedProductionVersions(request)) {
+    if (!highest || compareProductionVersions(published, highest) > 0) highest = published
+  }
+  if (highest && compareProductionVersions(version, highest) <= 0) {
+    throw new Error(`Production version must be greater than the highest published tag v${highest}`)
+  }
 }
 
 async function readReleaseVersion(mode, sourceSha, request) {
@@ -127,6 +173,7 @@ export async function resolveReleaseSource({ mode, source, confirmSha, workflowS
       throw new Error('Release branch must match the extension version')
     if (sourceSha !== confirmSha)
       throw new Error('Confirmed candidate commit must match the current release branch HEAD')
+    await assertNewerThanPublishedTags(version, request)
   }
   return {
     source_sha: sourceSha,

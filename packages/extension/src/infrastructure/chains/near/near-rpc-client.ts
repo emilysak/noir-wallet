@@ -9,6 +9,7 @@ import {
   isNearAccessKeyMissingResult,
   isRecord,
   parseNearAccountSnapshot,
+  parseNearAccessKeyList,
   parseNearAccessKeySnapshot,
   parseNearFinalBlock,
   parseNearFungibleTokenBalance,
@@ -31,6 +32,7 @@ import {
 export {
   NEAR_RPC_ERROR_CODES,
   NearRpcError,
+  type NearAccessKeyListSnapshot,
   type NearAccessKeyPermission,
   type NearAccessKeySnapshot,
   type NearAccountSnapshot,
@@ -321,6 +323,24 @@ export function createNearRpcClient(
         return parseNearAccessKeySnapshot(result, accountId, publicKey)
       } catch (error) {
         if (error instanceof NearRpcError && error.code === 'access-key-not-found') return null
+        throw error
+      }
+    },
+    listAccessKeys: async (accountIdValue: string, signal?: AbortSignal) => {
+      const accountId = readNearAccountId(accountIdValue, 'NEAR account ID')
+      try {
+        const result = await request(
+          'query',
+          Object.freeze({
+            request_type: 'view_access_key_list',
+            finality: 'final',
+            account_id: accountId
+          }),
+          signal
+        )
+        return parseNearAccessKeyList(result, accountId)
+      } catch (error) {
+        if (error instanceof NearRpcError && error.code === 'account-not-found') return null
         throw error
       }
     },

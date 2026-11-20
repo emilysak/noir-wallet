@@ -4,6 +4,7 @@ import type { ActivityItem, ActivityScope } from '@/core/activity'
 import { parseAssetId } from '@/core/chains/registry'
 import { readBoundedResponseText } from '@/lib/fetch-utils'
 import {
+  collectPlantedEvmCounterparties,
   mapEvmIndexedActivity,
   EVM_ACTIVITY_ITEM_LIMIT,
   type EvmConfirmedReplacement,
@@ -38,6 +39,8 @@ export type EvmAnkrHistoryResult =
       readonly partial: boolean
       readonly hasMore?: boolean
       readonly retrySingleChain?: boolean
+      readonly plantedRecipients?: readonly string[]
+      readonly plantedSenders?: readonly string[]
     }
   | { readonly incomplete: true; readonly retrySingleChain: boolean }
   | { readonly error: unknown }
@@ -449,6 +452,7 @@ export function createEvmAnkrHistoryClient(
           sourcePartial: partial,
           itemLimit: historyPageCount > 1 ? EVM_ACTIVITY_ITEM_LIMIT : undefined
         })
+        const planted = collectPlantedEvmCounterparties(target.address, tokenTransfers)
         if (items.length === 0 && partial) {
           output.set(target.chainId, {
             incomplete: true,
@@ -462,7 +466,9 @@ export function createEvmAnkrHistoryClient(
             hasMore:
               historyPageCount > 1 && items.length >= EVM_ACTIVITY_ITEM_LIMIT
                 ? false
-                : pageTruncated || branchFailed || items.length >= 200
+                : pageTruncated || branchFailed || items.length >= 200,
+            ...(planted.recipients.length > 0 ? { plantedRecipients: planted.recipients } : {}),
+            ...(planted.senders.length > 0 ? { plantedSenders: planted.senders } : {})
           })
         }
       } catch (error) {

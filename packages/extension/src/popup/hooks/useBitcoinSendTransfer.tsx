@@ -395,6 +395,34 @@ export function useBitcoinSendTransfer({
         review.value.graph.root.id,
         review.value.review.payloadFingerprint.digestHex
       )
+      if (submission.status === 'review-required') {
+        const latest = await bitcoinWalletClient.getPendingTransfer(review.value.graph.root.id)
+        const latestSummary = latest?.review.summary
+        const recipientOutput =
+          latestSummary?.schema === 'bitcoin.psbt.v1'
+            ? latestSummary.fields.outputs.find(
+                output =>
+                  output.classification === 'recipient' && output.address === review.recipient
+              )
+            : undefined
+        if (
+          !latest ||
+          latest.graph.root.id !== review.value.graph.root.id ||
+          latest.review.payloadFingerprint.digestHex !== submission.payloadFingerprint ||
+          !recipientOutput
+        ) {
+          throw new Error('The Bitcoin inputs changed. Review the transaction again.')
+        }
+        pendingReview.current = latest
+        setReview({
+          recipient: review.recipient,
+          amountRaw: recipientOutput.amountSats,
+          feeTier: review.feeTier,
+          value: latest
+        })
+        setError('The Bitcoin inputs changed. Review the transaction again.')
+        return
+      }
       pendingReview.current = null
       setReview(null)
       if (submission.status === 'external-signature-required') {
@@ -432,6 +460,7 @@ export function useBitcoinSendTransfer({
   const testnet = chain.chain.network.kind === 'testnet'
   const input: Omit<SendTransferViewState, 'priceUsd' | 'review'> = {
     family: 'bitcoin',
+    chainId: chain.chain.id,
     asset: {
       assetId: asset.asset.id,
       symbol: 'BTC',

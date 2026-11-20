@@ -164,13 +164,32 @@ test('small incoming warning requires an unfamiliar full source and a known smal
   expect(shouldWarnSmallTransfer(input)).toBe(true)
   expect(shouldWarnSmallTransfer({ ...input, ownedAddresses: [sender] })).toBe(false)
   expect(shouldWarnSmallTransfer({ ...input, contactAddresses: [sender] })).toBe(false)
+  const wallet = { chainId, address: `0x${'a'.repeat(40)}` }
   expect(
     shouldWarnSmallTransfer({
       ...input,
       history: [
         {
           createdAt: 1,
-          snapshot: { direction: 'outgoing', recipient: sender }
+          source: 'rpc',
+          status: 'final',
+          snapshot: { direction: 'outgoing', sender: wallet, recipient: sender },
+          segments: []
+        },
+        item
+      ]
+    })
+  ).toBe(true)
+  expect(
+    shouldWarnSmallTransfer({
+      ...input,
+      history: [
+        {
+          createdAt: 1,
+          source: 'wallet-v2',
+          status: 'final',
+          snapshot: { direction: 'outgoing', sender: wallet, recipient: sender },
+          segments: []
         },
         item
       ]

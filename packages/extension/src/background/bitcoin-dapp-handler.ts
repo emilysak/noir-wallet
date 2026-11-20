@@ -33,7 +33,8 @@ import type {
 } from './bitcoin-transfer-controller'
 import { mapBitcoinWalletRuntimeError } from './bitcoin-wallet-runtime-error'
 import type { BitcoinTransactionRpc } from '@/infrastructure/chains/bitcoin'
-import { networks, Psbt, Transaction } from 'bitcoinjs-lib'
+import * as secp256k1 from '@bitcoinerlab/secp256k1'
+import { initEccLib, networks, Psbt, Transaction } from 'bitcoinjs-lib'
 import { Buffer } from 'buffer'
 import { requestLedgerSignature } from './ledger-signing-coordinator'
 import { ledgerBitcoinMessageSummary, ledgerBitcoinPsbtSummary } from './ledger-bitcoin-dapp-review'
@@ -167,6 +168,167 @@ function finalizeIncompletePsbtInputs(psbt: Psbt): void {
       psbt.finalizeInput(index)
     }
   })
+}
+
+type BitcoinPsbtInput = Psbt['data']['inputs'][number]
+
+function signatureKey(pubkey: Uint8Array, leafHash?: Uint8Array): string {
+  const pubkeyHex = Buffer.from(pubkey).toString('hex')
+  return leafHash === undefined
+    ? pubkeyHex
+    : `${pubkeyHex}:${Buffer.from(leafHash).toString('hex')}`
+}
+
+function signatureGroups(
+  items:
+    | readonly {
+        readonly pubkey: Uint8Array
+        readonly signature: Uint8Array
+        readonly leafHash?: Uint8Array
+      }[]
+    | undefined
+): Map<string, Buffer[]> {
+  const groups = new Map<string, Buffer[]>()
+  for (const item of items ?? []) {
+    const key = signatureKey(item.pubkey, item.leafHash)
+    const signatures = groups.get(key) ?? []
+    signatures.push(Buffer.from(item.signature))
+    groups.set(key, signatures)
+  }
+  return groups
+}
+
+function hasUnmatchedSignature(
+  existing: Map<string, Buffer[]>,
+  pubkey: Uint8Array,
+  signature: Uint8Array,
+  leafHash?: Uint8Array
+): boolean {
+  const signatures = existing.get(signatureKey(pubkey, leafHash))
+  if (!signatures) return true
+  const matchIndex = signatures.findIndex(item => item.equals(Buffer.from(signature)))
+  if (matchIndex < 0) return true
+  signatures.splice(matchIndex, 1)
+  return false
+}
+
+function hasNewBytes(before: Uint8Array | undefined, after: Uint8Array | undefined): boolean {
+  if (after === undefined) return false
+  if (before === undefined) return true
+  return !Buffer.from(before).equals(Buffer.from(after))
+}
+
+function hasNewInputSignatures(before: BitcoinPsbtInput, after: BitcoinPsbtInput): boolean {
+  const partialSignatures = signatureGroups(before.partialSig)
+  for (const item of after.partialSig ?? []) {
+    if (hasUnmatchedSignature(partialSignatures, item.pubkey, item.signature)) return true
+  }
+  const tapScriptSignatures = signatureGroups(before.tapScriptSig)
+  for (const item of after.tapScriptSig ?? []) {
+    if (hasUnmatchedSignature(tapScriptSignatures, item.pubkey, item.signature, item.leafHash)) {
+      return true
+    }
+  }
+  return (
+    hasNewBytes(before.tapKeySig, after.tapKeySig) ||
+    hasNewBytes(before.finalScriptSig, after.finalScriptSig) ||
+    hasNewBytes(before.finalScriptWitness, after.finalScriptWitness)
+  )
+}
+
+let bitcoinEccReady = false
+
+function ensureBitcoinEcc(): void {
+  if (bitcoinEccReady) return
+  initEccLib(secp256k1)
+  bitcoinEccReady = true
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return Buffer.from(left).equals(Buffer.from(right))
+}
+
+function bitcoinSignatureIsValid(publicKey: Buffer, hash: Buffer, signature: Buffer): boolean {
+  return publicKey.length === 32
+    ? secp256k1.verifySchnorr(hash, publicKey, signature)
+    : secp256k1.verify(hash, publicKey, signature)
+}
+
+// confirmBitcoinPsbt does not receive the approved input indexes. Drop signatures
+// that are new on those inputs, then require the unsigned transaction and every
+// other PSBT field to match the pre-sign PSBT.
+function stripNewTargetSignatures(before: BitcoinPsbtInput, after: BitcoinPsbtInput): void {
+  if (after.partialSig) {
+    const previous = before.partialSig ?? []
+    const remaining = after.partialSig.filter(item =>
+      previous.some(existing => sameBytes(existing.pubkey, item.pubkey))
+    )
+    if (remaining.length === 0) delete after.partialSig
+    else after.partialSig = remaining
+  }
+  if (after.tapScriptSig) {
+    const previous = before.tapScriptSig ?? []
+    const remaining = after.tapScriptSig.filter(item =>
+      previous.some(
+        existing =>
+          sameBytes(existing.pubkey, item.pubkey) && sameBytes(existing.leafHash, item.leafHash)
+      )
+    )
+    if (remaining.length === 0) delete after.tapScriptSig
+    else after.tapScriptSig = remaining
+  }
+  if (after.tapKeySig !== undefined && before.tapKeySig === undefined) delete after.tapKeySig
+  if (after.finalScriptSig !== undefined && before.finalScriptSig === undefined) {
+    delete after.finalScriptSig
+  }
+  if (after.finalScriptWitness !== undefined && before.finalScriptWitness === undefined) {
+    delete after.finalScriptWitness
+  }
+}
+
+function assertSoftwarePsbtSignsOnlyTargetInputs(
+  original: Psbt,
+  signed: Psbt,
+  targetInputIndexes: readonly number[]
+): void {
+  if (signed.inputCount !== original.inputCount) {
+    throw new Error('Bitcoin PSBT signature result is invalid')
+  }
+  const targetInputs = new Set(targetInputIndexes)
+  for (const index of targetInputs) {
+    if (!Number.isInteger(index) || index < 0 || index >= original.inputCount) {
+      throw new Error('Bitcoin PSBT signature result is invalid')
+    }
+  }
+  for (let index = 0; index < original.inputCount; index += 1) {
+    if (targetInputs.has(index)) continue
+    const before = original.data.inputs[index]
+    const after = signed.data.inputs[index]
+    if (!before || !after) throw new Error('Bitcoin PSBT signature result is invalid')
+    if (hasNewInputSignatures(before, after)) {
+      throw new Error('Bitcoin PSBT signed a non-target input')
+    }
+  }
+  const withoutNewSignatures = Psbt.fromBase64(signed.toBase64())
+  for (const index of targetInputs) {
+    const before = original.data.inputs[index]
+    const after = withoutNewSignatures.data.inputs[index]
+    if (!before || !after) throw new Error('Bitcoin PSBT signature result is invalid')
+    stripNewTargetSignatures(before, after)
+  }
+  if (withoutNewSignatures.toBase64() !== original.toBase64()) {
+    throw new Error('Bitcoin PSBT changed unapproved fields')
+  }
+  ensureBitcoinEcc()
+  for (const index of targetInputs) {
+    let valid = false
+    try {
+      valid = signed.validateSignaturesOfInput(index, bitcoinSignatureIsValid)
+    } catch {
+      valid = false
+    }
+    if (!valid) throw new Error('Bitcoin PSBT target input signature is missing or invalid')
+  }
 }
 
 export class BackgroundBitcoinDAppHandler {
@@ -639,23 +801,68 @@ export class BackgroundBitcoinDAppHandler {
       if (!decision.approved) {
         throw new BitcoinProviderError(4001, 'User rejected the transaction request.')
       }
+      const authorizeAccount = async (context: {
+        readonly generationId: string
+        readonly chainAccount: { readonly id: string }
+      }) => {
+        const current = await this.requireAuthorizedAccount(origin)
+        if (
+          !activeAccountsEqual(current, active) ||
+          current.context.generationId !== context.generationId ||
+          current.context.chainAccount.id !== context.chainAccount.id
+        ) {
+          throw new BitcoinProviderError(
+            4100,
+            'The active Bitcoin account changed. Review the transaction request again.'
+          )
+        }
+      }
       let submission = await this.options.transferController.approveForDApp(
         prepared.graph.root.id,
         prepared.review.payloadFingerprint.digestHex,
-        async context => {
-          const current = await this.requireAuthorizedAccount(origin)
-          if (
-            !activeAccountsEqual(current, active) ||
-            current.context.generationId !== context.generationId ||
-            current.context.chainAccount.id !== context.chainAccount.id
-          ) {
-            throw new BitcoinProviderError(
-              4100,
-              'The active Bitcoin account changed. Review the transaction request again.'
-            )
-          }
-        }
+        authorizeAccount
       )
+      let replacedInputReviews = 0
+      while (submission.status === 'review-required') {
+        if (replacedInputReviews >= 2) break
+        replacedInputReviews += 1
+        const latest = await transferController.getPendingApproval(prepared.graph.root.id)
+        if (
+          !latest ||
+          latest.review.payloadFingerprint.digestHex !== submission.payloadFingerprint
+        ) {
+          throw new BitcoinProviderError(
+            4100,
+            'The Bitcoin inputs changed. Review the transaction again.'
+          )
+        }
+        prepared = latest
+        const nextDecision = await this.options.approval.requestExternalApproval(
+          origin,
+          'bitcoinTransaction',
+          {
+            chainName: this.options.network.displayName,
+            review: prepared.review,
+            feeTier: 'standard',
+            feeEditingAvailable: false,
+            ...dappApprovalMetadata(tabInfo)
+          }
+        )
+        if (!nextDecision.approved) {
+          throw new BitcoinProviderError(4001, 'User rejected the transaction request.')
+        }
+        submission = await this.options.transferController.approveForDApp(
+          prepared.graph.root.id,
+          prepared.review.payloadFingerprint.digestHex,
+          authorizeAccount
+        )
+      }
+      if (submission.status === 'review-required') {
+        throw new BitcoinProviderError(
+          4100,
+          'The Bitcoin inputs changed. Review the transaction again.'
+        )
+      }
       if (submission.status === 'external-signature-required') {
         if (
           active.context.keyDomainSource.kind !== 'hardware' ||
@@ -959,11 +1166,23 @@ export class BackgroundBitcoinDAppHandler {
       throw new Error('Bitcoin PSBT signature result is invalid')
     }
     const signedPsbtHex = bytesToHex(base64ToBytes(result.payload.value))
+    const network =
+      this.options.network.networkMode === 'mainnet' ? networks.bitcoin : networks.testnet
+    let originalPsbt: Psbt
+    let signedPsbt: Psbt
+    try {
+      originalPsbt = Psbt.fromHex(parsed.psbtHex, { network })
+      signedPsbt = Psbt.fromHex(signedPsbtHex, { network })
+    } catch {
+      throw new Error('Bitcoin PSBT signature result is invalid')
+    }
+    assertSoftwarePsbtSignsOnlyTargetInputs(
+      originalPsbt,
+      signedPsbt,
+      prepared.summary.fields.signingInputIndexes
+    )
     if (!parsed.autoFinalized) return signedPsbtHex
     try {
-      const network =
-        this.options.network.networkMode === 'mainnet' ? networks.bitcoin : networks.testnet
-      const signedPsbt = Psbt.fromHex(signedPsbtHex, { network })
       finalizeIncompletePsbtInputs(signedPsbt)
       return signedPsbt.toHex()
     } catch {

@@ -39,6 +39,7 @@ import {
   type EvmSendSourceMode
 } from '@/popup/services/evm-send-validation'
 import { resolvePortfolioTransferAvailability } from '@/popup/services/transfer-availability'
+import { useAddressPoisoningWarning } from '@/popup/services/use-address-poisoning'
 import {
   recordSendApprovalFailure,
   recordSendResult,
@@ -1104,6 +1105,14 @@ export function useEvmSendTransfer({
     setPrivateSendScope(scope)
     setError(null)
   }
+  const reviewedEvmSummary = summary?.schema === 'evm.transaction.v1' ? summary : null
+  const addressPoisoning = useAddressPoisoningWarning(
+    review &&
+      reviewedEvmSummary &&
+      review.recipient.toLowerCase() !== reviewedEvmSummary.fields.from.toLowerCase()
+      ? { chainId: chain.chain.id, address: review.recipient }
+      : null
+  )
 
   const setInputAmount = (value: string) => {
     if (!/^\d*\.?\d*$/.test(value)) return
@@ -1164,6 +1173,8 @@ export function useEvmSendTransfer({
     accountDisplayName,
     bundledAsset,
     nativeSymbol,
+    nativeDecimals,
+    addressPoisoning,
     domainAvailableRaw,
     availableRaw,
     tokenFeeBalanceError,

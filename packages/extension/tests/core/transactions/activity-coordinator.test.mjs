@@ -91,6 +91,7 @@ async function repositoryWithEvmTransfer(transactionHash) {
         input: '0x',
         accessList: []
       },
+      l1DataFeeWei: '0',
       createdAt: 1_100
     },
     scope,

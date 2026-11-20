@@ -138,6 +138,7 @@ export interface TransactionIntentSnapshot {
     readonly maxFeePerGasWei: string
     readonly maxPriorityFeePerGasWei: string
     readonly gasLimit: string
+    readonly l1DataFeeWei?: string
     readonly methodSelector?: string
     readonly unsignedTransaction?: TransactionEvmUnsignedTransaction
   }>

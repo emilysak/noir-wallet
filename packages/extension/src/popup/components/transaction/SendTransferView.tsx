@@ -3,6 +3,12 @@ import type { ComponentProps, ReactNode } from 'react'
 import { formatSortAddress } from '@/lib/format'
 import { formatTokenQuantity } from '@/lib/number-format'
 import { AmountDisplay } from '@/popup/components/common/AmountDisplay'
+import { InlineError } from '@/popup/components/common/InlineError'
+import { AddressPoisoningNotice } from '@/popup/components/transaction/AddressPoisoningNotice'
+import {
+  addressPoisoningNeedsCaution,
+  useAddressPoisoningWarning
+} from '@/popup/services/use-address-poisoning'
 import {
   TransactionReviewView,
   type TransactionReviewAsset,
@@ -36,6 +42,7 @@ interface SendTransferReviewState {
 
 export interface SendTransferViewState {
   readonly family: 'solana' | 'near' | 'bitcoin'
+  readonly chainId: string
   readonly asset: Pick<
     ComponentProps<typeof SendAssetHeader>,
     'assetId' | 'symbol' | 'icon' | 'nativeChain' | 'blockchain'
@@ -82,6 +89,11 @@ export function SendTransferView({
   const { asset, family, networkName, feeSymbol, review, selectedRecipient, approving } = state
   const titleId = `${family}-send-review-title`
   const balanceKnown = state.balanceKnown ?? true
+  const addressPoisoning = useAddressPoisoningWarning(
+    review && review.sender !== review.recipient
+      ? { chainId: state.chainId, address: review.recipient }
+      : null
+  )
 
   return (
     <>
@@ -244,7 +256,18 @@ export function SendTransferView({
                   : []),
                 ...(review.afterTotalRows ?? [])
               ]}
-              confirmLabel="Confirm"
+              afterRows={
+                addressPoisoningNeedsCaution(addressPoisoning) ? (
+                  <AddressPoisoningNotice />
+                ) : undefined
+              }
+              error={
+                state.error ? <InlineError message={state.error} className="mt-3" /> : undefined
+              }
+              confirmLabel={
+                addressPoisoningNeedsCaution(addressPoisoning) ? 'Send anyway' : 'Confirm'
+              }
+              confirmDisabled={addressPoisoning === 'pending'}
               confirming={approving}
               submitting={approving}
               preparing={review.preparing}

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  collectPlantedEvmCounterparties,
+  collectPlantedEvmRecipients,
   filterTrackedEvmTokenActivity,
   isUntrackedEvmTokenActivity,
   isZeroValueEvmTokenActivity,
@@ -285,4 +287,51 @@ test('cached zero RPC token transfers are removed without affecting other activi
     result.get(chainId).map(item => item.id),
     [nonzero.id, approve.id]
   )
+})
+
+test('zero token recipients stay out of activity rows and remain planted', async () => {
+  const lookalike = `0x${'8'.repeat(40)}`
+  const stranger = `0x${'9'.repeat(40)}`
+  assert.deepEqual(map([], [tokenTransfer('1', '0', { to: lookalike })]), [])
+  assert.deepEqual(
+    collectPlantedEvmRecipients(address, [
+      tokenTransfer('1', '0', { to: lookalike }),
+      tokenTransfer('1', '0', { to: lookalike }),
+      tokenTransfer('1', '0', { from: stranger, to: lookalike }),
+      tokenTransfer('1', '0', { to: address }),
+      tokenTransfer('2', '5', { to: lookalike })
+    ]),
+    [lookalike]
+  )
+  const dustSender = `0x${'a'.repeat(40)}`
+  assert.deepEqual(
+    collectPlantedEvmCounterparties(address, [
+      tokenTransfer('4', '0', { from: dustSender, to: address }),
+      tokenTransfer('4', '0', { from: dustSender, to: address }),
+      tokenTransfer('5', '0', { to: lookalike })
+    ]),
+    { recipients: [lookalike], senders: [dustSender] }
+  )
+
+  const cache = memoryCache(null)
+  const source = createCachedEvmActivityHistorySource({
+    chainId,
+    cache: cache.repository,
+    now: () => 1_000,
+    source: {
+      readAddressActivity: async () => {
+        throw new Error('metadata required')
+      },
+      readAddressActivityWithMetadata: async () => ({
+        items: map([], [tokenTransfer('3', '10')]),
+        hasMore: false,
+        plantedRecipients: [lookalike]
+      }),
+      findConfirmedReplacement: async () => null
+    }
+  })
+  const items = await source.readAddressActivity({ scope, address })
+  assert.equal(items.length, 1)
+  assert.notEqual(items[0].snapshot.primaryAmount.amountRaw, '0')
+  assert.deepEqual(cache.record().plantedRecipients, [lookalike])
 })

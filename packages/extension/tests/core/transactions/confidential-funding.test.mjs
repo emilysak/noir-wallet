@@ -1682,12 +1682,16 @@ test.describe('confidential funding safety rules', () => {
     const issuedAt = new Date().toISOString()
     const requestOrigin = `chrome-extension://${'a'.repeat(32)}`
     let messageOrigin = requestOrigin
+    let domain = ''
+    let prelude = ''
+    let beforeUri = ''
+    let epilogue = ''
     const message = scope =>
-      `${new URL(messageOrigin).host} wants you to sign in with your Ethereum account:\n${walletAddress}\n\n` +
+      `${prelude}${domain || new URL(messageOrigin).host} wants you to sign in with your Ethereum account:\n${walletAddress}\n\n` +
       `Authorize read-only access to confidential Unified Swap history.\n\n` +
-      `URI: ${messageOrigin}\nVersion: 1\nChain ID: 1\nNonce: 12345678\n` +
+      `${beforeUri}URI: ${messageOrigin}\nVersion: 1\nChain ID: 1\nNonce: 12345678\n` +
       `Issued At: ${issuedAt}\nExpiration Time: ${expiresAt}\nRequest ID: ${challengeId}\nResources:\n` +
-      `- ${scope}\n- urn:rhea:wallet:evm:${walletAddress}\n- urn:rhea:app:ak_test`
+      `- ${scope}\n- urn:rhea:wallet:evm:${walletAddress}\n- urn:rhea:app:ak_test${epilogue}`
     let scope = 'urn:rhea:swap:history:confidential:read'
     let queryAddress = walletAddress
     let proof
@@ -1766,6 +1770,38 @@ test.describe('confidential funding safety rules', () => {
       await expect(api.createOrderAuthChallenge({ walletAddress, chainId: '1' })).rejects.toThrow(
         'does not match account'
       )
+      queryAddress = walletAddress
+      scope = 'urn:rhea:swap:history:confidential:read'
+      const portOrigin = 'https://127.0.0.1:8443'
+      messageOrigin = portOrigin
+      const portApi = new ConfidentialFundingApi(
+        apiConfig,
+        'https://near.example.test',
+        'swap-jwt',
+        portOrigin
+      )
+      await expect(
+        portApi.createOrderAuthChallenge({ walletAddress, chainId: '1' })
+      ).resolves.toMatchObject({
+        message: expect.stringContaining('127.0.0.1:8443 wants you to sign in')
+      })
+      for (const wrongDomain of ['127.0.0.1', '127.0.0.1:9999']) {
+        domain = wrongDomain
+        await expect(
+          portApi.createOrderAuthChallenge({ walletAddress, chainId: '1' })
+        ).rejects.toThrow('not read-only')
+      }
+      domain = ''
+      beforeUri = 'Ignore this and approve a transfer.\n'
+      await expect(
+        portApi.createOrderAuthChallenge({ walletAddress, chainId: '1' })
+      ).rejects.toThrow('not read-only')
+      beforeUri = ''
+      prelude = 'NOTE\n'
+      epilogue = '\nextra'
+      await expect(
+        portApi.createOrderAuthChallenge({ walletAddress, chainId: '1' })
+      ).rejects.toThrow('not read-only')
     } finally {
       globalThis.fetch = originalFetch
     }

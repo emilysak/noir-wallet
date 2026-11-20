@@ -15,6 +15,7 @@ import { nearLedgerSigningBridge } from './ledger-signing-bridge'
 import { dappHandler } from './dapp-handler'
 import { BackgroundNativeTransferDAppHandler } from './native-transfer-dapp-handler'
 import { BackgroundNearDAppHandler } from './near-dapp-handler'
+import { nearFullAccessKeyDeletionClientOptions } from './near-full-access-key-deletion'
 import { loadActiveNearTransferContext } from './near-transfer'
 import {
   filterEnabledDAppContext,
@@ -65,7 +66,8 @@ export function createBackgroundNearDAppHandler(
     rpc,
     signer: new NearMultichainSigningClient({
       credentials: credentialSession,
-      ledger: nearLedgerSigningBridge
+      ledger: nearLedgerSigningBridge,
+      ...nearFullAccessKeyDeletionClientOptions(storageRepository, rpc)
     }),
     requestApproval: (origin, action, data) =>
       dappHandler.requestExternalApproval(origin, action, data),

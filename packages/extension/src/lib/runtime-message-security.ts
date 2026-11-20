@@ -739,6 +739,12 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
   GET_ADDITIONAL_RECEIVE_TARGETS: {
     required: { walletId: isShortString, accountId: isShortString }
   },
+  GET_EVM_ACCOUNT_DELEGATION: {
+    required: { walletId: isShortString, accountId: isShortString }
+  },
+  GET_EVM_PERMIT2_ALLOWANCES: {
+    required: { walletId: isShortString, accountId: isShortString }
+  },
   GET_ACCOUNT_NETWORKS: { optional: { deriveMissingAddresses: isBoolean } },
   GET_BITCOIN_ADDRESS_BALANCES: {},
   SET_ACTIVE_BITCOIN_ADDRESS_TYPE: {
@@ -798,6 +804,14 @@ const TRUSTED_RUNTIME_SCHEMAS: Readonly<Record<string, RuntimeMessageSchema>> = 
       expectedOwner: isEvmAddress
     },
     optional: { executionMode: value => value === 'main' || value === 'private' }
+  },
+  SELECT_EVM_ERC20_REVOKE: {
+    required: {
+      chainId: isShortString,
+      token: isEvmAddress,
+      spender: isEvmAddress,
+      expectedOwner: isEvmAddress
+    }
   },
   GET_EVM_TOKEN_BALANCE: {
     required: {
@@ -1167,6 +1181,8 @@ const TRUSTED_RUNTIME_CONTEXTS: Readonly<Record<string, readonly OwnExtensionSen
     REFRESH_CONFIDENTIAL_BALANCES: ['extension-page'],
     GET_ASSET_MARKET_HISTORY: ['extension-page'],
     GET_ADDITIONAL_RECEIVE_TARGETS: ['extension-page'],
+    GET_EVM_ACCOUNT_DELEGATION: ['extension-page'],
+    GET_EVM_PERMIT2_ALLOWANCES: ['extension-page'],
     GET_ACCOUNT_NETWORKS: ['extension-page'],
     GET_BITCOIN_ADDRESS_BALANCES: ['extension-page'],
     SET_ACTIVE_BITCOIN_ADDRESS_TYPE: ['extension-page'],
@@ -1188,6 +1204,7 @@ const TRUSTED_RUNTIME_CONTEXTS: Readonly<Record<string, readonly OwnExtensionSen
     GET_EVM_PORTFOLIO: ['extension-page'],
     GET_EVM_CONFIRMATION_ESTIMATE: ['extension-page'],
     GET_EVM_TOKEN_ALLOWANCE: ['extension-page'],
+    SELECT_EVM_ERC20_REVOKE: ['extension-page'],
     GET_EVM_TOKEN_BALANCE: ['extension-page'],
     PREPARE_EVM_TRANSFER: ['extension-page'],
     ESTIMATE_EVM_TRANSFER_FEE: ['extension-page'],

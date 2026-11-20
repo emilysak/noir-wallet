@@ -1,6 +1,13 @@
 import type { EvmContractCallIntent, EvmTransferIntent } from '@/infrastructure/chains/evm'
 import type { ChainId } from '@/core/chains/domain'
 
+export {
+  inspectNearIntentsSigningPayload,
+  isNearIntentsSigningPayload,
+  MAX_NEAR_INTENTS_JSON_DEPTH,
+  type NearIntentsPayloadFinding
+} from './internal-signature-domains'
+
 export const EVM_DAPP_RUNTIME_METHODS = Object.freeze([
   'eth_chainId',
   'net_version',

@@ -1,4 +1,5 @@
 import { parseAccountId } from '@/core/accounts/domain'
+import { parseChainId } from '@/core/chains/registry'
 import { parseKeyDomainId } from '@/core/keyring/domain'
 import {
   isEvmSpeedUpReplacement,
@@ -19,6 +20,7 @@ import {
 import type {
   ActivityCompleteness,
   ActivityItem,
+  ActivityPlantedRecipient,
   ActivityReadModel,
   ActivityScope,
   ActivitySource
@@ -27,7 +29,9 @@ import { ACTIVITY_SOURCES } from './activity-types'
 
 export const ACTIVITY_READ_LIMITS = Object.freeze({
   sourceItems: 10_200,
-  resultItems: 2_000
+  resultItems: 2_000,
+  plantedRecipients: 2_000,
+  plantedSenders: 2_000
 })
 
 const SOURCE_PRIORITY: Readonly<Record<ActivitySource, number>> = Object.freeze({
@@ -508,10 +512,45 @@ function parseActivityItem(value: unknown, scope: ActivityScope): ActivityItem {
   return item
 }
 
+function parsePlantedRecipients(
+  value: unknown,
+  limit: number,
+  label: string
+): readonly ActivityPlantedRecipient[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length > limit) {
+    throw new Error(`Invalid Activity planted ${label}`)
+  }
+  const seen = new Set<string>()
+  const recipients: ActivityPlantedRecipient[] = []
+  for (const entry of value) {
+    if (!isRecord(entry) || !hasExactKeys(entry, ['chainId', 'address'])) {
+      throw new Error(`Invalid Activity planted ${label}`)
+    }
+    if (typeof entry.chainId !== 'string' || typeof entry.address !== 'string') {
+      throw new Error(`Invalid Activity planted ${label}`)
+    }
+    const chainId = parseChainId(entry.chainId).id
+    const address = entry.address.toLowerCase()
+    if (!chainId.startsWith('eip155:') || !/^0x[0-9a-f]{40}$/.test(address)) {
+      throw new Error(`Invalid Activity planted ${label}`)
+    }
+    const key = `${chainId}:${address}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    recipients.push(Object.freeze({ chainId, address }))
+  }
+  return recipients.length > 0 ? Object.freeze(recipients) : undefined
+}
+
 export function parseActivityReadModel(value: unknown): ActivityReadModel {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ['scope', 'items', 'partialItemCount'], ['hasMore']) ||
+    !hasExactKeys(
+      value,
+      ['scope', 'items', 'partialItemCount'],
+      ['hasMore', 'plantedRecipients', 'plantedSenders']
+    ) ||
     !Array.isArray(value.items) ||
     value.items.length > ACTIVITY_READ_LIMITS.resultItems
   ) {
@@ -532,11 +571,23 @@ export function parseActivityReadModel(value: unknown): ActivityReadModel {
   if (value.hasMore !== undefined && typeof value.hasMore !== 'boolean') {
     throw new Error('Invalid Activity pagination state')
   }
+  const plantedRecipients = parsePlantedRecipients(
+    value.plantedRecipients,
+    ACTIVITY_READ_LIMITS.plantedRecipients,
+    'recipients'
+  )
+  const plantedSenders = parsePlantedRecipients(
+    value.plantedSenders,
+    ACTIVITY_READ_LIMITS.plantedSenders,
+    'senders'
+  )
   return Object.freeze({
     scope,
     items,
     partialItemCount,
-    ...(value.hasMore === undefined ? {} : { hasMore: value.hasMore })
+    ...(value.hasMore === undefined ? {} : { hasMore: value.hasMore }),
+    ...(plantedRecipients === undefined ? {} : { plantedRecipients }),
+    ...(plantedSenders === undefined ? {} : { plantedSenders })
   })
 }
 
@@ -547,6 +598,8 @@ export function buildActivityReadModel(input: {
   readonly privateExecutionAddresses?: readonly string[]
   readonly limit?: number
   readonly hasMore?: boolean
+  readonly plantedRecipients?: readonly ActivityPlantedRecipient[]
+  readonly plantedSenders?: readonly ActivityPlantedRecipient[]
 }): ActivityReadModel {
   const scope = parseScope(input.scope)
   const supplementalItems = input.supplementalItems ?? []
@@ -647,10 +700,22 @@ export function buildActivityReadModel(input: {
       left.id.localeCompare(right.id)
   )
   const items = Object.freeze(deduplicated.slice(0, limit))
+  const plantedRecipients = parsePlantedRecipients(
+    input.plantedRecipients,
+    ACTIVITY_READ_LIMITS.plantedRecipients,
+    'recipients'
+  )
+  const plantedSenders = parsePlantedRecipients(
+    input.plantedSenders,
+    ACTIVITY_READ_LIMITS.plantedSenders,
+    'senders'
+  )
   return Object.freeze({
     scope,
     items,
     partialItemCount: items.filter(item => item.completeness === 'partial').length,
-    ...(input.hasMore || deduplicated.length > limit ? { hasMore: true } : {})
+    ...(input.hasMore || deduplicated.length > limit ? { hasMore: true } : {}),
+    ...(plantedRecipients === undefined ? {} : { plantedRecipients }),
+    ...(plantedSenders === undefined ? {} : { plantedSenders })
   })
 }

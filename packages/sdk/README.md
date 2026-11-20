@@ -218,15 +218,13 @@ Transparent funding can reveal and link selected UTXOs. It is not supported by K
 
 ## Sign and verify a message
 
-`derived` mode creates a privacy-preserving identity key that is unlinkable to the main transparent address. It is the recommended mode for off-chain identity binding.
+`derived` mode creates a privacy-preserving identity key that is unlinkable to the main transparent address. Only the official Noir application can request it. Other sites must use the current account; another requested signing mode is rejected.
 
 ```ts
 import { verifyMessageSignature } from '@noir-wallet/sdk'
 
 const message = 'Sign in to Example'
-const signed = await zcash.signMessage(message, {
-  signingMode: 'derived'
-})
+const signed = await zcash.signMessage(message)
 
 const verification = verifyMessageSignature({
   message,

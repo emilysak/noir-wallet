@@ -118,6 +118,9 @@ export type EvmTransactionSummary = SigningSummaryEnvelope<
     readonly valueWei: string
     readonly gasLimit: string
     readonly maximumFeeWei: string
+    readonly l1DataFeeWei?: string
+    readonly suggestedFeePerGasWei?: string | null
+    readonly priorityFeeElevated?: boolean
     readonly gasPriceWei: string | null
     readonly maxFeePerGasWei: string | null
     readonly maxPriorityFeePerGasWei: string | null

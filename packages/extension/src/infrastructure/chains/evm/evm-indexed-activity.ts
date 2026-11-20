@@ -39,9 +39,12 @@ export interface EvmActivityHistorySource {
   readonly readAddressActivity: (
     input: ReadEvmAddressActivityInput
   ) => Promise<readonly ActivityItem[]>
-  readonly readAddressActivityWithMetadata?: (
-    input: ReadEvmAddressActivityInput
-  ) => Promise<{ readonly items: readonly ActivityItem[]; readonly hasMore: boolean }>
+  readonly readAddressActivityWithMetadata?: (input: ReadEvmAddressActivityInput) => Promise<{
+    readonly items: readonly ActivityItem[]
+    readonly hasMore: boolean
+    readonly plantedRecipients?: readonly string[]
+    readonly plantedSenders?: readonly string[]
+  }>
   readonly findConfirmedReplacement: (
     input: FindEvmConfirmedReplacementInput
   ) => Promise<EvmConfirmedReplacement | null>
@@ -74,6 +77,81 @@ export interface IndexedTokenTransfer {
   readonly nonce?: string
   readonly timestamp: number
   readonly assetId: ReturnType<typeof parseAssetId>['id']
+}
+
+const MAX_PLANTED_EVM_PARTIES = 200
+const EVM_ADDRESS = /^0x[0-9a-f]{40}$/
+
+export interface PlantedEvmCounterparties {
+  readonly recipients: readonly string[]
+  readonly senders: readonly string[]
+}
+
+/**
+ * Zero-value token counterparties are kept for poisoning checks and omitted from activity rows.
+ * Recipients are outgoing dust. Senders are incoming dust from another address.
+ */
+export function collectPlantedEvmCounterparties(
+  address: string,
+  transfers: readonly IndexedTokenTransfer[]
+): PlantedEvmCounterparties {
+  const watched = address.toLowerCase()
+  const recipients: string[] = []
+  const senders: string[] = []
+  const seenRecipients = new Set<string>()
+  const seenSenders = new Set<string>()
+  for (const transfer of transfers) {
+    if (transfer.amountRaw !== '0') continue
+    const from = transfer.from.toLowerCase()
+    const to = transfer.to.toLowerCase()
+    if (
+      from === watched &&
+      to !== watched &&
+      EVM_ADDRESS.test(to) &&
+      !seenRecipients.has(to) &&
+      recipients.length < MAX_PLANTED_EVM_PARTIES
+    ) {
+      seenRecipients.add(to)
+      recipients.push(to)
+    }
+    if (
+      to === watched &&
+      from !== watched &&
+      EVM_ADDRESS.test(from) &&
+      !seenSenders.has(from) &&
+      senders.length < MAX_PLANTED_EVM_PARTIES
+    ) {
+      seenSenders.add(from)
+      senders.push(from)
+    }
+  }
+  return Object.freeze({
+    recipients: Object.freeze(recipients),
+    senders: Object.freeze(senders)
+  })
+}
+
+/** Zero-value token recipients are kept for poisoning checks and omitted from activity rows. */
+export function collectPlantedEvmRecipients(
+  address: string,
+  transfers: readonly IndexedTokenTransfer[]
+): readonly string[] {
+  return collectPlantedEvmCounterparties(address, transfers).recipients
+}
+
+export function mergePlantedEvmRecipients(
+  previous: readonly string[] | undefined,
+  fresh: readonly string[] | undefined
+): readonly string[] {
+  const merged: string[] = []
+  const seen = new Set<string>()
+  for (const address of [...(fresh ?? []), ...(previous ?? [])]) {
+    if (seen.has(address)) continue
+    seen.add(address)
+    merged.push(address)
+    if (merged.length === MAX_PLANTED_EVM_PARTIES) break
+  }
+  return Object.freeze(merged)
 }
 
 export function isZeroValueEvmTokenActivity(item: ActivityItem): boolean {

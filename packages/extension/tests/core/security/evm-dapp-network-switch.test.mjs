@@ -220,6 +220,7 @@ test.describe('EVM dApp network switch coordinator', () => {
     expect(state.approvals[0].data.action).toBe('add')
     expect(authorizationReads).toBe(0)
     expect(state.added).toHaveLength(1)
+    expect(state.added[0].network.addedBy).toBe('dapp')
     expect(state.commits).toEqual([])
     expect(state.getSettings().activeEvmChainId).toBe(
       DEFAULT_CHAIN_ENDPOINT_SETTINGS.activeEvmChainId

@@ -49,6 +49,22 @@ export type EvmFeeSelection =
 
 const GWEI_IN_WEI = 1_000_000_000n
 export const MAX_CUSTOM_PRIORITY_FEE_GWEI = 10_000n
+const PRIORITY_FEE_ELEVATED_RATIO = 10n
+const PRIORITY_FEE_ELEVATED_FLOOR_WEI = GWEI_IN_WEI
+const PRIORITY_FEE_ELEVATED_CEILING_WEI = 200n * GWEI_IN_WEI
+
+export const ELEVATED_PRIORITY_FEE_MESSAGE = 'Priority fee is unusually high.'
+
+export function isPriorityFeeElevated(chosenWei: bigint, suggestedWei: bigint): boolean {
+  if (chosenWei < 0n || suggestedWei < 0n) {
+    throw new Error('EVM fee inputs must be unsigned')
+  }
+  return (
+    chosenWei > PRIORITY_FEE_ELEVATED_CEILING_WEI ||
+    (chosenWei > suggestedWei * PRIORITY_FEE_ELEVATED_RATIO &&
+      chosenWei > PRIORITY_FEE_ELEVATED_FLOOR_WEI)
+  )
+}
 
 function parseUnsignedWei(value: unknown): bigint {
   if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(value)) {

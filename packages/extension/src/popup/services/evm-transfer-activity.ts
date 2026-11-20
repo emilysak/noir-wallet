@@ -32,11 +32,15 @@ function readRecord(value: unknown, label: string): Record<string, unknown> {
 function assertExactKeys(
   value: Record<string, unknown>,
   required: readonly string[],
-  label: string
+  label: string,
+  optional: readonly string[] = []
 ): void {
+  const keys = Object.keys(value)
   if (
-    Object.keys(value).length !== required.length ||
-    required.some(key => !Object.prototype.hasOwnProperty.call(value, key))
+    keys.length < required.length ||
+    keys.length > required.length + optional.length ||
+    required.some(key => !Object.prototype.hasOwnProperty.call(value, key)) ||
+    keys.some(key => !required.includes(key) && !optional.includes(key))
   ) {
     throw new Error(`${label} has invalid fields`)
   }
@@ -175,7 +179,11 @@ export function parseEvmTransferActivityResponse(
   if (response.result === null) return null
 
   const model = readRecord(response.result, 'Activity read model')
-  assertExactKeys(model, ['scope', 'items', 'partialItemCount'], 'Activity read model')
+  assertExactKeys(model, ['scope', 'items', 'partialItemCount'], 'Activity read model', [
+    'hasMore',
+    'plantedRecipients',
+    'plantedSenders'
+  ])
   if (
     !plainValueMatches(model.scope, expectedGraph.root.scope) ||
     !Array.isArray(model.items) ||

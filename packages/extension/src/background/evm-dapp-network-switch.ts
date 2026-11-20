@@ -98,6 +98,7 @@ export async function handleEvmDAppNetworkSwitch(
               label: metadata.chainName,
               url: metadata.rpcUrls[0]
             },
+            addedBy: 'dapp',
             ...(metadata.blockExplorerUrls[0] === undefined
               ? {}
               : {

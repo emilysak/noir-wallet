@@ -125,6 +125,44 @@ test.describe('Chain-specific signing summaries', () => {
         expectation(evmChainId, 'evm', 'transaction')
       )
     ).toThrow(/maximum fee/)
+
+    const withL1Fee = {
+      ...fields,
+      maximumFeeWei: '100050',
+      l1DataFeeWei: '50',
+      suggestedFeePerGasWei: '1',
+      priorityFeeElevated: false
+    }
+    expect(
+      parseSigningSummary(
+        envelope('evm.transaction.v1', evmChainId, 'transaction', withL1Fee, reviewed.review),
+        expectation(evmChainId, 'evm', 'transaction')
+      ).fields.maximumFeeWei
+    ).toBe('100050')
+    expect(() =>
+      parseSigningSummary(
+        envelope(
+          'evm.transaction.v1',
+          evmChainId,
+          'transaction',
+          { ...withL1Fee, priorityFeeElevated: true },
+          reviewed.review
+        ),
+        expectation(evmChainId, 'evm', 'transaction')
+      )
+    ).toThrow(/priority fee warning/)
+    expect(() =>
+      parseSigningSummary(
+        envelope(
+          'evm.transaction.v1',
+          evmChainId,
+          'transaction',
+          { ...withL1Fee, maximumFeeWei: '100000' },
+          reviewed.review
+        ),
+        expectation(evmChainId, 'evm', 'transaction')
+      )
+    ).toThrow(/maximum fee/)
   })
 
   test('preserves typed EIP-712 structure and rejects excessive nesting', () => {
@@ -303,6 +341,26 @@ test.describe('Chain-specific signing summaries', () => {
         expectation(solanaChainId, 'solana', 'transaction')
       )
     ).toThrow(/warning/)
+
+    const revertedFields = { ...fields, simulationStatus: 'failed' }
+    expect(() =>
+      parseSigningSummary(
+        envelope('solana.transaction.v1', solanaChainId, 'transaction', revertedFields, {
+          level: 'caution',
+          issues: [{ code: 'simulation-failed' }]
+        }),
+        expectation(solanaChainId, 'solana', 'transaction')
+      )
+    ).toThrow(/blocked/)
+    expect(
+      parseSigningSummary(
+        envelope('solana.transaction.v1', solanaChainId, 'transaction', revertedFields, {
+          level: 'blocked',
+          issues: [{ code: 'simulation-failed' }]
+        }),
+        expectation(solanaChainId, 'solana', 'transaction')
+      ).review.level
+    ).toBe('blocked')
   })
 
   test('binds Solana compute budget instructions to the quoted priority fee', () => {

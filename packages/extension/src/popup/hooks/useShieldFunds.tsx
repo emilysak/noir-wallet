@@ -11,10 +11,12 @@ import type { Transaction } from '@/types/wallet'
 import { safeBig } from '@/lib/big'
 import { classifyError, getResponseErrorMessage } from '@/lib/errors'
 import { isValidAddTransactionResponse } from '@/lib/transaction-record-response'
+import { assertFeeWithinCeiling } from '@/core/transactions/domain'
 import {
   getShieldableTransparentBalance,
   hasEnoughTransparentBalanceToShield,
-  MIN_SHIELDING_BALANCE_MESSAGE
+  MIN_SHIELDING_BALANCE_MESSAGE,
+  transparentShieldAmountZats
 } from '@/core/zcash/shielding'
 import { getStandardTransactionResultCopy } from '@/lib/transaction-status-copy'
 import { isSidePanelSurface } from '@/lib/extension-display-mode'
@@ -23,6 +25,26 @@ import { useSettingsStore } from '@/store/settings-store'
 import { getChainEndpointRuntimeKey } from '@/core/chains/chain-endpoint-settings'
 import { zcashWalletRuntimeClient } from '@/popup/services/zcash-wallet-runtime-client'
 import type { FeeTier } from '@/config/fee'
+
+function shieldFeeRemainsAuthorized(actualFeeZats: string, reviewedFeeZats: number): boolean {
+  try {
+    assertFeeWithinCeiling(actualFeeZats, String(reviewedFeeZats))
+    return true
+  } catch {
+    return false
+  }
+}
+
+function shieldBalanceRemainsAuthorized(currentBalance: string, reviewedBalance: string): boolean {
+  try {
+    return (
+      BigInt(transparentShieldAmountZats(currentBalance)) <=
+      BigInt(transparentShieldAmountZats(reviewedBalance))
+    )
+  } catch {
+    return false
+  }
+}
 
 const SHIELD_FAILED_COPY = getStandardTransactionResultCopy('failed', { shield: true })
 const SHIELD_SUCCESS_COPY = getStandardTransactionResultCopy('submitted', { shield: true })
@@ -110,7 +132,7 @@ export function useShieldFunds(pageId: string): UseShieldFundsResult {
             revision !== sheetRevision.current ||
             updatedEstimate.feeQuote.id !== feeQuoteId ||
             updatedEstimate.feeQuote.expiresAt <= Date.now() ||
-            updatedEstimate.feeZats !== String(feeZats) ||
+            !shieldFeeRemainsAuthorized(updatedEstimate.feeZats, feeZats) ||
             Number(updatedEstimate.marginalFeeZats) !== marginalFeeZats ||
             context !==
               JSON.stringify([
@@ -131,7 +153,7 @@ export function useShieldFunds(pageId: string): UseShieldFundsResult {
         const currentBalance = getShieldableTransparentBalance(
           useAccountDataStore.getState().getCurrentBalance()
         )
-        if (currentBalance !== sheetBalance) {
+        if (!shieldBalanceRemainsAuthorized(currentBalance, sheetBalance)) {
           setSheetBalance(currentBalance)
           setFeeRefreshRevision(value => value + 1)
           return
@@ -171,7 +193,7 @@ export function useShieldFunds(pageId: string): UseShieldFundsResult {
             kind: 'shield' as const,
             walletId: currentWalletId,
             accountId: currentAccountId,
-            amount: transparentBalance,
+            amount: sheetBalance,
             marginalFeeZats,
             feeQuoteId,
             feeTier
@@ -252,7 +274,7 @@ export function useShieldFunds(pageId: string): UseShieldFundsResult {
               txHash: '',
               status: 'pending',
               type: 'shield',
-              amount: transparentBalance,
+              amount: sheetBalance,
               to: toAddress,
               from: fromAddress,
               fromType: 'transparent',

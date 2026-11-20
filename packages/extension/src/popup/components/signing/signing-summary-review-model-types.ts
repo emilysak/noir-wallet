@@ -5,6 +5,7 @@ import type {
   SigningReviewLevel,
   SigningSummary
 } from '@/core/keyring/domain'
+import { containsHiddenCharacters, revealHiddenCharacters } from '@/lib/unicode-display'
 
 export interface SigningSummaryReviewRow {
   readonly label: string
@@ -18,6 +19,8 @@ export interface SigningSummaryReviewRow {
   readonly code?: boolean
   readonly breakAll?: boolean
   readonly tone?: 'default' | 'warning' | 'danger'
+  /** True when hidden characters in the original value were replaced for display. */
+  readonly hiddenCharacters?: boolean
 }
 
 export interface SigningSummaryReviewSection {
@@ -32,17 +35,25 @@ export interface SigningSummaryReviewIssue {
 }
 
 export interface TokenAuthorizationReview {
-  readonly protocol: 'Permit' | 'Permit2'
+  readonly protocol: 'ERC-20' | 'ERC-721' | 'Permit' | 'Permit2' | 'EIP-3009'
   readonly kind: 'allowance' | 'transfer'
+  readonly effect?: 'lockdown' | 'revoke-permit2'
   readonly owner: string
   readonly spender: string
   readonly signatureDeadline: string
+  readonly recipient?: string
+  readonly validAfter?: string
+  readonly submission?: string
+  readonly witnessReceivers?: readonly string[]
   readonly tokens: readonly {
     readonly contractAddress: string
     readonly assetId: string
     readonly symbol: string | null
+    readonly selfReportedName?: string
     readonly amount: string
     readonly unlimited: boolean
+    /** Set only when `unlimited` is the exact maximum of this amount field. */
+    readonly unlimitedUnit?: 'uint256' | 'uint160'
     readonly expiration?: string
   }[]
 }
@@ -69,11 +80,13 @@ export function reviewRow(
   value: string | number | boolean | null,
   options: Omit<SigningSummaryReviewRow, 'label' | 'value'> = {}
 ): SigningSummaryReviewRow {
+  const text =
+    value === null ? 'None' : typeof value === 'boolean' ? (value ? 'Yes' : 'No') : `${value}`
   return {
     label,
-    value:
-      value === null ? 'None' : typeof value === 'boolean' ? (value ? 'Yes' : 'No') : `${value}`,
-    ...options
+    ...options,
+    value: revealHiddenCharacters(text),
+    ...(containsHiddenCharacters(text) ? { hiddenCharacters: true } : {})
   }
 }
 
@@ -135,8 +148,7 @@ const ISSUE_COPY: Readonly<
   },
   'simulation-failed': {
     title: 'Simulation failed',
-    description:
-      'The network could not simulate this transaction successfully. It may fail or still charge a fee.'
+    description: 'This transaction reverted in simulation. Noir Wallet will not sign it.'
   },
   'unrecognized-action': {
     title: 'Unknown NEAR action',
@@ -161,7 +173,8 @@ const ISSUE_COPY: Readonly<
   },
   'unlimited-token-approval': {
     title: 'Unlimited token approval',
-    description: 'The allowance is the maximum uint256 value and does not expire automatically.'
+    description:
+      'Unlimited means the allowance equals the maximum value of its amount field: 2^256−1 for ERC-20, Permit, and TRC-20, or 2^160−1 for Permit2.'
   },
   'opaque-message': {
     title: 'Opaque signed content',
@@ -186,6 +199,11 @@ const ISSUE_PRIORITY: Readonly<Record<SigningReviewIssue['code'], number>> = Obj
   'unknown-output': 5,
   'opaque-message': 5
 })
+
+export const UNLIMITED_AMOUNT_LABEL = {
+  uint256: 'Maximum uint256 (2^256−1)',
+  uint160: 'Maximum uint160 (2^160−1)'
+} as const
 
 export function reviewIssueCopy(
   issue: SigningReviewIssue,

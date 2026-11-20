@@ -8,7 +8,12 @@ import { ZcashWorkerClient, getWorkerClient } from '../worker/client'
 import { getNetworkConfig } from '@/lib/runtime-network'
 import { safeBig } from '@/lib/big'
 import { logger } from '@/lib/logger'
-import { getShieldableTransparentBalance, getShieldInputAmountFromHistory } from './shielding'
+import {
+  assertApprovedShieldAmount,
+  getShieldableTransparentBalance,
+  getShieldInputAmountFromHistory,
+  transparentShieldAmountZats
+} from './shielding'
 import { isRetryableWalletRpcError } from './wallet-rpc-errors'
 import { mapWasmAccountAddresses, mapWasmShieldedAddresses } from './account-addresses'
 import type {
@@ -642,7 +647,8 @@ export class ZcashWalletCore {
     marginalFeeZats?: number,
     approvedAccountIndex?: number,
     transactionContext?: ZcashTransactionContext,
-    feeQuoteId?: string
+    feeQuoteId?: string,
+    approvedShieldAmountZats?: string
   ): Promise<{ txid: string; amount: string | null }> {
     if (this.watchOnly) {
       throw new Error('Watch-only wallet: use the hardware signing flow (pcztShieldCreate)')
@@ -655,6 +661,12 @@ export class ZcashWalletCore {
 
     const balance = await this.getBalance(accountIndex)
     const shieldableBalance = getShieldableTransparentBalance(balance)
+    if (approvedShieldAmountZats !== undefined) {
+      assertApprovedShieldAmount(
+        approvedShieldAmountZats,
+        transparentShieldAmountZats(shieldableBalance)
+      )
+    }
 
     if (safeBig(shieldableBalance).lte(0)) {
       throw new Error('No transparent funds available to shield')
@@ -665,7 +677,8 @@ export class ZcashWalletCore {
         accountIndex,
         ...(seedPhrase ? { seedPhrase } : {}),
         marginalFeeZats,
-        feeQuoteId
+        feeQuoteId,
+        ...(approvedShieldAmountZats === undefined ? {} : { approvedShieldAmountZats })
       },
       transactionContext
     )

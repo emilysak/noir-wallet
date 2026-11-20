@@ -26,6 +26,7 @@ export { attestNearRpcEndpoint } from './near-network-attestation'
 export type { AttestNearRpcEndpointInput } from './near-network-attestation'
 export { createNearRpcClient, NearRpcError } from './near-rpc-client'
 export type {
+  NearAccessKeyListSnapshot,
   NearAccessKeyPermission,
   NearAccessKeySnapshot,
   NearAccountSnapshot,
@@ -90,3 +91,29 @@ export {
   type NearTransactionMonitorResult
 } from './near-transaction-monitor'
 export { createConfiguredNearRpcClient } from './near-configured-rpc-client'
+export {
+  authorizeNearFullAccessKeyDeletion,
+  type AuthorizeNearFullAccessKeyDeletionInput
+} from './near-full-access-key-authorizer'
+export {
+  canonicalNearRpcUrl,
+  NearFullAccessKeyDeletionRefused,
+  NEAR_FULL_ACCESS_KEY_REMOVAL_OBSERVATION_MS,
+  observeNearFullAccessKeyRemoval,
+  pollNearFullAccessKeyRemovals,
+  selectNearCrossCheckRpcUrl,
+  selectRetainedNearFullAccessKey,
+  usableNearPublicKeys,
+  type NearFullAccessKeyDeletionGrant,
+  type NearFullAccessKeyDeletionIntent,
+  type NearFullAccessKeyRemovalObservation,
+  type NearFullAccessKeyRemovalPollResult,
+  type NearFullAccessKeyRemovalRecord,
+  type RetainedNearFullAccessKey
+} from './near-full-access-key-removal'
+export {
+  ChromeSessionNearFullAccessKeyRemovalStore,
+  parseNearFullAccessKeyDeletionIntent,
+  parseNearFullAccessKeyRemovalRecord,
+  type NearFullAccessKeyRemovalStore
+} from './near-full-access-key-removal-store'

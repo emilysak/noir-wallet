@@ -388,6 +388,8 @@ export interface RPCSchema {
       seedPhrase?: string
       marginalFeeZats?: number
       feeQuoteId?: string
+      /** Shieldable zatoshis reviewed by the user. Construction must match them. */
+      approvedShieldAmountZats?: string
     }
     response: string // txid
   }

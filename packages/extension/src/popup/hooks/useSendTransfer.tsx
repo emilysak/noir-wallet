@@ -295,6 +295,7 @@ export function useSendTransfer<R extends TransferReview, S extends TransferSubm
 
   return {
     family: config.family,
+    chainId: chain.chain.id,
     asset: {
       assetId: asset.asset.id,
       symbol: asset.metadata.symbol,

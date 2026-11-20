@@ -62,6 +62,18 @@ export {
   type TransactionTransitionCause
 } from './transaction'
 export {
+  CONSTRAINT_EXECUTION_MESSAGES,
+  assertBitcoinSelectionWithinConstraint,
+  assertFeeWithinCeiling,
+  assertWithinConstraintBinding,
+  isQuoteExecutionProtocol,
+  reviewedAmountAllows,
+  type ConstraintAmount,
+  type ConstraintExecutionBinding,
+  type ConstraintRecipient,
+  type ObservedConstraintExecution
+} from './execution-binding'
+export {
   assertNearIntentsTransferBinding,
   getTransactionProtocolIntentKind,
   parseNearIntentsTransactionBinding,

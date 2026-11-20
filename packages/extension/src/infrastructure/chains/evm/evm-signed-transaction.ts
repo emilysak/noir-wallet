@@ -9,15 +9,16 @@ import {
   type TransactionSerializableEIP1559,
   type TransactionSerializedEIP1559
 } from 'viem'
-import type { PreparedEvmTransfer } from './evm-transaction-builder'
+import type { EvmPreparedTransaction, PreparedEvmTransfer } from './evm-transaction-builder'
 
 export interface SignedEvmTransactionEnvelope {
   readonly rawTransaction: string
   readonly transactionHash: string
 }
 
-function toSerializableEip1559(prepared: PreparedEvmTransfer): TransactionSerializableEIP1559 {
-  const transaction = prepared.transaction
+function toSerializableEip1559(
+  transaction: EvmPreparedTransaction
+): TransactionSerializableEIP1559 {
   if (transaction.type !== 'eip1559') failIntegrity('transaction-type')
   const chainId = Number(transaction.chainId)
   const nonce = Number(transaction.nonce)
@@ -38,8 +39,7 @@ function toSerializableEip1559(prepared: PreparedEvmTransfer): TransactionSerial
   })
 }
 
-function toSerializableLegacy(prepared: PreparedEvmTransfer): TransactionSerializableLegacy {
-  const transaction = prepared.transaction
+function toSerializableLegacy(transaction: EvmPreparedTransaction): TransactionSerializableLegacy {
   if (transaction.type !== 'legacy') failIntegrity('transaction-type')
   const chainId = Number(transaction.chainId)
   const nonce = Number(transaction.nonce)
@@ -58,10 +58,14 @@ function toSerializableLegacy(prepared: PreparedEvmTransfer): TransactionSeriali
   })
 }
 
+export function serializeEvmUnsignedTransaction(transaction: EvmPreparedTransaction): string {
+  return transaction.type === 'legacy'
+    ? serializeTransaction(toSerializableLegacy(transaction))
+    : serializeTransaction(toSerializableEip1559(transaction))
+}
+
 export function serializePreparedEvmUnsignedTransaction(prepared: PreparedEvmTransfer): string {
-  return prepared.transaction.type === 'legacy'
-    ? serializeTransaction(toSerializableLegacy(prepared))
-    : serializeTransaction(toSerializableEip1559(prepared))
+  return serializeEvmUnsignedTransaction(prepared.transaction)
 }
 
 export async function createKeystoneSignedEvmTransaction(
@@ -78,11 +82,11 @@ export async function createKeystoneSignedEvmTransaction(
   }
   const rawTransaction =
     prepared.transaction.type === 'legacy'
-      ? serializeTransaction(toSerializableLegacy(prepared), {
+      ? serializeTransaction(toSerializableLegacy(prepared.transaction), {
           ...signature,
           v: 27n + BigInt(yParity)
         })
-      : serializeTransaction(toSerializableEip1559(prepared), signature)
+      : serializeTransaction(toSerializableEip1559(prepared.transaction), signature)
   const envelope = Object.freeze({
     rawTransaction,
     transactionHash: keccak256(rawTransaction)

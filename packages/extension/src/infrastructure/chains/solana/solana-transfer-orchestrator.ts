@@ -9,6 +9,9 @@ import type {
   SigningResult
 } from '@/core/keyring/ports'
 import {
+  assertWithinConstraintBinding,
+  isQuoteExecutionProtocol,
+  reviewedAmountAllows,
   type NearIntentsTransactionBinding,
   parseTransactionEventId,
   parseTransactionId,
@@ -163,6 +166,39 @@ function pendingSigning(pending: AwaitingApprovalSolanaTransfer): PreparedSignin
   })
 }
 
+function assertSolanaQuoteConstraint(
+  graph: TransactionGraph,
+  pending: AwaitingApprovalSolanaTransfer,
+  now: number
+): void {
+  const intent = graph.root.intent
+  const protocol = intent?.protocol
+  if (!intent?.primaryAmount || !intent.feeLimit || !intent.recipient || !protocol) {
+    throw new Error('Approved spend changed. Review the transaction again.')
+  }
+  const prepared = pending.prepared
+  if ('kind' in prepared && prepared.kind !== 'token') {
+    throw new Error('Approved spend changed. Review the transaction again.')
+  }
+  const amountRaw = 'kind' in prepared ? prepared.amountRaw : prepared.lamports
+  const assetId = 'kind' in prepared ? prepared.assetId : intent.primaryAmount.assetId
+  assertWithinConstraintBinding(
+    {
+      kind: 'constraint',
+      maxSpend: intent.primaryAmount,
+      recipients: [intent.recipient],
+      maxFee: intent.feeLimit,
+      expiresAt: Math.min(pending.expiresAt, protocol.expiresAt)
+    },
+    {
+      spend: { assetId, amountRaw },
+      recipients: [{ chainId: pending.prepared.chainId, address: pending.prepared.recipient }],
+      fee: { assetId: intent.feeLimit.assetId, amountRaw: pending.prepared.feeLamports }
+    },
+    now
+  )
+}
+
 export class SolanaTransferOrchestrator {
   private readonly repository: TransactionRepository
   private readonly pendingStore: SolanaPendingTransferStore
@@ -177,6 +213,7 @@ export class SolanaTransferOrchestrator {
     graph: TransactionGraph,
     recovered: boolean
   ) => Promise<void> | void
+  private readonly rebuiltQuoteSources = new Set<string>()
 
   constructor(options: SolanaTransferOrchestratorOptions) {
     this.repository = options.repository
@@ -352,42 +389,59 @@ export class SolanaTransferOrchestrator {
       await this.failAwaitingApproval(pending, input.signal)
       throw new Error('Pending Solana transfer integrity check failed')
     }
+    let approval = pending
     if ((await this.rpc.getBlockHeight(input.signal)) > pending.prepared.lastValidBlockHeight) {
-      await this.failAwaitingApproval(pending, input.signal)
-      throw new Error('Solana transfer blockhash expired')
+      const rebuilt = await this.rebuildExpiredQuoteSource(pending, currentGraph, input.signal)
+      if (!rebuilt) {
+        await this.failAwaitingApproval(pending, input.signal)
+        throw new Error('Solana transfer blockhash expired')
+      }
+      approval = rebuilt
+    }
+    if (isQuoteExecutionProtocol(currentGraph.root.intent?.protocol?.provider)) {
+      try {
+        assertSolanaQuoteConstraint(currentGraph, approval, this.timestamp())
+      } catch (error) {
+        await this.failAwaitingApproval(approval, input.signal)
+        throw error
+      }
+    }
+    if (approval.signingSummary.review.level === 'blocked') {
+      await this.failAwaitingApproval(approval, input.signal)
+      throw new Error('Solana transaction failed simulation and cannot be signed')
     }
 
-    let graph = this.transitionReviewGraph(pending, currentGraph, 'approved')
+    let graph = this.transitionReviewGraph(approval, currentGraph, 'approved')
     try {
-      await this.pendingStore.put(pending, graph)
+      await this.pendingStore.put(approval, graph)
     } catch {
-      await this.failAwaitingApproval(pending, input.signal)
+      await this.failAwaitingApproval(approval, input.signal)
       throw new Error('Approved Solana signing request could not be persisted')
     }
     let signed: SigningResult
     try {
       signed = await this.signer.confirm(
-        pending.scope.keyDomainId,
-        pending.signingCommandId,
+        approval.scope.keyDomainId,
+        approval.signingCommandId,
         input.signal,
         undefined,
-        pending.signingExecution,
-        pending.signingExecution?.kind === 'external' && pending.accountIndex !== undefined
+        approval.signingExecution,
+        approval.signingExecution?.kind === 'external' && approval.accountIndex !== undefined
           ? {
-              accountId: pending.scope.accountId,
+              accountId: approval.scope.accountId,
               payload: {
                 kind: 'solana-transaction',
-                chainId: parseChainId(pending.prepared.chainId).id,
-                accountIndex: pending.accountIndex,
-                transaction: pending.prepared.transactionBase64
+                chainId: parseChainId(approval.prepared.chainId).id,
+                accountIndex: approval.accountIndex,
+                transaction: approval.prepared.transactionBase64
               },
-              prepared: pendingSigning(pending)
+              prepared: pendingSigning(approval)
             }
           : undefined
       )
     } catch (error) {
       if (isUnrecoverableSigningError(error)) {
-        await this.failAwaitingApproval(pending, input.signal)
+        await this.failAwaitingApproval(approval, input.signal)
       }
       throw error
     }
@@ -396,37 +450,37 @@ export class SolanaTransferOrchestrator {
       signed.payload.encoding !== 'base64' ||
       signed.transactionId === undefined
     ) {
-      await this.failConsumedSigning(pending)
+      await this.failConsumedSigning(approval)
       throw new Error('Signed Solana transaction failed integrity validation')
     }
     let parsedSigned: ReturnType<typeof parseSignedSolanaTransaction>
     try {
       parsedSigned = parseSignedSolanaTransaction(signed.payload.value, signed.transactionId)
-      if (parsedSigned.messageBase64 !== pending.prepared.messageBase64) {
+      if (parsedSigned.messageBase64 !== approval.prepared.messageBase64) {
         throw new Error('Signed Solana message does not match the prepared message')
       }
     } catch {
-      await this.failConsumedSigning(pending)
+      await this.failConsumedSigning(approval)
       throw new Error('Signed Solana transaction failed integrity validation')
     }
     const signedPending: SignedPendingSolanaTransfer = Object.freeze({
       schemaVersion: 1,
       phase: 'signed',
-      transactionId: pending.transactionId,
-      segmentId: pending.segmentId,
-      scope: pending.scope,
+      transactionId: approval.transactionId,
+      segmentId: approval.segmentId,
+      scope: approval.scope,
       ...parsedSigned,
-      lastValidBlockHeight: pending.prepared.lastValidBlockHeight,
+      lastValidBlockHeight: approval.prepared.lastValidBlockHeight,
       signedAt: this.timestamp()
     })
     try {
-      graph = this.transitionReviewGraph(pending, graph, 'signed', {
+      graph = this.transitionReviewGraph(approval, graph, 'signed', {
         transactionHash: signedPending.transactionHash,
-        externalReference: `solana-blockhash:${pending.prepared.recentBlockhash}`
+        externalReference: `solana-blockhash:${approval.prepared.recentBlockhash}`
       })
       await this.pendingStore.put(signedPending, graph)
     } catch {
-      await this.failConsumedSigning(pending)
+      await this.failConsumedSigning(approval)
       throw new Error('Signed Solana transaction could not be persisted')
     }
     graph = await this.persistSignedGraph(signedPending, graph)
@@ -560,6 +614,84 @@ export class SolanaTransferOrchestrator {
     return pending.length
   }
 
+  private async rebuildExpiredQuoteSource(
+    pending: AwaitingApprovalSolanaTransfer,
+    graph: TransactionGraph,
+    signal?: AbortSignal
+  ): Promise<AwaitingApprovalSolanaTransfer | null> {
+    const protocol = graph.root.intent?.protocol
+    if (!isQuoteExecutionProtocol(protocol?.provider) || pending.accountIndex === undefined) {
+      return null
+    }
+    if (this.rebuiltQuoteSources.has(pending.transactionId)) return null
+    this.rebuiltQuoteSources.add(pending.transactionId)
+    const current = pending.prepared
+    if ('kind' in current && current.kind !== 'token') return null
+    const prepared =
+      'kind' in current
+        ? await prepareSolanaTokenTransfer({
+            chainId: current.chainId,
+            assetId: current.assetId,
+            sender: current.sender,
+            recipient: current.recipient,
+            mint: current.mint,
+            decimals: current.decimals,
+            amountRaw: current.amountRaw,
+            rpc: this.rpc,
+            signal
+          })
+        : await prepareSolanaNativeTransfer({
+            chainId: current.chainId,
+            sender: current.sender,
+            recipient: current.recipient,
+            lamports: current.lamports,
+            rpc: this.rpc,
+            signal
+          })
+    const rebuilt: AwaitingApprovalSolanaTransfer = Object.freeze({
+      ...pending,
+      prepared
+    })
+    assertSolanaQuoteConstraint(graph, rebuilt, this.timestamp())
+    const signing = await this.signer.prepare(
+      pending.scope.keyDomainId,
+      Object.freeze({
+        kind: 'solana-transaction' as const,
+        chainId: parseChainId(prepared.chainId).id,
+        accountIndex: pending.accountIndex,
+        transaction: prepared.transactionBase64
+      }),
+      signal
+    )
+    try {
+      await assertSolanaTransferSigningMatchesPrepared(prepared, signing)
+      if (signing.expiresAt <= this.timestamp()) {
+        throw new Error('Solana signing request expired during preparation')
+      }
+    } catch (error) {
+      await this.cancelSigning(pending.scope.keyDomainId, signing.commandId, signal).catch(() => {})
+      throw error
+    }
+    if (signing.summary.schema !== 'solana.transaction.v1') {
+      await this.cancelSigning(pending.scope.keyDomainId, signing.commandId, signal).catch(() => {})
+      throw new Error('Solana signing request expired during preparation')
+    }
+    const signingSummary = signing.summary
+    await this.cancelSigning(pending.scope.keyDomainId, pending.signingCommandId, signal).catch(
+      () => {}
+    )
+    const next: AwaitingApprovalSolanaTransfer = Object.freeze({
+      ...rebuilt,
+      signingSummary,
+      signingCommandId: signing.commandId,
+      signingExecution: signing.execution,
+      payloadFingerprint: signing.payloadFingerprint.digestHex,
+      expiresAt: Math.min(pending.expiresAt, signing.expiresAt)
+    })
+    await this.pendingStore.put(next, graph)
+    return next
+  }
+
   private async failAwaitingApproval(
     pending: AwaitingApprovalSolanaTransfer,
     signal?: AbortSignal
@@ -642,7 +774,9 @@ export class SolanaTransferOrchestrator {
         intent.primaryAmount?.assetId === primaryAssetId &&
         intent.primaryAmount.amountRaw === primaryAmountRaw &&
         intent.feeLimit?.assetId === `${pending.prepared.chainId}/slip44:501` &&
-        intent.feeLimit.amountRaw === pending.prepared.feeLamports &&
+        (isQuoteExecutionProtocol(intent.protocol?.provider)
+          ? reviewedAmountAllows(pending.prepared.feeLamports, intent.feeLimit.amountRaw)
+          : intent.feeLimit.amountRaw === pending.prepared.feeLamports) &&
         intent.sender?.chainId === pending.prepared.chainId &&
         intent.sender.address === pending.prepared.sender &&
         intent.recipient?.chainId === pending.prepared.chainId &&

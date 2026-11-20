@@ -1,6 +1,7 @@
 import Big from '@/lib/big'
 import type { ActivityItem } from '@/core/activity'
 import { getActivityAssetEffects } from '@/core/activity'
+import { isTrustedOutgoingActivity } from '@/core/security/address-poisoning'
 import { findAssetPrice, type AssetPriceReadModel } from '@/core/prices'
 import type { ActivityAssetMetadata } from './activity-presentation-catalog'
 
@@ -48,8 +49,8 @@ export function shouldWarnSmallTransfer(input: {
     history.some(
       previous =>
         previous.createdAt < item.createdAt &&
-        previous.snapshot?.direction === 'outgoing' &&
-        previous.snapshot.recipient?.address &&
+        isTrustedOutgoingActivity(previous) &&
+        previous.snapshot?.recipient?.address &&
         sameAddress(source, previous.snapshot.recipient)
     )
   )

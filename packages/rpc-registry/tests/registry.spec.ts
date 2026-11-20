@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { handleRegistryRequest } from '../src/api'
 import { getMonitorTargets, RPC_REGISTRY, ZCASH_RPC_REGISTRY } from '../src/registry'
+import { SITE_LIST } from '../src/site-list'
 import { ZERO_INDEXER_REGISTRY } from '../src/zero-indexer-registry'
 
 test('serves broadcast nodes separately from sync RPC monitoring', async () => {
@@ -85,6 +86,23 @@ test('derives monitor targets from the same registry across chain namespaces', (
     network: 'testnet',
     id: 'testnet-primary'
   })
+})
+
+test('publishes hostnames and IP addresses without path prefixes', async () => {
+  const response = handleRegistryRequest(new Request('https://rpc.zknoir.com/v1/site-list'))
+  const preflight = handleRegistryRequest(
+    new Request('https://rpc.zknoir.com/v1/site-list', { method: 'OPTIONS' })
+  )
+
+  expect(response.status).toBe(200)
+  expect(preflight.status).toBe(204)
+  await expect(response.json()).resolves.toEqual(SITE_LIST)
+  const body = await handleRegistryRequest(
+    new Request('https://rpc.zknoir.com/v1/site-list')
+  ).json()
+  expect(Object.keys(body as object).sort()).toEqual(['documents'])
+  expect(JSON.stringify(body)).not.toContain('://')
+  expect(JSON.stringify(body)).not.toContain('paths')
 })
 
 test('rejects unknown routes and supports CORS preflight', async () => {

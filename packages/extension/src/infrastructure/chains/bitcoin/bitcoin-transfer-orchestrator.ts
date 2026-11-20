@@ -11,9 +11,11 @@ import {
   type SigningResult
 } from '@/core/keyring/ports'
 import {
+  assertBitcoinSelectionWithinConstraint,
   parseTransactionEventId,
   parseTransactionId,
   parseTransactionSegmentId,
+  reviewedAmountAllows,
   type TransactionAccountScope,
   type TransactionGraph,
   type TransactionId,
@@ -115,6 +117,24 @@ export interface BitcoinTransferOrchestratorOptions {
     recovered: boolean
   ) => Promise<void> | void
   readonly onMonitoringRequired?: () => Promise<void> | void
+  readonly reselectWalletInputs?: (input: {
+    readonly chainAccount: ChainAccount
+    readonly accountIndex: BitcoinInputReservation['accountIndex']
+    readonly addressType: BitcoinInputReservation['addressType']
+    readonly transactionId: TransactionId
+    readonly recipient: string
+    readonly amountSats: string
+    readonly feeRateSatsPerVbyte: number
+    readonly reservedOutpoints: readonly BitcoinInputOutpoint[]
+    readonly hasChangeReservation: boolean
+    readonly ledgerAccount: boolean
+    readonly signal?: AbortSignal
+  }) => Promise<{
+    readonly prepared: PreparedBitcoinPsbt
+    readonly signerAddress: string
+    readonly inputReservation: BitcoinInputReservation
+    readonly changeReservation: BitcoinChangeReservation | null
+  } | null>
 }
 
 export interface PrepareBitcoinTransferInput {
@@ -160,9 +180,18 @@ export interface BitcoinExternalSignatureRequired {
   readonly expiresAt: number
 }
 
+/** The reserved inputs changed. The replacement is stored and still needs review. */
+export interface BitcoinReviewRequired {
+  readonly status: 'review-required'
+  readonly transactionId: TransactionId
+  readonly payloadFingerprint: string
+  readonly expiresAt: number
+}
+
 export type BitcoinTransferApprovalResult =
   | BitcoinTransferSubmission
   | BitcoinExternalSignatureRequired
+  | BitcoinReviewRequired
 
 export interface BitcoinExternalSigningRequest {
   readonly vendor?: 'keystone' | 'ledger'
@@ -260,6 +289,33 @@ function normalizeInputReservation(
   return reservation
 }
 
+function assertBitcoinApprovalConstraint(
+  graph: TransactionGraph,
+  pending: AwaitingApprovalBitcoinTransfer,
+  now: number
+): void {
+  const intent = graph.root.intent
+  const protocol = intent?.protocol
+  if (!intent?.primaryAmount || !intent.feeLimit || !intent.recipient) {
+    throw new Error('Approved spend changed. Review the transaction again.')
+  }
+  assertBitcoinSelectionWithinConstraint({
+    binding: {
+      kind: 'constraint',
+      maxSpend: intent.primaryAmount,
+      recipients: [intent.recipient],
+      maxFee: intent.feeLimit,
+      expiresAt: Math.min(pending.expiresAt, protocol?.expiresAt ?? pending.expiresAt)
+    },
+    chainId: pending.prepared.chainId,
+    assetId: `${pending.prepared.chainId}/slip44:0`,
+    recipient: pending.prepared.recipient,
+    amountSats: pending.prepared.amountSats,
+    feeSats: pending.prepared.feeSats,
+    now
+  })
+}
+
 export class BitcoinTransferOrchestrator {
   private readonly repository: TransactionRepository
   private readonly pendingStore: BitcoinPendingTransferStore
@@ -276,6 +332,7 @@ export class BitcoinTransferOrchestrator {
   private readonly onPendingBroadcast?: () => Promise<void> | void
   private readonly onBroadcastAccepted?: BitcoinTransferOrchestratorOptions['onBroadcastAccepted']
   private readonly onMonitoringRequired?: () => Promise<void> | void
+  private readonly reselectWalletInputs?: BitcoinTransferOrchestratorOptions['reselectWalletInputs']
 
   constructor(options: BitcoinTransferOrchestratorOptions) {
     this.repository = options.repository
@@ -290,6 +347,7 @@ export class BitcoinTransferOrchestrator {
     this.onPendingBroadcast = options.onPendingBroadcast
     this.onBroadcastAccepted = options.onBroadcastAccepted
     this.onMonitoringRequired = options.onMonitoringRequired
+    this.reselectWalletInputs = options.reselectWalletInputs
   }
 
   async prepare(input: PrepareBitcoinTransferInput): Promise<PreparedBitcoinTransferApproval> {
@@ -557,46 +615,85 @@ export class BitcoinTransferOrchestrator {
       await this.failAwaitingApproval(pending, input.signal)
       throw new Error('RHEA Swap quote expired')
     }
-    let graph = this.transitionReviewGraph(pending, currentGraph, 'approved')
+    let approval = pending
+    if (pending.signingExecution.kind !== 'external' && this.reselectWalletInputs) {
+      try {
+        const plan = await this.reselectWalletInputs({
+          chainAccount: pending.inputReservation.chainAccount,
+          accountIndex: pending.inputReservation.accountIndex,
+          addressType: pending.inputReservation.addressType,
+          transactionId: pending.transactionId,
+          recipient: pending.prepared.recipient,
+          amountSats: pending.prepared.amountSats,
+          feeRateSatsPerVbyte: pending.prepared.feeRateSatsPerVbyte,
+          reservedOutpoints: pending.inputReservation.outpoints,
+          hasChangeReservation: pending.changeReservation !== null,
+          ledgerAccount: pending.signingCommandId.startsWith('signing-command:ledger-bitcoin:'),
+          signal: input.signal
+        })
+        if (plan) {
+          approval = await this.installReselectedPlan(pending, currentGraph, plan, input.signal)
+        }
+      } catch (error) {
+        await this.failAwaitingApproval(pending, input.signal)
+        throw error
+      }
+    }
+    try {
+      assertBitcoinApprovalConstraint(currentGraph, approval, this.timestamp())
+    } catch (error) {
+      await this.failAwaitingApproval(approval, input.signal)
+      throw error
+    }
+    // A replaced input set has a new payload. Keep the pending transfer and require another review.
+    if (approval.payloadFingerprint !== input.payloadFingerprint) {
+      return Object.freeze({
+        status: 'review-required' as const,
+        transactionId: approval.transactionId,
+        payloadFingerprint: approval.payloadFingerprint,
+        expiresAt: approval.expiresAt
+      })
+    }
+    let graph = this.transitionReviewGraph(approval, currentGraph, 'approved')
 
-    if (pending.signingExecution.kind === 'external') {
+    if (approval.signingExecution.kind === 'external') {
       const externalPending: AwaitingExternalSignatureBitcoinTransfer = Object.freeze({
-        ...pending,
+        ...approval,
         phase: 'awaiting-external-signature',
-        signingExecution: pending.signingExecution
+        signingExecution: approval.signingExecution
       })
       try {
         await this.pendingStore.put(externalPending, graph)
       } catch {
-        await this.failAwaitingApproval(pending, input.signal)
+        await this.failAwaitingApproval(approval, input.signal)
         throw new Error('External Bitcoin signing request could not be persisted')
       }
       return Object.freeze({
         status: 'external-signature-required' as const,
         graph,
-        transactionId: pending.transactionId,
-        payloadFingerprint: pending.payloadFingerprint,
-        expiresAt: pending.expiresAt
+        transactionId: approval.transactionId,
+        payloadFingerprint: approval.payloadFingerprint,
+        expiresAt: approval.expiresAt
       })
     }
 
     try {
-      await this.pendingStore.put(pending, graph)
+      await this.pendingStore.put(approval, graph)
     } catch {
-      await this.failAwaitingApproval(pending, input.signal)
+      await this.failAwaitingApproval(approval, input.signal)
       throw new Error('Approved Bitcoin signing request could not be persisted')
     }
 
     let signed: SigningResult
     try {
       signed = await this.signer.confirm(
-        pending.scope.keyDomainId,
-        pending.signingCommandId,
+        approval.scope.keyDomainId,
+        approval.signingCommandId,
         input.signal
       )
     } catch (error) {
       if (isUnrecoverableSigningError(error)) {
-        await this.failAwaitingApproval(pending, input.signal)
+        await this.failAwaitingApproval(approval, input.signal)
       }
       throw error
     }
@@ -606,46 +703,46 @@ export class BitcoinTransferOrchestrator {
       if (
         signed.kind !== 'signed-payload' ||
         signed.payload.encoding !== 'base64' ||
-        signed.transactionId !== pending.prepared.unsignedTransactionId
+        signed.transactionId !== approval.prepared.unsignedTransactionId
       ) {
         throw new Error('WASM did not return the prepared signed Bitcoin PSBT')
       }
       finalized = finalizeBitcoinPsbt({
-        prepared: pending.prepared,
+        prepared: approval.prepared,
         signedPsbtBase64: signed.payload.value
       })
       if (
-        (pending.prepared.addressType === 'p2wpkh' || pending.prepared.addressType === 'p2tr') &&
+        (approval.prepared.addressType === 'p2wpkh' || approval.prepared.addressType === 'p2tr') &&
         finalized.transactionId !== signed.transactionId
       ) {
         throw new Error('Signed Bitcoin transaction ID does not match the prepared PSBT')
       }
     } catch {
-      await this.failConsumedSigning(pending)
+      await this.failConsumedSigning(approval)
       throw new Error('Signed Bitcoin transaction failed integrity validation')
     }
 
     const signedPending: SignedPendingBitcoinTransfer = Object.freeze({
       schemaVersion: 3,
       phase: 'signed',
-      transactionId: pending.transactionId,
-      segmentId: pending.segmentId,
-      scope: pending.scope,
-      requiredConfirmations: pending.requiredConfirmations,
-      changeReservation: pending.changeReservation,
-      inputReservation: pending.inputReservation,
+      transactionId: approval.transactionId,
+      segmentId: approval.segmentId,
+      scope: approval.scope,
+      requiredConfirmations: approval.requiredConfirmations,
+      changeReservation: approval.changeReservation,
+      inputReservation: approval.inputReservation,
       rawTransactionHex: finalized.rawTransactionHex,
       transactionHash: finalized.transactionId,
       signedAt: this.timestamp()
     })
     try {
-      graph = this.transitionReviewGraph(pending, graph, 'signed', {
+      graph = this.transitionReviewGraph(approval, graph, 'signed', {
         transactionHash: signedPending.transactionHash,
         requiredConfirmations: signedPending.requiredConfirmations
       })
       await this.pendingStore.put(signedPending, graph)
     } catch {
-      await this.failConsumedSigning(pending)
+      await this.failConsumedSigning(approval)
       throw new Error('Signed Bitcoin transaction could not be persisted')
     }
     graph = await this.persistSignedGraph(signedPending, graph)
@@ -837,6 +934,88 @@ export class BitcoinTransferOrchestrator {
     return Object.freeze({ status: 'broadcast', graph })
   }
 
+  private async installReselectedPlan(
+    pending: AwaitingApprovalBitcoinTransfer,
+    graph: TransactionGraph,
+    plan: {
+      readonly prepared: PreparedBitcoinPsbt
+      readonly signerAddress: string
+      readonly inputReservation: BitcoinInputReservation
+      readonly changeReservation: BitcoinChangeReservation | null
+    },
+    signal?: AbortSignal
+  ): Promise<AwaitingApprovalBitcoinTransfer> {
+    const candidate: AwaitingApprovalBitcoinTransfer = Object.freeze({
+      ...pending,
+      prepared: plan.prepared,
+      signer: plan.signerAddress,
+      inputReservation: plan.inputReservation,
+      changeReservation: plan.changeReservation
+    })
+    try {
+      assertBitcoinApprovalConstraint(graph, candidate, this.timestamp())
+      const expectedFingerprint = await computeBitcoinSigningPayloadFingerprint(plan.prepared)
+      const preparedSigning = await this.signer.prepare(
+        pending.scope.keyDomainId,
+        createBitcoinSigningPreparePayload(plan.prepared),
+        signal
+      )
+      const signing = Object.freeze({
+        ...preparedSigning,
+        summary: normalizeBitcoinSigningSummary(
+          plan.prepared,
+          preparedSigning.summary,
+          plan.signerAddress
+        )
+      })
+      if (
+        signing.summary.review.level === 'blocked' ||
+        signing.expiresAt <= this.timestamp() ||
+        signing.payloadFingerprint.digestHex !== expectedFingerprint
+      ) {
+        await this.signer
+          .cancel(pending.scope.keyDomainId, signing.commandId, signal)
+          .catch(() => {})
+        throw new Error('Bitcoin signing request cannot be approved')
+      }
+      await this.signer
+        .cancel(pending.scope.keyDomainId, pending.signingCommandId, signal)
+        .catch(() => {})
+      const next: AwaitingApprovalBitcoinTransfer = Object.freeze({
+        ...candidate,
+        signingSummary: signing.summary,
+        signingCommandId: signing.commandId,
+        signingExecution: signing.execution,
+        payloadFingerprint: signing.payloadFingerprint.digestHex,
+        expiresAt: Math.min(pending.expiresAt, signing.expiresAt)
+      })
+      await this.pendingStore.put(next, graph)
+      return next
+    } catch (error) {
+      await this.releaseInputs(plan.inputReservation).catch(() => {})
+      if (plan.changeReservation) {
+        await this.changeReservations
+          .abandon(
+            {
+              chainAccount: plan.changeReservation.chainAccount,
+              accountIndex: plan.changeReservation.accountIndex,
+              addressType: plan.changeReservation.addressType
+            },
+            plan.changeReservation.transactionId
+          )
+          .catch(abandonError => {
+            if (
+              !(abandonError instanceof Error) ||
+              abandonError.message !== 'Bitcoin change reservation is missing'
+            ) {
+              throw abandonError
+            }
+          })
+      }
+      throw error
+    }
+  }
+
   private async failAwaitingApproval(
     pending: PendingBitcoinSigningTransfer,
     signal?: AbortSignal
@@ -919,9 +1098,9 @@ export class BitcoinTransferOrchestrator {
       intent?.schemaVersion === 1 &&
       intent.direction === (pending.signer === pending.prepared.recipient ? 'self' : 'outgoing') &&
       intent.primaryAmount?.assetId === expectedAssetId &&
-      intent.primaryAmount.amountRaw === pending.prepared.amountSats &&
+      reviewedAmountAllows(pending.prepared.amountSats, intent.primaryAmount.amountRaw) &&
       intent.feeLimit?.assetId === expectedAssetId &&
-      intent.feeLimit.amountRaw === pending.prepared.feeSats &&
+      reviewedAmountAllows(pending.prepared.feeSats, intent.feeLimit.amountRaw) &&
       intent.sender?.chainId === pending.prepared.chainId &&
       intent.sender.address === pending.signer &&
       intent.recipient?.chainId === pending.prepared.chainId &&

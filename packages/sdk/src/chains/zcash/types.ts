@@ -120,9 +120,11 @@ export interface SignMessageOptions {
    * Signing mode for message signing.
    * - `'current'` (default): Signs with the main transparent address key.
    * - `'derived'`: Signs with a privacy-preserving derived key (m/44'/133'/2147483647'/0/0),
-   *   cryptographically unlinkable to the main address. Recommended for identity binding.
+   *   cryptographically unlinkable to the main address. The wallet accepts this mode only for
+   *   the official Noir application.
    * - `'legacy_index0'`: Signs with BIP-44 index 0 key via pure JS (for legacy MCA accounts)
-   *   (e.g. MCA creation) to prevent on-chain linkage.
+   *   (e.g. MCA creation) to prevent on-chain linkage. The wallet accepts this mode only for
+   *   the official Noir application.
    */
   signingMode?: SigningMode
 }

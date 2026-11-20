@@ -311,6 +311,28 @@ test('binds Bitcoin approval and activity to the exact local transaction', async
   expect(messages[1]).toEqual({ type: 'GET_BITCOIN_ACTIVITY', action: 'read' })
 })
 
+test('returns a review update when Bitcoin inputs change after confirmation', async () => {
+  const nextFingerprint = 'b'.repeat(64)
+  const client = createBitcoinWalletClient(async message => {
+    if (message.type !== 'APPROVE_BITCOIN_TRANSFER') throw new Error(message.type)
+    return {
+      result: {
+        status: 'review-required',
+        transactionId,
+        payloadFingerprint: nextFingerprint,
+        expiresAt: 5_000
+      }
+    }
+  })
+
+  await expect(client.approveTransfer(transactionId, fingerprint)).resolves.toEqual({
+    status: 'review-required',
+    transactionId,
+    payloadFingerprint: nextFingerprint,
+    expiresAt: 5_000
+  })
+})
+
 test('strictly binds Keystone handoff, PSBT retrieval and signed submission messages', async () => {
   const graph = approvedGraph()
   const signedPsbtBase64 = context().prepared.psbtBase64

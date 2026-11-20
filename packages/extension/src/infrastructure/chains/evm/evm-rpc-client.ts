@@ -60,6 +60,38 @@ export interface EvmContractRpc {
   readonly callContract: (address: string, data: string, signal?: AbortSignal) => Promise<string>
 }
 
+export interface EvmLogQuery {
+  readonly address: string
+  readonly fromBlock: string
+  readonly toBlock: string
+  readonly topics: readonly (string | readonly string[])[]
+}
+
+export interface EvmQueriedLog {
+  readonly address: string
+  readonly topics: readonly string[]
+  readonly data: string
+}
+
+export interface EvmBlockHeader {
+  readonly number: string
+  readonly timestamp: string
+}
+
+/** Wallet-only log and historical code reads. These are not added to the dApp method list. */
+export interface EvmLogRpc {
+  readonly getCodeAt: (
+    address: string,
+    blockNumber: string,
+    signal?: AbortSignal
+  ) => Promise<string>
+  readonly getBlockHeader: (
+    block: 'latest' | string,
+    signal?: AbortSignal
+  ) => Promise<EvmBlockHeader>
+  readonly getLogs: (query: EvmLogQuery, signal?: AbortSignal) => Promise<readonly EvmQueriedLog[]>
+}
+
 export interface EvmRpcCall {
   readonly from: string
   readonly to: string
@@ -111,6 +143,7 @@ export interface EvmTransactionRpc {
   readonly getMaximumPriorityFeePerGas: (signal?: AbortSignal) => Promise<string>
   readonly getGasPrice: (signal?: AbortSignal) => Promise<string>
   readonly getLatestBlockFee: (signal?: AbortSignal) => Promise<EvmLatestBlockFee>
+  readonly callContract?: (address: string, data: string, signal?: AbortSignal) => Promise<string>
 }
 
 export interface EvmTransactionReceipt {
@@ -242,6 +275,28 @@ function parseData(value: string, label: string): string {
   return value
 }
 
+function readCode(result: unknown): string {
+  if (
+    typeof result !== 'string' ||
+    !/^0x(?:[0-9a-fA-F]{2})*$/.test(result) ||
+    result.length > 2 + 128 * 1024 * 2
+  ) {
+    throw new EvmRpcError('invalid-response', 'Invalid EVM contract code response')
+  }
+  return result.toLowerCase()
+}
+
+function parseLogTopics(topics: readonly (string | readonly string[])[]): readonly unknown[] {
+  if (topics.length > 4) throw new Error('Invalid EVM log topics')
+  return topics.map(topic => {
+    if (typeof topic === 'string') return parseHash(topic, 'EVM log topic')
+    if (!Array.isArray(topic) || topic.length < 1 || topic.length > 4) {
+      throw new Error('Invalid EVM log topics')
+    }
+    return topic.map(item => parseHash(item, 'EVM log topic'))
+  })
+}
+
 function parseHash(value: unknown, label: string): string {
   if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(value)) {
     throw new EvmRpcError('invalid-response', `Invalid ${label}`)
@@ -314,7 +369,12 @@ async function readResponseText(response: Response, maximumBytes: number): Promi
 export function createEvmRpcClient(
   config: EvmRpcClientConfig,
   fetchImplementation: FetchImplementation = fetch
-): EvmBalanceRpc & EvmContractRpc & EvmTransactionRpc & EvmBroadcastRpc & EvmDAppReadRpc {
+): EvmBalanceRpc &
+  EvmContractRpc &
+  EvmTransactionRpc &
+  EvmBroadcastRpc &
+  EvmDAppReadRpc &
+  EvmLogRpc {
   const expectedChain = parseExpectedChainId(config.chainId)
   const rpcUrl = parseRpcUrl(config.rpcUrl)
   const timeoutMs = config.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
@@ -497,20 +557,72 @@ export function createEvmRpcClient(
       }
       return BigInt(result).toString()
     },
-    getCode: async (address: string, signal?: AbortSignal) => {
+    getCode: async (address: string, signal?: AbortSignal) =>
+      readCode(
+        await request('eth_getCode', [parseAddress(address, 'EVM contract'), 'latest'], signal)
+      ),
+    getCodeAt: async (address: string, blockNumber: string, signal?: AbortSignal) =>
+      readCode(
+        await request(
+          'eth_getCode',
+          [
+            parseAddress(address, 'EVM contract'),
+            toRpcQuantity(parseRawAmount(blockNumber, 'EVM block number'))
+          ],
+          signal
+        )
+      ),
+    getBlockHeader: async (block: 'latest' | string, signal?: AbortSignal) => {
+      const tag =
+        block === 'latest' ? 'latest' : toRpcQuantity(parseRawAmount(block, 'EVM block number'))
+      const result = await request('eth_getBlockByNumber', [tag, false], signal)
+      if (!isRecord(result)) {
+        throw new EvmRpcError('invalid-response', 'Invalid EVM block header')
+      }
+      return Object.freeze({
+        number: parseQuantity(result.number, 'block number').toString(),
+        timestamp: parseQuantity(result.timestamp, 'block timestamp').toString()
+      })
+    },
+    getLogs: async (query: EvmLogQuery, signal?: AbortSignal) => {
       const result = await request(
-        'eth_getCode',
-        [parseAddress(address, 'EVM contract'), 'latest'],
+        'eth_getLogs',
+        [
+          {
+            address: parseAddress(query.address, 'EVM log address'),
+            fromBlock: toRpcQuantity(parseRawAmount(query.fromBlock, 'EVM log start block')),
+            toBlock: toRpcQuantity(parseRawAmount(query.toBlock, 'EVM log end block')),
+            topics: parseLogTopics(query.topics)
+          }
+        ],
         signal
       )
-      if (
-        typeof result !== 'string' ||
-        !/^0x(?:[0-9a-fA-F]{2})*$/.test(result) ||
-        result.length > 2 + 128 * 1024 * 2
-      ) {
-        throw new EvmRpcError('invalid-response', 'Invalid EVM contract code response')
+      if (!Array.isArray(result) || result.length > 1_000) {
+        throw new EvmRpcError('invalid-response', 'Invalid EVM log response')
       }
-      return result.toLowerCase()
+      return Object.freeze(
+        result.map((value: unknown): EvmQueriedLog => {
+          if (
+            !isRecord(value) ||
+            typeof value.address !== 'string' ||
+            !/^0x[0-9a-fA-F]{40}$/.test(value.address) ||
+            !Array.isArray(value.topics) ||
+            value.topics.length > 4 ||
+            typeof value.data !== 'string' ||
+            !/^0x(?:[0-9a-fA-F]{2})*$/.test(value.data) ||
+            value.data.length > 2 + 4_096 * 2
+          ) {
+            throw new EvmRpcError('invalid-response', 'Invalid EVM log')
+          }
+          return Object.freeze({
+            address: value.address.toLowerCase(),
+            topics: Object.freeze(
+              value.topics.map((topic: unknown) => parseHash(topic, 'EVM log topic'))
+            ),
+            data: value.data.toLowerCase()
+          })
+        })
+      )
     },
     callContract: async (address: string, data: string, signal?: AbortSignal) => {
       const result = await request(

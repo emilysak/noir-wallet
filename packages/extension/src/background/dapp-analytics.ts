@@ -1,5 +1,6 @@
 import { ANALYTICS_EVENTS, PAGE_IDS, type AnalyticsEventName } from '../lib/analytics/constants'
 import type { TrackOptions } from '../lib/analytics/types'
+import { isEvmAuthorizationCalldata } from '@/infrastructure/chains/evm/evm-contract-call-classification'
 import { formatUnits } from 'viem'
 
 export type DAppAnalyticsSink = (
@@ -20,8 +21,12 @@ export function formatKnownAssetAmount(raw: string, decimals: number): string | 
   return formatUnits(BigInt(raw), decimals)
 }
 
-export function isErc20ApprovalCall(valueRaw: string, calldata: string): boolean {
-  return valueRaw === '0' && /^0x095ea7b30{24}[0-9a-f]{40}[0-9a-f]{64}$/.test(calldata)
+export function isErc20ApprovalCall(
+  valueRaw: string,
+  calldata: string,
+  contractAddress?: string
+): boolean {
+  return valueRaw === '0' && isEvmAuthorizationCalldata(calldata, contractAddress?.toLowerCase())
 }
 
 export function emitDAppEvent(

@@ -11,6 +11,7 @@ import {
   type RawWalletEngine
 } from '../../../src/infrastructure/keyring/multichain/raw-wallet-engine'
 import { MultichainWorkerRuntime } from '../../../src/infrastructure/keyring/multichain/worker-runtime'
+import { buildSolanaNativeTransfer } from '../../../src/infrastructure/chains/solana/solana-transaction-builder'
 
 const MNEMONIC =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
@@ -83,6 +84,7 @@ class FakeWalletEngine implements RawWalletEngine {
   readonly rejectedRequests: number[] = []
   readonly lockedSessions: number[] = []
   readonly peaRequests: string[] = []
+  readonly solanaMessages: Uint8Array[] = []
   lockAllCalls = 0
   freeCalls = 0
   nextSessionId = 1
@@ -256,6 +258,16 @@ class FakeWalletEngine implements RawWalletEngine {
 
   verifyBitcoinMessage(): boolean {
     return false
+  }
+
+  prepareSolanaMessage(
+    _sessionId: number,
+    _chainId: string,
+    _accountIndex: number,
+    message: Uint8Array
+  ): never {
+    this.solanaMessages.push(new Uint8Array(message))
+    throw new Error('Solana message reached the engine')
   }
 
   rejectSigningRequest(_sessionId: number, requestId: number): boolean {
@@ -563,6 +575,54 @@ test.describe('Multichain Worker runtime boundaries', () => {
       identity: { value: NEAR_ACCOUNT.address },
       derivation: { scheme: 'slip10', path: "m/44'/397'/0'" }
     })
+  })
+
+  test('rejects a Solana message that parses as a transaction before the engine', async () => {
+    const chainId = 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1'
+    const built = buildSolanaNativeTransfer({
+      chainId,
+      sender: 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk',
+      recipient: 'SysvarRent111111111111111111111111111111111',
+      recentBlockhash: 'SysvarC1ock11111111111111111111111111111111',
+      lamports: '1'
+    })
+    const engine = new FakeWalletEngine()
+    const runtime = createRuntime(engine)
+    expectSuccess(
+      await runtime.execute(command('credential.unlock', { vault: VAULT, password: 'password' }))
+    )
+
+    for (const message of [
+      Buffer.from(built.transactionBase64, 'base64'),
+      Buffer.from(built.messageBase64, 'base64')
+    ]) {
+      expectFailure(
+        await runtime.execute(
+          command('signing.prepare', {
+            kind: 'solana-message',
+            chainId,
+            accountIndex: 0,
+            message
+          })
+        ),
+        'UNSUPPORTED_PAYLOAD'
+      )
+    }
+    expect(engine.solanaMessages).toEqual([])
+
+    const ordinary = new TextEncoder().encode('hello')
+    expectFailure(
+      await runtime.execute(
+        command('signing.prepare', {
+          kind: 'solana-message',
+          chainId,
+          accountIndex: 0,
+          message: ordinary
+        })
+      ),
+      'INTERNAL_ERROR'
+    )
+    expect(engine.solanaMessages).toEqual([ordinary])
   })
 
   test('reports stable input errors instead of internal failures', async () => {

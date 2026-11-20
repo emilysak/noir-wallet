@@ -1,6 +1,6 @@
 import { parseActivityReadModel, type ActivityItem, type ActivityScope } from '@/core/activity'
 import { parseChainId } from '@/core/chains/registry'
-import { isZeroValueEvmTokenActivity } from './evm-indexed-activity'
+import { isZeroValueEvmTokenActivity, mergePlantedEvmRecipients } from './evm-indexed-activity'
 
 const DB_NAME = 'noir-wallet-evm-history-cache'
 const DB_VERSION = 2
@@ -19,6 +19,8 @@ export interface EvmHistoryCacheRecord {
   readonly historyPageCount?: number
   readonly historySyncAt?: number | null
   readonly items: readonly ActivityItem[]
+  readonly plantedRecipients?: readonly string[]
+  readonly plantedSenders?: readonly string[]
 }
 
 export interface EvmHistoryCacheRepository {
@@ -127,6 +129,24 @@ function parseItems(
   return Object.freeze(model.items.filter(item => !isZeroValueEvmTokenActivity(item)))
 }
 
+function parsePlantedRecipients(value: unknown): readonly string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length > 200) {
+    throw new Error('Invalid EVM history cache planted recipients')
+  }
+  const recipients: string[] = []
+  const seen = new Set<string>()
+  for (const entry of value) {
+    if (typeof entry !== 'string' || !/^0x[0-9a-f]{40}$/.test(entry)) {
+      throw new Error('Invalid EVM history cache planted recipient')
+    }
+    if (seen.has(entry)) continue
+    seen.add(entry)
+    recipients.push(entry)
+  }
+  return recipients.length > 0 ? Object.freeze(recipients) : undefined
+}
+
 function parseCurrentRecord(value: Record<string, unknown>): EvmHistoryCacheRecord {
   if (
     !hasExactKeys(
@@ -141,7 +161,7 @@ function parseCurrentRecord(value: Record<string, unknown>): EvmHistoryCacheReco
         'retryAfter',
         'items'
       ],
-      ['hasMore', 'historyPageCount', 'historySyncAt']
+      ['hasMore', 'historyPageCount', 'historySyncAt', 'plantedRecipients', 'plantedSenders']
     ) ||
     value.schemaVersion !== 1
   ) {
@@ -191,6 +211,8 @@ function parseCurrentRecord(value: Record<string, unknown>): EvmHistoryCacheReco
     items: [],
     partialItemCount: 0
   })
+  const plantedRecipients = parsePlantedRecipients(value.plantedRecipients)
+  const plantedSenders = parsePlantedRecipients(value.plantedSenders)
   return Object.freeze({
     schemaVersion: 1,
     chainId,
@@ -202,7 +224,9 @@ function parseCurrentRecord(value: Record<string, unknown>): EvmHistoryCacheReco
     ...(value.hasMore === undefined ? {} : { hasMore: value.hasMore }),
     ...(value.historyPageCount === undefined ? {} : { historyPageCount: value.historyPageCount }),
     ...(historySyncAt === undefined ? {} : { historySyncAt }),
-    items: parseItems(value.items, parsed.scope, chainId)
+    items: parseItems(value.items, parsed.scope, chainId),
+    ...(plantedRecipients === undefined ? {} : { plantedRecipients }),
+    ...(plantedSenders === undefined ? {} : { plantedSenders })
   })
 }
 
@@ -390,12 +414,22 @@ export function mergeEvmHistoryCacheRecords(
     current.successfulSyncAt ?? -1,
     incoming.successfulSyncAt ?? -1
   )
+  const plantedRecipients = mergePlantedEvmRecipients(
+    current.plantedRecipients,
+    incoming.plantedRecipients
+  )
+  const plantedSenders = mergePlantedEvmRecipients(current.plantedSenders, incoming.plantedSenders)
+  const withoutPlanted = { ...newest }
+  delete withoutPlanted.plantedRecipients
+  delete withoutPlanted.plantedSenders
   return parseCurrentRecord({
-    ...newest,
+    ...withoutPlanted,
     successfulSyncAt: latestSuccessfulSyncAt < 0 ? null : latestSuccessfulSyncAt,
     hasMore: pagination.hasMore,
     historyPageCount: pagination.historyPageCount,
     historySyncAt: pagination.historySyncAt ?? pagination.successfulSyncAt,
+    ...(plantedRecipients.length > 0 ? { plantedRecipients } : {}),
+    ...(plantedSenders.length > 0 ? { plantedSenders } : {}),
     items: [...byId.values()]
       .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
       .slice(0, MAX_ITEMS)

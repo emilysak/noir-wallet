@@ -126,6 +126,13 @@ export function createBackgroundEvmTransferController(
     ),
     readTokenAllowance: (token, owner, spender) =>
       readEvmTokenAllowance(allowanceRpc, token, owner, spender),
+    probeTokenCall: call =>
+      allowanceRpc.simulateCall({
+        from: call.from,
+        to: call.to,
+        valueRaw: call.valueRaw,
+        data: call.data
+      }),
     readTokenBalance: (token, owner) => allowanceRpc.getErc20Balance(token, owner),
     loadActiveContext: async () =>
       requireSelectedTransferNetwork(

@@ -1,6 +1,5 @@
 import { Icon } from '@iconify/react'
 import type { ReactNode } from 'react'
-import { formatSortAddress } from '@/lib/format'
 import { formatTokenQuantity } from '@/lib/number-format'
 import { formatSendFiatValue } from './send-input-model'
 import { cn } from '@/lib/utils'
@@ -299,6 +298,9 @@ export function SendRecipientAddress({
   readonly address: string
   readonly name?: string
 }) {
+  const prefix = address.length < 16 ? '' : address.slice(0, 6)
+  const middle = address.length < 16 ? address : address.slice(6, -6)
+  const suffix = address.length < 16 ? '' : address.slice(-6)
   return (
     <span className="block min-w-0 text-right">
       {name && (
@@ -306,8 +308,10 @@ export function SendRecipientAddress({
           {name}
         </span>
       )}
-      <span className="block truncate font-mono text-xs text-muted" title={address}>
-        {formatSortAddress(address)}
+      <span className="block break-all font-mono text-xs font-normal leading-4" title={address}>
+        {prefix && <span className="text-muted">{prefix}</span>}
+        <span className="font-semibold text-foreground">{middle}</span>
+        {suffix && <span className="text-muted">{suffix}</span>}
       </span>
     </span>
   )

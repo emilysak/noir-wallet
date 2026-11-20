@@ -38,6 +38,11 @@ import {
   getOnChainStatusCopy,
   getTransactionStatusCopy
 } from '@/lib/transaction-status-copy'
+import {
+  containsHiddenCharacters,
+  MEMO_HIDDEN_CHARACTER_WARNING,
+  revealHiddenCharacters
+} from '@/lib/unicode-display'
 
 interface TransactionDetailContentProps {
   transactionId?: string
@@ -52,12 +57,18 @@ const isZcashAddress = (addr: string) => {
 }
 
 function MemoSection({ memo }: { memo: string }) {
+  const revealed = revealHiddenCharacters(memo)
   return (
     <div className="space-y-2 pt-1">
       <span className="text-sm text-muted">Memo</span>
+      {containsHiddenCharacters(memo) ? (
+        <p role="status" className="text-xs leading-5 text-warning">
+          {MEMO_HIDDEN_CHARACTER_WARNING}
+        </p>
+      ) : null}
       <div className="max-h-40 overflow-y-auto rounded-lg border border-border/50 bg-card/30 px-3 py-2.5">
-        <p className="whitespace-pre-wrap wrap-break-word font-mono text-xs leading-5 text-foreground/80 select-text">
-          {memo}
+        <p className="whitespace-pre-wrap wrap-break-word font-mono text-xs leading-5 text-foreground/80 select-text [unicode-bidi:isolate]">
+          {revealed}
         </p>
       </div>
     </div>

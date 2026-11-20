@@ -19,6 +19,7 @@ import {
   buildBitcoinPsbt,
   ChromeSessionBitcoinPendingTransferStore,
   computeBitcoinSigningPayloadFingerprint,
+  createBitcoinSigningSummary,
   selectBitcoinCoins
 } from '../../../../src/infrastructure/chains/bitcoin/index.ts'
 import { InMemoryTransactionRepository } from '../../../../src/infrastructure/persistence/repositories/index.ts'
@@ -238,35 +239,45 @@ function sessionStore() {
 }
 
 function signer(context, calls, options = {}) {
-  const commandId = parseSigningCommandId('signing-command:bitcoin:orchestrator')
+  let activePrepared = context.prepared
   return {
     prepare: async (keyDomainId, payload) => {
       calls.push(['prepare', keyDomainId, payload])
+      const usingReplacement =
+        options.replacementPrepared && payload.psbt === options.replacementPrepared.psbtBase64
+      activePrepared = usingReplacement ? options.replacementPrepared : context.prepared
+      const commandId = parseSigningCommandId(
+        usingReplacement
+          ? 'signing-command:bitcoin:reselected'
+          : 'signing-command:bitcoin:orchestrator'
+      )
       return {
         commandId,
         chainId,
         operation: 'transaction',
-        summary: options.invalidSummary
-          ? {
-              ...context.summary,
-              fields: { ...context.summary.fields, feeSats: '1' }
-            }
-          : options.wasmSelfChangeClassification
+        summary: usingReplacement
+          ? createBitcoinSigningSummary(activePrepared, context.sender.address)
+          : options.invalidSummary
             ? {
                 ...context.summary,
-                fields: {
-                  ...context.summary.fields,
-                  outputs: context.summary.fields.outputs.map(output =>
-                    output.classification === 'change'
-                      ? { ...output, classification: 'recipient' }
-                      : output
-                  )
-                }
+                fields: { ...context.summary.fields, feeSats: '1' }
               }
-            : context.summary,
+            : options.wasmSelfChangeClassification
+              ? {
+                  ...context.summary,
+                  fields: {
+                    ...context.summary.fields,
+                    outputs: context.summary.fields.outputs.map(output =>
+                      output.classification === 'change'
+                        ? { ...output, classification: 'recipient' }
+                        : output
+                    )
+                  }
+                }
+              : context.summary,
         payloadFingerprint: {
           algorithm: 'sha256',
-          digestHex: await computeBitcoinSigningPayloadFingerprint(context.prepared)
+          digestHex: await computeBitcoinSigningPayloadFingerprint(activePrepared)
         },
         execution: { kind: 'internal' },
         expiresAt: 5_000
@@ -274,7 +285,7 @@ function signer(context, calls, options = {}) {
     },
     confirm: async (keyDomainId, requestedCommandId) => {
       calls.push(['confirm', keyDomainId, requestedCommandId])
-      const psbt = Psbt.fromBase64(context.prepared.psbtBase64)
+      const psbt = Psbt.fromBase64(activePrepared.psbtBase64)
       if (!options.unsigned) {
         psbt.signInput(0, {
           publicKey: context.sender.publicKey,
@@ -284,7 +295,7 @@ function signer(context, calls, options = {}) {
       return {
         kind: 'signed-payload',
         payload: { encoding: 'base64', value: psbt.toBase64() },
-        transactionId: context.prepared.unsignedTransactionId
+        transactionId: activePrepared.unsignedTransactionId
       }
     },
     cancel: async (keyDomainId, requestedCommandId) => {
@@ -294,8 +305,57 @@ function signer(context, calls, options = {}) {
   }
 }
 
+function replacementPlan(context) {
+  const addressType = context.prepared.addressType
+  const fundingTransactionId = 'b'.repeat(64)
+  const selection = selectBitcoinCoins({
+    chainId,
+    accountIndex: 0,
+    addressType,
+    recipient: context.prepared.recipient,
+    amount: { mode: 'exact', valueSats: context.prepared.amountSats },
+    feeRateSatsPerVbyte: context.prepared.feeRateSatsPerVbyte,
+    utxos: [
+      {
+        chainId,
+        addressType,
+        accountIndex: 0,
+        change: false,
+        addressIndex: 0,
+        address: context.sender.address,
+        derivationPath: context.sender.derived.derivationPath,
+        publicKey: context.sender.derived.publicKey,
+        transactionId: fundingTransactionId,
+        outputIndex: 0,
+        valueSats: '100000',
+        blockHeight: 899_999
+      }
+    ]
+  })
+  const prepared = buildBitcoinPsbt({
+    selection,
+    masterFingerprint: '0x01020304',
+    lockTime: 900_000,
+    change: {
+      address: context.changeReservation?.address ?? context.sender.derived,
+      outputPosition: 'first'
+    }
+  })
+  return {
+    prepared,
+    signerAddress: context.sender.address,
+    inputReservation: {
+      ...context.inputReservation,
+      outpoints: [{ transactionId: fundingTransactionId, outputIndex: 0 }]
+    },
+    changeReservation: context.changeReservation
+  }
+}
+
 function harness(options = {}) {
   const context = transferContext(options.addressType, options.selfChange)
+  const replacement = options.replaceInputs ? replacementPlan(context) : null
+  let reselectCount = 0
   const repository = new InMemoryTransactionRepository()
   const session = sessionStore()
   const pendingStore = new ChromeSessionBitcoinPendingTransferStore(session.area)
@@ -308,7 +368,23 @@ function harness(options = {}) {
   const orchestrator = new BitcoinTransferOrchestrator({
     repository,
     pendingStore,
-    signer: signer(context, signingCalls, options),
+    signer: signer(context, signingCalls, {
+      ...options,
+      replacementPrepared: replacement?.prepared
+    }),
+    reselectWalletInputs: options.reselectSamePayload
+      ? async () => ({
+          prepared: context.prepared,
+          signerAddress: context.sender.address,
+          inputReservation: context.inputReservation,
+          changeReservation: context.changeReservation
+        })
+      : replacement
+        ? async () => {
+            reselectCount += 1
+            return reselectCount === 1 ? replacement : null
+          }
+        : undefined,
     rpc: {
       broadcastRawTransaction: async rawTransactionHex => {
         if (options.broadcastThrows) throw new Error('network unavailable')
@@ -816,6 +892,50 @@ test('expires an external signing handoff and releases its reservations before t
   expect(testHarness.reservationCalls.map(call => call[0])).toEqual(['abandon'])
   expect(testHarness.inputReservationCalls.map(call => call[0])).toEqual(['release'])
   await expect(testHarness.pendingStore.get(transactionId)).resolves.toBeNull()
+})
+
+test('requires another review when reserved inputs are replaced', async () => {
+  const testHarness = harness({ replaceInputs: true })
+  const approval = await prepare(testHarness)
+  const first = await testHarness.orchestrator.approve({
+    scope,
+    transactionId,
+    payloadFingerprint: approval.signing.payloadFingerprint.digestHex
+  })
+
+  expect(first).toMatchObject({
+    status: 'review-required',
+    transactionId
+  })
+  expect(first.payloadFingerprint).not.toBe(approval.signing.payloadFingerprint.digestHex)
+  expect(testHarness.signingCalls.filter(call => call[0] === 'confirm')).toEqual([])
+  await expect(testHarness.pendingStore.get(transactionId)).resolves.toMatchObject({
+    phase: 'awaiting-approval',
+    payloadFingerprint: first.payloadFingerprint
+  })
+  await expect(testHarness.pendingStore.getReviewGraph(transactionId)).resolves.toMatchObject({
+    root: { status: 'prepared' }
+  })
+
+  const submission = await testHarness.orchestrator.approve({
+    scope,
+    transactionId,
+    payloadFingerprint: first.payloadFingerprint
+  })
+  expect(submission).toMatchObject({ status: 'broadcast' })
+  expect(testHarness.signingCalls.filter(call => call[0] === 'confirm')).toHaveLength(1)
+})
+
+test('signs when reselection keeps the reviewed payload', async () => {
+  const testHarness = harness({ reselectSamePayload: true })
+  const approval = await prepare(testHarness)
+  const submission = await testHarness.orchestrator.approve({
+    scope,
+    transactionId,
+    payloadFingerprint: approval.signing.payloadFingerprint.digestHex
+  })
+  expect(submission).toMatchObject({ status: 'broadcast' })
+  expect(testHarness.signingCalls.filter(call => call[0] === 'confirm')).toHaveLength(1)
 })
 
 test('does not cancel a signed pending broadcast during an Account switch', async () => {

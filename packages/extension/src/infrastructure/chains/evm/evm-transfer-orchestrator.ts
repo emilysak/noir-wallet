@@ -12,11 +12,14 @@ import {
   type SigningResult
 } from '@/core/keyring/ports'
 import {
+  assertWithinConstraintBinding,
   hasDestinationSettlementEvidence,
+  isQuoteExecutionProtocol,
   parseTransactionEventId,
   parseTransactionGraph,
   parseTransactionId,
   parseTransactionSegmentId,
+  reviewedAmountAllows,
   type TransactionAccountScope,
   type TransactionGraph,
   type TransactionId,
@@ -39,6 +42,8 @@ import {
   assertEvmSigningSummaryMatchesPrepared,
   assertEvmReplacementNonceAvailable,
   assertEvmTransferFresh,
+  evmSimulationPreviewExpiresAt,
+  simulatePreparedEvmTransaction,
   buildEvmCancelTransaction,
   buildEvmContractCall,
   buildEvmNonceRecoveryTransaction,
@@ -47,6 +52,7 @@ import {
   computeEvmSigningPayloadFingerprint,
   createEvmSigningPreparePayload,
   createEvmSigningSummary,
+  evmPreparedMaximumFeeWei,
   EvmTransactionError,
   estimateEvmContractCallFee,
   estimateEvmTransferFee,
@@ -242,6 +248,68 @@ function isUnrecoverableSigningError(error: unknown): boolean {
     (error.code === 'SIGNING_COMMAND_EXPIRED' ||
       error.code === 'SIGNING_COMMAND_NOT_FOUND' ||
       error.code === 'SIGNING_COMMAND_CANCELLED')
+  )
+}
+
+function quoteSpendSnapshot(
+  graph: TransactionGraph,
+  prepared: PendingEvmSigningTransfer['prepared']
+): { readonly assetId: string; readonly amountRaw: string } | undefined {
+  if (prepared.kind === 'native-transfer' || prepared.kind === 'erc20-transfer') return undefined
+  const amount = graph.root.intent?.primaryAmount
+  if (!amount || !isQuoteExecutionProtocol(graph.root.intent?.protocol?.provider)) return undefined
+  if (amount.assetId === prepared.assetId) return undefined
+  return Object.freeze({ assetId: amount.assetId, amountRaw: amount.amountRaw })
+}
+
+function observedQuoteSpend(
+  pending: PendingEvmSigningTransfer,
+  approvedAssetId: string
+): { readonly assetId: string; readonly amountRaw: string } {
+  const prepared = pending.prepared
+  if (prepared.kind === 'native-transfer' || prepared.kind === 'erc20-transfer') {
+    return { assetId: prepared.assetId, amountRaw: prepared.amountRaw }
+  }
+  if (approvedAssetId === prepared.assetId) {
+    return { assetId: prepared.assetId, amountRaw: prepared.transaction.value }
+  }
+  const classified = classifyEvmContractCall(prepared)
+  const tokenAssetId = `${prepared.chainId}/erc20:${prepared.recipient.toLowerCase()}`
+  if (classified?.amountRaw !== undefined && approvedAssetId.toLowerCase() === tokenAssetId) {
+    return { assetId: approvedAssetId, amountRaw: classified.amountRaw }
+  }
+  if (pending.quotedSpend?.assetId === approvedAssetId) return pending.quotedSpend
+  throw new Error('Approved spend changed. Review the transaction again.')
+}
+
+function assertQuoteSourceConstraint(
+  graph: TransactionGraph,
+  pending: PendingEvmSigningTransfer,
+  now: number
+): void {
+  const intent = graph.root.intent
+  const protocol = intent?.protocol
+  if (!intent?.primaryAmount || !intent.feeLimit || !intent.recipient || !protocol) {
+    throw new Error('Approved spend changed. Review the transaction again.')
+  }
+  const spend = observedQuoteSpend(pending, intent.primaryAmount.assetId)
+  assertWithinConstraintBinding(
+    {
+      kind: 'constraint',
+      maxSpend: intent.primaryAmount,
+      recipients: [intent.recipient],
+      maxFee: intent.feeLimit,
+      expiresAt: Math.min(pending.expiresAt, protocol.expiresAt)
+    },
+    {
+      spend,
+      recipients: [{ chainId: pending.prepared.chainId, address: pending.prepared.recipient }],
+      fee: {
+        assetId: intent.feeLimit.assetId,
+        amountRaw: evmPreparedMaximumFeeWei(pending.prepared)
+      }
+    },
+    now
   )
 }
 
@@ -777,13 +845,27 @@ export class EvmTransferOrchestrator {
       })
     } else if (input.speedUpOf) {
       const originalIntent = input.speedUpOf.root.intent!
-      const maximumFee =
-        BigInt(prepared.transaction.gasLimit) *
-        BigInt(
-          prepared.transaction.type === 'legacy'
-            ? prepared.transaction.gasPrice
-            : prepared.transaction.maxFeePerGas
-        )
+      const maximumFee = evmPreparedMaximumFeeWei(prepared)
+      const previousEvm = originalIntent.evm
+      const retainedEvm =
+        previousEvm === undefined
+          ? undefined
+          : (() => {
+              const { l1DataFeeWei: _previousL1Fee, ...evm } = previousEvm
+              return {
+                ...evm,
+                maxFeePerGasWei:
+                  prepared.transaction.type === 'legacy'
+                    ? prepared.transaction.gasPrice
+                    : prepared.transaction.maxFeePerGas,
+                maxPriorityFeePerGasWei:
+                  prepared.transaction.type === 'legacy'
+                    ? '0'
+                    : prepared.transaction.maxPriorityFeePerGas,
+                ...(prepared.l1DataFeeWei === '0' ? {} : { l1DataFeeWei: prepared.l1DataFeeWei }),
+                unsignedTransaction: prepared.transaction
+              }
+            })()
       graph = parseTransactionGraph({
         ...graph,
         root: {
@@ -792,20 +874,9 @@ export class EvmTransferOrchestrator {
           intent: {
             ...originalIntent,
             feeLimit: originalIntent.feeLimit
-              ? { ...originalIntent.feeLimit, amountRaw: maximumFee.toString() }
+              ? { ...originalIntent.feeLimit, amountRaw: maximumFee }
               : graph.root.intent?.feeLimit,
-            evm: {
-              ...originalIntent.evm,
-              maxFeePerGasWei:
-                prepared.transaction.type === 'legacy'
-                  ? prepared.transaction.gasPrice
-                  : prepared.transaction.maxFeePerGas,
-              maxPriorityFeePerGasWei:
-                prepared.transaction.type === 'legacy'
-                  ? '0'
-                  : prepared.transaction.maxPriorityFeePerGas,
-              unsignedTransaction: prepared.transaction
-            }
+            ...(retainedEvm === undefined ? {} : { evm: retainedEvm })
           },
           relation: {
             kind: 'replacement-of',
@@ -814,6 +885,7 @@ export class EvmTransferOrchestrator {
         }
       })
     }
+    const quotedSpend = quoteSpendSnapshot(graph, prepared)
     const pending: AwaitingApprovalEvmTransfer = Object.freeze({
       schemaVersion: 2,
       phase: 'awaiting-approval',
@@ -826,7 +898,8 @@ export class EvmTransferOrchestrator {
       signingExecution: signing.execution,
       externalSigner,
       payloadFingerprint: signing.payloadFingerprint.digestHex,
-      expiresAt: signing.expiresAt
+      expiresAt: signing.expiresAt,
+      ...(quotedSpend === undefined ? {} : { quotedSpend })
     })
 
     try {
@@ -1153,6 +1226,12 @@ export class EvmTransferOrchestrator {
       await this.failAwaitingApproval(pending, input.signal)
       throw new Error('EVM signing request expired')
     }
+    if (
+      this.now() >= evmSimulationPreviewExpiresAt(pending.prepared.createdAt, pending.expiresAt)
+    ) {
+      await this.failAwaitingApproval(pending, input.signal)
+      throw new Error('EVM transaction preview expired')
+    }
 
     const currentGraph = await this.requireReviewGraph(pending)
     if (!(await this.pendingIntegrityMatchesGraph(pending, currentGraph))) {
@@ -1163,6 +1242,22 @@ export class EvmTransferOrchestrator {
     if (rheaBinding?.provider === 'rhea-cross-chain-dex' && rheaBinding.expiresAt <= this.now()) {
       await this.failAwaitingApproval(pending, input.signal)
       throw new Error('RHEA Swap quote expired')
+    }
+    if (isQuoteExecutionProtocol(rheaBinding?.provider)) {
+      try {
+        assertQuoteSourceConstraint(currentGraph, pending, this.now())
+      } catch (error) {
+        await this.failAwaitingApproval(pending, input.signal)
+        throw error
+      }
+    }
+    try {
+      // The preview the user confirmed stays valid for about 30 seconds.
+      // Run the same call again before a software signature or hardware handoff.
+      await simulatePreparedEvmTransaction(pending.prepared, this.rpc, input.signal)
+    } catch (error) {
+      await this.failAwaitingApproval(pending, input.signal)
+      throw error
     }
 
     let graph = this.transitionReviewGraph(pending, currentGraph, 'approved')
@@ -1757,11 +1852,8 @@ export class EvmTransferOrchestrator {
         intent.sender.address.toLowerCase() === pending.prepared.from.toLowerCase() &&
         evidence !== undefined &&
         JSON.stringify(evidence) === JSON.stringify(transaction) &&
-        intent.feeLimit?.amountRaw ===
-          (
-            BigInt(transaction.gasLimit) *
-            BigInt(transaction.type === 'legacy' ? transaction.gasPrice : transaction.maxFeePerGas)
-          ).toString() &&
+        (intent?.evm?.l1DataFeeWei ?? '0') === pending.prepared.l1DataFeeWei &&
+        intent.feeLimit?.amountRaw === evmPreparedMaximumFeeWei(pending.prepared) &&
         graph.segments.length === 1 &&
         segment?.role === 'origin' &&
         segment.target.kind === 'onchain' &&
@@ -1772,14 +1864,7 @@ export class EvmTransferOrchestrator {
     const rheaBinding =
       intent?.protocol?.provider === 'rhea-cross-chain-dex' ? intent.protocol : undefined
     const segment = graph.segments.find(candidate => candidate.id === pending.segmentId)
-    const maximumFee = (
-      BigInt(pending.prepared.transaction.gasLimit) *
-      BigInt(
-        pending.prepared.transaction.type === 'legacy'
-          ? pending.prepared.transaction.gasPrice
-          : pending.prepared.transaction.maxFeePerGas
-      )
-    ).toString()
+    const maximumFee = evmPreparedMaximumFeeWei(pending.prepared)
     const contractCall = classifyEvmContractCall(pending.prepared)
     const isContractCall = contractCall !== null
     const isCancel =
@@ -1820,7 +1905,10 @@ export class EvmTransferOrchestrator {
               : 'outgoing') &&
       primaryAmountMatches &&
       protocolMatchesPrepared &&
-      intent.feeLimit?.amountRaw === maximumFee &&
+      (intent?.evm?.l1DataFeeWei ?? '0') === pending.prepared.l1DataFeeWei &&
+      (isQuoteExecutionProtocol(intent?.protocol?.provider)
+        ? reviewedAmountAllows(maximumFee, intent?.feeLimit?.amountRaw)
+        : intent.feeLimit?.amountRaw === maximumFee) &&
       intent.sender?.chainId === pending.prepared.chainId &&
       intent.sender.address === pending.prepared.from &&
       intent.recipient?.chainId === pending.prepared.chainId &&

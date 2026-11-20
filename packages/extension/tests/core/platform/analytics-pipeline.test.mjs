@@ -51,7 +51,8 @@ test('V2 pages and chain families resolve to bounded analytics values', () => {
     '/account-networks',
     '/onboarding/import-accounts',
     '/default-evm-wallet',
-    '/evm-wallet-choice'
+    '/evm-wallet-choice',
+    '/site-intercept'
   ]
   for (const route of routes) {
     assert.notEqual(resolvePageId(route), PAGE_IDS.BACKGROUND, route)

@@ -6,6 +6,11 @@ import { parseTransactionId } from '@/core/transactions/domain'
 import { loadTransactions } from '@/lib/indexed-db'
 import { getTransactionRecoveryAction } from '@/lib/transaction-replacement'
 import { cn } from '@/lib/utils'
+import {
+  containsHiddenCharacters,
+  MEMO_HIDDEN_CHARACTER_WARNING,
+  revealHiddenCharacters
+} from '@/lib/unicode-display'
 import { getOwnExtensionSenderContext } from '@/lib/runtime-message-security'
 import { getTransactionStatusToneClassName } from '@/lib/transaction-status-presentation'
 import type { Network, Transaction } from '@/types'
@@ -716,9 +721,14 @@ export function MultichainActivityDetail({
       {visibleItem.source === 'zcash-v1' && scopedZcashRecord?.memo && (
         <div className="mb-6 space-y-2">
           <span className="text-sm text-muted">Memo</span>
+          {containsHiddenCharacters(scopedZcashRecord.memo) ? (
+            <p role="status" className="text-xs leading-5 text-warning">
+              {MEMO_HIDDEN_CHARACTER_WARNING}
+            </p>
+          ) : null}
           <div className="max-h-40 overflow-y-auto rounded-md border border-border/50 bg-card/30 px-3 py-2.5">
-            <p className="whitespace-pre-wrap wrap-break-word font-mono text-xs leading-5 text-foreground/80 select-text">
-              {scopedZcashRecord.memo}
+            <p className="whitespace-pre-wrap wrap-break-word font-mono text-xs leading-5 text-foreground/80 select-text [unicode-bidi:isolate]">
+              {revealHiddenCharacters(scopedZcashRecord.memo)}
             </p>
           </div>
         </div>

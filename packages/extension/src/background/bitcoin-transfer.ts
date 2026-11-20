@@ -152,6 +152,7 @@ function createBackgroundBitcoinRuntime(customRpcUrl?: string): BackgroundBitcoi
     assets,
     changeReservations,
     inputReservations,
+    reselectWalletInputs: input => preparation.reselectIfInputsUnavailable(input),
     onPendingBroadcast: scheduleMonitor,
     onBroadcastAccepted: async (input, recovered) => {
       if (recovered || input.graph.root.intent?.protocol?.provider === 'rhea-cross-chain-dex')

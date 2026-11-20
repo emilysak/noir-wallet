@@ -38,6 +38,7 @@ import { credentialSession } from './credential-session'
 import { nearLedgerSigningBridge } from './ledger-signing-bridge'
 import { encodeNearDAppFunctionArgs, parseNearDAppTransactionBatch } from './near-dapp-codecs'
 import { loadActiveNearTransferContext, type ActiveNearTransferContext } from './near-transfer'
+import { nearFullAccessKeyDeletionClientOptions } from './near-full-access-key-deletion'
 import { NEAR_TRANSACTION_MONITOR_ALARM } from './near-transaction-monitor'
 import { RHEA_SWAP_TRANSACTION_MONITOR_ALARM } from './rhea-swap-transaction-monitor'
 
@@ -714,7 +715,11 @@ export function createBackgroundRheaSwapNearCoordinator(
   const rpc = createConfiguredNearRpcClient({ chainId: network.chainId, rpcUrl: network.rpcUrl })
   return new RheaSwapNearCoordinator({
     service,
-    signer: new NearSigner({ credentials: credentialSession, ledger: nearLedgerSigningBridge }),
+    signer: new NearSigner({
+      credentials: credentialSession,
+      ledger: nearLedgerSigningBridge,
+      ...nearFullAccessKeyDeletionClientOptions(storage, rpc)
+    }),
     rpc,
     pending: new ChromeSessionRheaSwapNearStore(),
     repository: new IndexedDbTransactionRepository(),

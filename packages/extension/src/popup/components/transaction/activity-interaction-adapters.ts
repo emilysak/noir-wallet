@@ -115,6 +115,23 @@ export function getActivityApprovalDetails(
       : undefined
   return {
     ...(token ? { tokenSymbol: token.metadata.symbol } : {}),
-    ...(item.snapshot?.evm?.methodSelector === '0x095ea7b3' ? { methodLabel: 'Approve' } : {})
+    ...(() => {
+      const selector = item.snapshot?.evm?.methodSelector?.toLowerCase()
+      const methodLabel =
+        selector === '0x095ea7b3'
+          ? 'Approve'
+          : selector === '0x39509351'
+            ? 'Increase allowance'
+            : selector === '0xa457c2d7'
+              ? 'Decrease allowance'
+              : selector === '0xa22cb465'
+                ? 'Set approval for all'
+                : selector === '0x87517c45'
+                  ? 'Permit2 approve'
+                  : selector === '0xcc53287f'
+                    ? 'Permit2 lockdown'
+                    : undefined
+      return methodLabel === undefined ? {} : { methodLabel }
+    })()
   }
 }

@@ -430,6 +430,36 @@ test.describe('Popup EVM wallet client', () => {
     ).rejects.toMatchObject({ code: 'invalid-response' })
   })
 
+  test('asks the background to choose an ERC-20 revoke call for the selected owner', async () => {
+    const messages = []
+    const data = `0x095ea7b3${'0'.repeat(24)}${recipient.slice(2)}${'0'.repeat(64)}`
+    const client = createEvmWalletClient(async message => {
+      messages.push(message)
+      return { result: { method: 'approve', data } }
+    })
+    await expect(
+      client.selectErc20Revoke(chainId, customContract, recipient, from)
+    ).resolves.toEqual({ method: 'approve', data })
+    expect(messages).toEqual([
+      {
+        type: 'SELECT_EVM_ERC20_REVOKE',
+        chainId,
+        token: customContract,
+        spender: recipient,
+        expectedOwner: from
+      }
+    ])
+    await expect(
+      client.selectErc20Revoke(chainId, 'invalid', recipient, from)
+    ).rejects.toMatchObject({ code: 'invalid-request' })
+    const malformed = createEvmWalletClient(async () => ({
+      result: { method: 'approve', data: '0x095ea7b3' }
+    }))
+    await expect(
+      malformed.selectErc20Revoke(chainId, customContract, recipient, from)
+    ).rejects.toMatchObject({ code: 'invalid-response' })
+  })
+
   test('accepts confirmed zero but rejects malformed catalog balance responses', async () => {
     const messages = []
     const request = {

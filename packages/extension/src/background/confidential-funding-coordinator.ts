@@ -86,6 +86,7 @@ import {
   createConfiguredEvmRpcClient,
   createEvmTransactionSegmentEvent,
   estimateEvmTransferFee,
+  evmPreparedMaximumFeeWei,
   EvmTransactionError,
   isEvmSpeedUpReplacement,
   observeEvmTransaction,
@@ -2522,13 +2523,38 @@ export class ConfidentialFundingCoordinator {
       void this.continuePlan(plan.planId)
       return plan
     }
-    if (!plan.preparedDeposit) throw new Error('Confidential funding deposit was not prepared')
+    if (!plan.preparedDeposit || !plan.depositQuote) {
+      throw new Error('Confidential funding deposit was not prepared')
+    }
+    const preparedDepositTransfer = parsePreparedEvmTransfer(plan.preparedDeposit.preparedTransfer)
+    const depositFeeAsset = this.options.assets
+      .list(preparedDepositTransfer.chainId)
+      .find(entry => entry.asset.kind === 'native' && entry.asset.namespace === 'slip44')
+    const depositQuoteDeadline = Date.parse(plan.depositQuote.quote.deadline)
+    if (!depositFeeAsset || !Number.isSafeInteger(depositQuoteDeadline)) {
+      throw new Error('Confidential funding deposit was not prepared')
+    }
     let signed: Awaited<ReturnType<ConfidentialFundingSigner['confirmTransaction']>>
     try {
       signed = await this.options.signer.confirmTransaction({
         identity,
         commandId: plan.preparedDeposit.commandId,
         preparedTransfer: plan.preparedDeposit.preparedTransfer,
+        constraint: {
+          kind: 'constraint',
+          maxSpend: { assetId: plan.source.assetId, amountRaw: plan.source.amountRaw },
+          recipients: [
+            {
+              chainId: plan.source.chainId,
+              address: plan.depositQuote.quote.depositAddress
+            }
+          ],
+          maxFee: {
+            assetId: depositFeeAsset.asset.id,
+            amountRaw: evmPreparedMaximumFeeWei(preparedDepositTransfer)
+          },
+          expiresAt: Math.min(plan.preparedDeposit.expiresAt, depositQuoteDeadline)
+        },
         ...(plan.operation === 'deposit' || plan.operation === 'cluster'
           ? { sourceDomain: plan.sourceDomain as 'public' | 'private' }
           : {})

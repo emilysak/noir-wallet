@@ -181,6 +181,13 @@ function parseSignedSolanaTransaction(value: unknown): SigningResult {
   })
 }
 
+function simulationBlocksSigning(summary: PreparedSigningCommand['summary']): boolean {
+  return (
+    summary.schema === 'solana.transaction.v1' &&
+    (summary.review.level === 'blocked' || summary.fields.simulationStatus === 'failed')
+  )
+}
+
 function parseCancelledSigning(value: unknown): boolean {
   const record = readRecord(value, 'Cancelled Solana signing command')
   assertExactKeys(record, ['cancelled'], [], 'Cancelled Solana signing command')
@@ -190,6 +197,7 @@ function parseCancelledSigning(value: unknown): boolean {
 export class SolanaMultichainSigningClient {
   private readonly commandClient: MultichainCommandClient
   private readonly confirming = new Set<SigningCommandId>()
+  private readonly simulationBlocked = new Set<SigningCommandId>()
   private readonly ledgerPending = new Map<
     SigningCommandId,
     {
@@ -302,6 +310,7 @@ export class SolanaMultichainSigningClient {
           },
           expiresAt: (this.options.now?.() ?? Date.now()) + 120_000
         })
+        this.rememberBlockedSimulation(prepared)
         this.ledgerPending.set(commandId, {
           keyDomainId,
           accountIndex: payload.accountIndex,
@@ -359,7 +368,7 @@ export class SolanaMultichainSigningClient {
         })
       })
     }
-    return this.commandClient.execute(
+    const prepared = await this.commandClient.execute(
       {
         operation: 'signing.prepare',
         binding,
@@ -368,6 +377,8 @@ export class SolanaMultichainSigningClient {
       },
       value => parsePreparedSolanaSigning(value, payload)
     )
+    this.rememberBlockedSimulation(prepared)
+    return prepared
   }
 
   async confirm(
@@ -382,6 +393,9 @@ export class SolanaMultichainSigningClient {
       throw new Error('Solana signing command is already confirming')
     this.confirming.add(commandId)
     try {
+      if (this.simulationBlocked.has(commandId)) {
+        throw new Error('Solana transaction failed simulation and cannot be signed')
+      }
       if (
         !this.ledgerPending.has(commandId) &&
         execution?.kind === 'external' &&
@@ -416,6 +430,10 @@ export class SolanaMultichainSigningClient {
           chainId: payload.chainId,
           operation: 'transaction'
         })
+        this.rememberBlockedSimulation(prepared)
+        if (this.simulationBlocked.has(commandId)) {
+          throw new Error('Solana transaction failed simulation and cannot be signed')
+        }
         this.ledgerPending.set(commandId, {
           keyDomainId,
           accountIndex: payload.accountIndex,
@@ -432,6 +450,9 @@ export class SolanaMultichainSigningClient {
       }
       const pending = this.ledgerPending.get(commandId)
       if (pending) {
+        if (simulationBlocksSigning(pending.prepared.summary)) {
+          throw new Error('Solana transaction failed simulation and cannot be signed')
+        }
         this.ledgerPending.delete(commandId)
         if (pending.keyDomainId !== keyDomainId || !this.options.ledger)
           throw new Error('Ledger signing scope changed')
@@ -540,6 +561,12 @@ export class SolanaMultichainSigningClient {
       )
     } finally {
       this.confirming.delete(commandId)
+    }
+  }
+
+  private rememberBlockedSimulation(prepared: PreparedSigningCommand): void {
+    if (simulationBlocksSigning(prepared.summary)) {
+      this.simulationBlocked.add(prepared.commandId)
     }
   }
 

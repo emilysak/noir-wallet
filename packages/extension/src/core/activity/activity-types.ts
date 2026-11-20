@@ -47,9 +47,16 @@ export interface ActivityItem {
   readonly reconfirming?: true
 }
 
+export interface ActivityPlantedRecipient {
+  readonly chainId: string
+  readonly address: string
+}
+
 export interface ActivityReadModel {
   readonly scope: ActivityScope
   readonly items: readonly ActivityItem[]
   readonly partialItemCount: number
   readonly hasMore?: boolean
+  readonly plantedRecipients?: readonly ActivityPlantedRecipient[]
+  readonly plantedSenders?: readonly ActivityPlantedRecipient[]
 }

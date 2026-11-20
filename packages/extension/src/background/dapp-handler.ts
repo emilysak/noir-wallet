@@ -21,7 +21,11 @@ import { useWalletStore, rehydrateWalletStore } from '@/store/wallet-store'
 import { useAccountDataStore, buildAccountKey } from '@/store/account-data-store'
 import { EVM_GAS_FUNDING_APPROVAL_TIMEOUT_MS, pendingRequestsManager } from './pending-requests'
 import { getApprovalContext } from './approval-context'
-import { signApprovedDAppMessage } from './dapp-message-signing'
+import {
+  assertReviewedDAppSigningIdentity,
+  resolveDAppMessageSigningMode,
+  signApprovedDAppMessage
+} from './dapp-message-signing'
 import { sleep } from '@/lib/utils'
 import { logger } from '@/lib/logger'
 import { ANALYTICS_EVENTS, PAGE_IDS, trackEvent } from '@/background/analytics/reporter'
@@ -39,10 +43,13 @@ import {
   isRetryableWalletRpcError,
   WALLET_BUSY_MESSAGE
 } from '@/core/zcash/wallet-rpc-errors'
+import { assertFeeWithinCeiling } from '@/core/transactions/domain'
 import {
+  assertApprovedShieldAmount,
   getShieldableTransparentBalance,
   hasEnoughTransparentBalanceToShield,
-  MIN_SHIELDING_BALANCE_MESSAGE
+  MIN_SHIELDING_BALANCE_MESSAGE,
+  transparentShieldAmountZats
 } from '@/core/zcash/shielding'
 import { requireSuccessfulTransfer } from '@/core/zcash/transfer-result'
 import { isTransparentZcashAddress } from '@/lib/zcash-memo'
@@ -1299,12 +1306,10 @@ export class DAppHandler {
           undefined,
           approvedFee.feeQuoteId
         )
-        if (
-          feeEstimate.feeQuote.id !== approvedFee.feeQuoteId ||
-          feeEstimate.feeZats !== String(approvedFee.feeZats)
-        ) {
+        if (feeEstimate.feeQuote.id !== approvedFee.feeQuoteId) {
           throw new Error('Network fee changed. Review the transaction again.')
         }
+        assertFeeWithinCeiling(feeEstimate.feeZats, String(approvedFee.feeZats))
         const feeZec = formatBaseUnitDecimalAmount(feeEstimate.feeZats, ZEC_DECIMALS)
 
         const tx = await transactionRecorder.addTransaction({
@@ -1558,7 +1563,7 @@ export class DAppHandler {
   private async signMessage(
     origin: string,
     message: string,
-    options: { signingMode?: 'derived' | 'current' | 'legacy_index0' } | undefined,
+    options: unknown,
     tabInfo: DAppTabInfo
   ): Promise<{
     signature: string
@@ -1568,12 +1573,63 @@ export class DAppHandler {
     originAddress?: string
   }> {
     this.validateSignMessageParam(message)
-    await this.ensurePermission(origin)
+    const bound = await this.ensurePermission(origin)
+    const signingMode = resolveDAppMessageSigningMode(origin, options)
+    const identity = await this.runBoundZcashOperation(
+      bound.walletId,
+      bound.accountId,
+      async () => {
+        await this.ensureApprovedAccountContext(
+          origin,
+          bound.walletId,
+          bound.accountId,
+          bound.revision
+        )
+        const walletCore = await backgroundZcashWalletRuntime.getWalletCore(
+          bound.walletId,
+          bound.accountId
+        )
+        const account = useWalletStore.getState().getAccount(bound.walletId, bound.accountId)
+        if (!account) throw new Error('Wallet account no longer available')
+        const cached = await fetchCachedIdentity(
+          useWalletStore.getState().currentNetwork,
+          bound.walletId,
+          bound.accountId,
+          account.derivationIndex,
+          signingMode,
+          walletCore
+        )
+        await this.ensureApprovedAccountContext(
+          origin,
+          bound.walletId,
+          bound.accountId,
+          bound.revision
+        )
+        return {
+          signingMode: cached.signingMode,
+          address: cached.address,
+          pubkey: cached.pubkey
+        }
+      }
+    )
+    if (
+      identity.signingMode !== signingMode ||
+      identity.address.length === 0 ||
+      identity.pubkey.length === 0
+    ) {
+      throw new Error('The signing identity is unavailable.')
+    }
 
     const { approved, walletId, accountId, authorizationRevision } = await this.requestUserApproval(
       origin,
       'signMessage',
-      { message, ...dappApprovalMetadata(tabInfo) }
+      {
+        message,
+        signingMode: identity.signingMode,
+        address: identity.address,
+        pubkey: identity.pubkey,
+        ...dappApprovalMetadata(tabInfo)
+      }
     )
 
     if (!approved) {
@@ -1586,8 +1642,8 @@ export class DAppHandler {
 
     return this.runBoundZcashOperation(walletId, accountId, async () => {
       await this.ensureApprovedAccountContext(origin, walletId, accountId, authorizationRevision)
-      const mode: IdentitySigningMode = options?.signingMode ?? 'current'
-      const dedupKey = `${walletId}:${accountId}:${message}:${mode}`
+      const mode: IdentitySigningMode = identity.signingMode
+      const dedupKey = `${walletId}:${accountId}:${message}:${mode}:${identity.address}`
       const pending = this.signMessageInFlight.get(dedupKey)
       if (pending) {
         logger.log('dedup hit', walletId)
@@ -1603,13 +1659,18 @@ export class DAppHandler {
         walletCore,
         message,
         approvedAccountIndex,
-        options?.signingMode,
+        mode,
         SIGNING_ACCOUNT_INDEX
-      ).finally(() => {
-        if (this.signMessageInFlight.get(dedupKey) === promise) {
-          this.signMessageInFlight.delete(dedupKey)
-        }
-      })
+      )
+        .then(signed => {
+          assertReviewedDAppSigningIdentity(identity, signed)
+          return signed
+        })
+        .finally(() => {
+          if (this.signMessageInFlight.get(dedupKey) === promise) {
+            this.signMessageInFlight.delete(dedupKey)
+          }
+        })
 
       this.signMessageInFlight.set(dedupKey, promise)
       const result = await promise
@@ -1647,6 +1708,8 @@ export class DAppHandler {
     const balance = useAccountDataStore
       .getState()
       .getBalance(currentNetwork, bound.walletId, bound.accountId)
+    const approvedShieldAmount = getShieldableTransparentBalance(balance)
+    const approvedShieldAmountZats = transparentShieldAmountZats(approvedShieldAmount)
 
     const {
       requestId,
@@ -1659,7 +1722,8 @@ export class DAppHandler {
       feeTier,
       feeZats
     } = await this.requestUserApprovalWithId(origin, 'shieldFunds', {
-      amount: getShieldableTransparentBalance(balance),
+      amount: approvedShieldAmount,
+      shieldAmountZats: approvedShieldAmountZats,
       ...dappApprovalMetadata(tabInfo)
     })
 
@@ -1702,6 +1766,10 @@ export class DAppHandler {
         const latestTransparentBalance = getShieldableTransparentBalance(
           await prepareTransparentSpend(walletCore, undefined, approvedAccountIndex)
         )
+        assertApprovedShieldAmount(
+          approvedShieldAmountZats,
+          transparentShieldAmountZats(latestTransparentBalance)
+        )
         if (!hasEnoughTransparentBalanceToShield(latestTransparentBalance)) {
           throw new Error(MIN_SHIELDING_BALANCE_MESSAGE)
         }
@@ -1709,12 +1777,14 @@ export class DAppHandler {
           approvedFee.marginalFeeZats,
           approvedFee.feeQuoteId
         )
-        if (
-          feeEstimate.feeQuote.id !== approvedFee.feeQuoteId ||
-          feeEstimate.feeZats !== String(approvedFee.feeZats)
-        ) {
+        if (feeEstimate.feeQuote.id !== approvedFee.feeQuoteId) {
           throw new Error('Network fee changed. Review the shield request again.')
         }
+        assertFeeWithinCeiling(
+          feeEstimate.feeZats,
+          String(approvedFee.feeZats),
+          'Network fee changed. Review the shield request again.'
+        )
         const feeZec = formatBaseUnitDecimalAmount(feeEstimate.feeZats, ZEC_DECIMALS)
         const tx = await transactionRecorder.addTransaction({
           accountKey,
@@ -1722,7 +1792,7 @@ export class DAppHandler {
             txHash: '',
             status: 'pending',
             type: 'shield',
-            amount: latestTransparentBalance,
+            amount: approvedShieldAmount,
             to: approvedAccount?.addresses.shielded ?? '',
             from: approvedAccount?.addresses.transparent ?? '',
             fromType: 'transparent',
@@ -1739,7 +1809,8 @@ export class DAppHandler {
           approvedFee.marginalFeeZats,
           approvedAccountIndex,
           undefined,
-          approvedFee.feeQuoteId
+          approvedFee.feeQuoteId,
+          approvedShieldAmountZats
         )
         const { txid } = shieldResult
         broadcastHash = txid

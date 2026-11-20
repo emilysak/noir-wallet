@@ -23,6 +23,7 @@ import type { StorageV2ReadRepository } from '@/ports/repositories'
 
 import { credentialSession } from './credential-session'
 import { nearLedgerSigningBridge } from './ledger-signing-bridge'
+import { nearFullAccessKeyDeletionClientOptions } from './near-full-access-key-deletion'
 import { NEAR_TRANSACTION_MONITOR_ALARM } from './near-transaction-monitor'
 import { reportBackgroundSendBroadcast } from './analytics/send-broadcast'
 import {
@@ -95,14 +96,16 @@ export function createBackgroundNearTransferController(
     ...getBundledInitialProductAssetDefinitions(DEFAULT_NETWORK),
     ...protocolAssets
   ])
+  const rpc = createConfiguredNearRpcClient({ chainId: network.chainId, rpcUrl: network.rpcUrl })
   const orchestrator = new NearTransferOrchestrator({
     repository: new IndexedDbTransactionRepository(),
     pendingStore: new ChromeSessionNearPendingTransferStore(),
     signer: new NearMultichainSigningClient({
       credentials: credentialSession,
-      ledger: nearLedgerSigningBridge
+      ledger: nearLedgerSigningBridge,
+      ...nearFullAccessKeyDeletionClientOptions(storageRepository, rpc)
     }),
-    rpc: createConfiguredNearRpcClient({ chainId: network.chainId, rpcUrl: network.rpcUrl }),
+    rpc,
     assets,
     canBroadcastSigned: scope => isSelectedTransferScope(storageRepository, scope, 'near'),
     onPendingBroadcast: () =>

@@ -1,5 +1,5 @@
 import { isZcashHardwareKeySource } from '@/core/wallet/hardware-wallet-data'
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Icon } from '@iconify/react'
 import { PageHeader } from '../../components/common/PageHeader'
@@ -25,6 +25,7 @@ import { accountNetworksClient } from '../../services/account-networks-client'
 import { isAccountNetworkEnabled } from '@/core/wallet/account-network-selection'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import { AccountAvatar } from '../../components/account/AccountAvatar'
+import { EvmDelegationStatus } from '../../components/account/EvmDelegationStatus'
 
 export function AccountDetail() {
   const { navigate, goBack } = useNavigate()
@@ -297,23 +298,47 @@ export function AccountDetail() {
               </div>
             )
 
-            if (item.action) {
-              return (
-                <button
-                  key={item.label}
-                  type="button"
-                  onClick={item.action}
-                  className={rowClassName}
-                >
-                  {content}
-                </button>
-              )
-            }
+            const row = item.action ? (
+              <button type="button" onClick={item.action} className={rowClassName}>
+                {content}
+              </button>
+            ) : (
+              <div className={rowClassName}>{content}</div>
+            )
 
             return (
-              <div key={item.label} className={rowClassName}>
-                {content}
-              </div>
+              <Fragment key={item.label}>
+                {row}
+                {item.label === 'Address' &&
+                isAccountNetworkEnabled(account, DEFAULT_NETWORK, 'evm') ? (
+                  <>
+                    <EvmDelegationStatus enabled walletId={wallet.id} accountId={account.id} />
+                    <button
+                      type="button"
+                      className="flex h-[61px] w-full items-center gap-[17px] px-[27px] text-left transition-colors hover:bg-wallet-surface"
+                      onClick={() =>
+                        navigate(
+                          `/token-approvals?accountId=${encodeURIComponent(account.id)}&walletId=${encodeURIComponent(wallet.id)}`
+                        )
+                      }
+                    >
+                      <Icon
+                        icon="lucide:shield-check"
+                        width={20}
+                        height={20}
+                        className="shrink-0 text-muted"
+                      />
+                      <span className="min-w-0 flex-1 text-lg leading-[23px]">Token approvals</span>
+                      <Icon
+                        icon="lucide:chevron-right"
+                        width={16}
+                        height={16}
+                        className="text-muted"
+                      />
+                    </button>
+                  </>
+                ) : null}
+              </Fragment>
             )
           })}
         </div>

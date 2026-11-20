@@ -53,6 +53,7 @@ test('network management includes each enabled chain once and keeps custom ident
       label: 'Ink',
       iconChain: 'eip155:57073',
       source: 'custom',
+      rpcOrigin: 'user',
       numericChainId: 57073,
       currencySymbol: 'ETH'
     }

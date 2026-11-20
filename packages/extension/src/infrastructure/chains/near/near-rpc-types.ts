@@ -59,6 +59,13 @@ export interface NearAccessKeySnapshot {
   readonly blockHeight: number
 }
 
+export interface NearAccessKeyListSnapshot {
+  readonly accountId: string
+  readonly blockHash: string
+  readonly blockHeight: number
+  readonly keys: readonly NearAccessKeySnapshot[]
+}
+
 export interface NearFinalBlockSnapshot {
   readonly hash: string
   readonly height: number
@@ -105,6 +112,10 @@ export interface NearReadRpc {
     publicKey: string,
     signal?: AbortSignal
   ) => Promise<NearAccessKeySnapshot | null>
+  readonly listAccessKeys: (
+    accountId: string,
+    signal?: AbortSignal
+  ) => Promise<NearAccessKeyListSnapshot | null>
   readonly getFinalBlock: (signal?: AbortSignal) => Promise<NearFinalBlockSnapshot>
   readonly getGasPrice: (signal?: AbortSignal) => Promise<string>
   readonly getNativeTransferCostConfig: (

@@ -1,5 +1,7 @@
+import { isOpStackExecutionFee } from '@/config/networks'
 import type { ChainAccount } from '@/core/accounts/domain'
 import type { ChainId } from '@/core/chains/domain'
+import { evmBytecodeHasRuntimeCode } from '@/core/chains/evm/evm-runtime-code'
 import type { EvmTransactionSummary, SigningSummary } from '@/core/keyring/domain'
 import type { NetworkFeeTier } from '@/core/transactions/domain'
 import {
@@ -12,9 +14,11 @@ import { parseEvmAccountBinding } from './evm-account'
 import {
   deriveEvmFeeTierQuote,
   deriveEvmLegacyFeeQuote,
+  isPriorityFeeElevated,
   type EvmFeeSelection,
   type EvmFeeTierQuote
 } from './evm-fee-tier'
+import { OpStackFeeError, quoteOpStackL1DataFee } from './op-stack-fee'
 import {
   EvmRpcError,
   type EvmBroadcastRpc,
@@ -22,6 +26,7 @@ import {
   type EvmRpcCall,
   type EvmTransactionRpc
 } from './evm-rpc-client'
+import { evmContractCallReviewIssues } from './evm-contract-call-classification'
 
 const ETHEREUM_MAINNET_PRIORITY_FEE_FLOOR_WEI = 10_000_000n
 const EVM_SIMPLE_TRANSFER_GAS = 21_000n
@@ -133,6 +138,9 @@ export interface PreparedEvmTransfer {
   readonly amountRaw: string
   readonly observedBlockNumber: string
   readonly transaction: EvmPreparedTransaction
+  readonly l1DataFeeWei: string
+  readonly suggestedFeePerGasWei: string | null
+  readonly priorityFeeElevated: boolean
   readonly createdAt: number
 }
 
@@ -141,6 +149,9 @@ export interface EvmSigningPreparePayload {
   readonly chainId: ChainId
   readonly addressIndex: number
   readonly transaction: EvmPreparedTransaction
+  readonly l1DataFeeWei: string
+  readonly suggestedFeePerGasWei: string | null
+  readonly priorityFeeElevated: boolean
 }
 
 export interface PeaEvmExecutionAccount {
@@ -186,6 +197,8 @@ export interface EvmFeeEstimate {
   readonly transactionType?: 'eip1559' | 'legacy'
   readonly gasPriceWei?: string | null
   readonly amountIndependent?: boolean
+  readonly l1DataFeeWei?: string
+  readonly priorityFeeElevated?: boolean
 }
 
 export interface BuildEvmCancelInput {
@@ -239,7 +252,9 @@ export interface BuildEvmNonceRecoveryInput {
 const MAXIMUM_UINT64 = (1n << 64n) - 1n
 const MAXIMUM_UINT256 = (1n << 256n) - 1n
 const ERC20_TRANSFER_SELECTOR = 'a9059cbb'
+const ERC20_TRANSFER_CALLDATA_LENGTH = 2 + ERC20_TRANSFER_SELECTOR.length + 128
 const ERC20_TRUE = `0x${'0'.repeat(63)}1`
+export const EVM_SIMULATION_PREVIEW_TTL_MS = 30_000
 
 function invalidIntent(message: string): never {
   throw new EvmTransactionError('invalid-intent', message)
@@ -409,11 +424,13 @@ function readRecord(value: unknown, label: string): Record<string, unknown> {
 function assertExactKeys(
   value: Record<string, unknown>,
   expected: readonly string[],
-  label: string
+  label: string,
+  optional: readonly string[] = []
 ): void {
+  const allowed = new Set([...expected, ...optional])
   if (
-    Object.keys(value).length !== expected.length ||
-    !expected.every(key => Object.prototype.hasOwnProperty.call(value, key))
+    expected.some(key => !Object.prototype.hasOwnProperty.call(value, key)) ||
+    Object.keys(value).some(key => !allowed.has(key))
   ) {
     throw new Error(`${label} has invalid fields`)
   }
@@ -523,7 +540,8 @@ export function parsePreparedEvmTransfer(value: unknown): PreparedEvmTransfer {
       'transaction',
       'createdAt'
     ],
-    'Prepared EVM transfer'
+    'Prepared EVM transfer',
+    ['l1DataFeeWei', 'suggestedFeePerGasWei', 'priorityFeeElevated']
   )
   if (
     record.kind !== 'native-transfer' &&
@@ -553,6 +571,32 @@ export function parsePreparedEvmTransfer(value: unknown): PreparedEvmTransfer {
     throw new Error('Prepared EVM transfer amount must be positive')
   }
   const transaction = parsePersistedTransaction(record.transaction, chain.id)
+  const l1DataFeeWei =
+    record.l1DataFeeWei === undefined
+      ? '0'
+      : readRawAmount(record.l1DataFeeWei, 'EVM L1 data fee', MAXIMUM_UINT256)
+  const suggestedFeePerGasWei =
+    record.suggestedFeePerGasWei === undefined || record.suggestedFeePerGasWei === null
+      ? null
+      : readRawAmount(record.suggestedFeePerGasWei, 'EVM suggested fee', MAXIMUM_UINT256)
+  if (
+    typeof record.priorityFeeElevated !== 'undefined' &&
+    typeof record.priorityFeeElevated !== 'boolean'
+  ) {
+    throw new Error('Invalid EVM priority fee warning')
+  }
+  const priorityFeeElevated = record.priorityFeeElevated === true
+  const chosenFeePerGasWei = BigInt(
+    transaction.type === 'legacy' ? transaction.gasPrice : transaction.maxPriorityFeePerGas
+  )
+  if (
+    (priorityFeeElevated && suggestedFeePerGasWei === null) ||
+    (suggestedFeePerGasWei !== null &&
+      priorityFeeElevated !==
+        isPriorityFeeElevated(chosenFeePerGasWei, BigInt(suggestedFeePerGasWei)))
+  ) {
+    throw new Error('Invalid EVM priority fee warning')
+  }
   if (record.kind === 'native-transfer') {
     if (
       asset.namespace !== 'slip44' ||
@@ -614,8 +658,21 @@ export function parsePreparedEvmTransfer(value: unknown): PreparedEvmTransfer {
       MAXIMUM_UINT64
     ),
     transaction,
+    l1DataFeeWei,
+    suggestedFeePerGasWei,
+    priorityFeeElevated,
     createdAt: parseTimestamp(record.createdAt as number)
   })
+}
+
+export function evmPreparedMaximumFeeWei(
+  prepared: Pick<PreparedEvmTransfer, 'transaction' | 'l1DataFeeWei'>
+): string {
+  const transaction = prepared.transaction
+  const executionFee =
+    BigInt(transaction.gasLimit) *
+    BigInt(transaction.type === 'legacy' ? transaction.gasPrice : transaction.maxFeePerGas)
+  return (executionFee + BigInt(prepared.l1DataFeeWei ?? '0')).toString()
 }
 
 export async function computeEvmSigningPayloadFingerprint(
@@ -660,11 +717,15 @@ export async function createEvmSigningSummary(
 ): Promise<EvmTransactionSummary> {
   const transaction = prepared.transaction
   const calldataByteLength = (transaction.input.length - 2) / 2
+  const callIssues =
+    calldataByteLength > 0
+      ? transaction.to === null
+        ? [Object.freeze({ code: 'unrecognized-call' as const })]
+        : evmContractCallReviewIssues(transaction.input, transaction.to)
+      : []
   const review = Object.freeze({
-    level: calldataByteLength > 0 ? ('caution' as const) : ('standard' as const),
-    issues: Object.freeze(
-      calldataByteLength > 0 ? [Object.freeze({ code: 'unrecognized-call' as const })] : []
-    )
+    level: callIssues.length > 0 ? ('caution' as const) : ('standard' as const),
+    issues: Object.freeze(callIssues)
   })
   return Object.freeze({
     schema: 'evm.transaction.v1' as const,
@@ -678,10 +739,10 @@ export async function createEvmSigningSummary(
       nonce: transaction.nonce,
       valueWei: transaction.value,
       gasLimit: transaction.gasLimit,
-      maximumFeeWei: (
-        BigInt(transaction.gasLimit) *
-        BigInt(transaction.type === 'legacy' ? transaction.gasPrice : transaction.maxFeePerGas)
-      ).toString(),
+      maximumFeeWei: evmPreparedMaximumFeeWei(prepared),
+      l1DataFeeWei: prepared.l1DataFeeWei,
+      suggestedFeePerGasWei: prepared.suggestedFeePerGasWei,
+      priorityFeeElevated: prepared.priorityFeeElevated,
       gasPriceWei: transaction.type === 'legacy' ? transaction.gasPrice : null,
       maxFeePerGasWei: transaction.type === 'eip1559' ? transaction.maxFeePerGas : null,
       maxPriorityFeePerGasWei:
@@ -711,20 +772,27 @@ export async function assertEvmSigningSummaryMatchesPrepared(
   }
   const transaction = prepared.transaction
   const calldataByteLength = (transaction.input.length - 2) / 2
-  const expectsCallWarning = calldataByteLength > 0
-  const issue = summary.review.issues[0]
-  const expectedMaximumFee = (
-    BigInt(transaction.gasLimit) *
-    BigInt(transaction.type === 'legacy' ? transaction.gasPrice : transaction.maxFeePerGas)
-  ).toString()
+  const expectedIssues =
+    calldataByteLength > 0
+      ? transaction.to === null
+        ? [Object.freeze({ code: 'unrecognized-call' as const })]
+        : evmContractCallReviewIssues(transaction.input, transaction.to)
+      : []
+  const expectsCallWarning = expectedIssues.length > 0
+  const expectedMaximumFee = evmPreparedMaximumFeeWei(prepared)
   const fields = summary.fields
   const addressesMatch = (left: string | null, right: string | null): boolean =>
     left === null || right === null ? left === right : left.toLowerCase() === right.toLowerCase()
   if (
     summary.review.level !== (expectsCallWarning ? 'caution' : 'standard') ||
-    summary.review.issues.length !== (expectsCallWarning ? 1 : 0) ||
+    summary.review.issues.length !== expectedIssues.length ||
     (expectsCallWarning &&
-      (issue?.code !== 'unrecognized-call' || issue.subjectIndex !== undefined)) ||
+      (expectedIssues.length !== summary.review.issues.length ||
+        expectedIssues.some(
+          (expected, index) =>
+            summary.review.issues[index]?.code !== expected.code ||
+            summary.review.issues[index]?.subjectIndex !== undefined
+        ))) ||
     fields.transactionType !== transaction.type ||
     !addressesMatch(fields.from, prepared.from) ||
     !addressesMatch(fields.to, transaction.to) ||
@@ -732,6 +800,9 @@ export async function assertEvmSigningSummaryMatchesPrepared(
     fields.valueWei !== transaction.value ||
     fields.gasLimit !== transaction.gasLimit ||
     fields.maximumFeeWei !== expectedMaximumFee ||
+    (fields.l1DataFeeWei ?? '0') !== prepared.l1DataFeeWei ||
+    (fields.suggestedFeePerGasWei ?? null) !== prepared.suggestedFeePerGasWei ||
+    (fields.priorityFeeElevated ?? false) !== prepared.priorityFeeElevated ||
     fields.gasPriceWei !== (transaction.type === 'legacy' ? transaction.gasPrice : null) ||
     fields.maxFeePerGasWei !== (transaction.type === 'eip1559' ? transaction.maxFeePerGas : null) ||
     fields.maxPriorityFeePerGasWei !==
@@ -814,10 +885,77 @@ function createTransferCall(
   return invalidIntent('Unsupported EVM transfer asset')
 }
 
-function assertSimulationResult(kind: PreparedEvmTransfer['kind'], result: string): void {
-  if (kind === 'erc20-transfer' && result !== '0x' && result !== ERC20_TRUE) {
+export function evmSimulationPreviewExpiresAt(createdAt: number, signingExpiresAt: number): number {
+  const previewExpiresAt = createdAt + EVM_SIMULATION_PREVIEW_TTL_MS
+  if (
+    !Number.isSafeInteger(createdAt) ||
+    createdAt < 0 ||
+    !Number.isSafeInteger(signingExpiresAt) ||
+    signingExpiresAt < 0 ||
+    !Number.isSafeInteger(previewExpiresAt)
+  ) {
+    throw new Error('EVM simulation preview expiry is invalid')
+  }
+  return Math.min(signingExpiresAt, previewExpiresAt)
+}
+
+function isErc20TransferSimulation(kind: PreparedEvmTransfer['kind'], calldata?: string): boolean {
+  if (kind === 'erc20-transfer') return true
+  return (
+    calldata !== undefined &&
+    calldata.length === ERC20_TRANSFER_CALLDATA_LENGTH &&
+    calldata.toLowerCase().startsWith(`0x${ERC20_TRANSFER_SELECTOR}`)
+  )
+}
+
+function assertSimulationResult(
+  kind: PreparedEvmTransfer['kind'],
+  result: string,
+  calldata?: string
+): void {
+  if (isErc20TransferSimulation(kind, calldata) && result !== '0x' && result !== ERC20_TRUE) {
     throw new EvmTransactionError('simulation-failed', 'ERC-20 transfer simulation failed')
   }
+}
+
+async function simulateEvmCall(
+  kind: PreparedEvmTransfer['kind'],
+  call: EvmRpcCall,
+  rpc: Pick<EvmTransactionRpc, 'simulateCall'>,
+  signal?: AbortSignal
+): Promise<void> {
+  let result: string
+  try {
+    result = await rpc.simulateCall(call, signal)
+  } catch (error) {
+    if (isInsufficientFundsRpcError(error)) insufficientFunds()
+    if (error instanceof EvmRpcError && error.code !== 'rpc-error') throw error
+    throw new EvmTransactionError(
+      'simulation-failed',
+      'EVM transaction simulation failed',
+      undefined,
+      error instanceof EvmRpcError ? { code: error.rpcCode, method: error.rpcMethod } : undefined
+    )
+  }
+  assertSimulationResult(kind, result, call.data)
+}
+
+export function simulatePreparedEvmTransaction(
+  prepared: PreparedEvmTransfer,
+  rpc: Pick<EvmTransactionRpc, 'simulateCall'>,
+  signal?: AbortSignal
+): Promise<void> {
+  return simulateEvmCall(
+    prepared.kind,
+    Object.freeze({
+      from: prepared.from,
+      to: prepared.transaction.to,
+      valueRaw: prepared.transaction.value,
+      data: prepared.transaction.input
+    }),
+    rpc,
+    signal
+  )
 }
 
 interface PreparedEvmCall {
@@ -891,16 +1029,12 @@ async function estimatePreparedCallFee(
   ) {
     insufficientFunds(minimumFundingDetails(nativeBalance, transactionValue))
   }
-  const simulation = input.rpc.simulateCall(transactionCall.call, input.signal).catch(error => {
-    if (isInsufficientFundsRpcError(error)) insufficientFunds()
-    if (error instanceof EvmRpcError && error.code !== 'rpc-error') throw error
-    throw new EvmTransactionError(
-      'simulation-failed',
-      'EVM transaction simulation failed',
-      undefined,
-      error instanceof EvmRpcError ? { code: error.rpcCode, method: error.rpcMethod } : undefined
-    )
-  })
+  const simulation = simulateEvmCall(
+    transactionCall.kind,
+    transactionCall.call,
+    input.rpc,
+    input.signal
+  )
   const gas = input.rpc.estimateGas(transactionCall.call, input.signal).catch(error => {
     if (isInsufficientFundsRpcError(error)) insufficientFunds()
     if (error instanceof EvmRpcError && error.code === 'rpc-error') {
@@ -913,8 +1047,7 @@ async function estimatePreparedCallFee(
     }
     throw error
   })
-  const [simulationResult, gasEstimate] = await Promise.all([simulation, gas])
-  assertSimulationResult(transactionCall.kind, simulationResult)
+  const [, gasEstimate] = await Promise.all([simulation, gas])
   const estimatedGas = parseRpcUint64(gasEstimate, 'EVM gas estimate')
   if (estimatedGas === 0n) {
     throw new EvmRpcError('invalid-response', 'EVM gas estimate must be positive')
@@ -933,11 +1066,16 @@ async function estimatePreparedCallFee(
   const transactionType: 'legacy' | 'eip1559' =
     blockFee.baseFeePerGas === null ? 'legacy' : 'eip1559'
   let feeQuote: EvmFeeTierQuote
+  let suggestedFeePerGasWei: bigint
   if (transactionType === 'legacy') {
+    suggestedFeePerGasWei = parseRpcUint64(
+      await input.rpc.getGasPrice(input.signal),
+      'EVM gas price'
+    )
     feeQuote = deriveEvmLegacyFeeQuote({
       ...(input.feeSelection === undefined ? {} : { selection: input.feeSelection }),
       ...(input.feeTier === undefined ? {} : { tier: input.feeTier }),
-      suggestedGasPrice: parseRpcUint64(await input.rpc.getGasPrice(input.signal), 'EVM gas price')
+      suggestedGasPrice: suggestedFeePerGasWei
     })
   } else {
     const baseFeePerGas = parseRpcUint64(blockFee.baseFeePerGas!, 'EVM base fee per gas')
@@ -952,14 +1090,12 @@ async function estimatePreparedCallFee(
       baseFeePerGas,
       suggestedGasPriceRaw
     )
+    suggestedFeePerGasWei = parseRpcUint64(suggestedPriorityRaw, 'EVM maximum priority fee per gas')
     feeQuote = deriveEvmFeeTierQuote({
       ...(input.feeSelection === undefined ? {} : { selection: input.feeSelection }),
       ...(input.feeTier === undefined ? {} : { tier: input.feeTier }),
       baseFeePerGas,
-      suggestedPriorityFeePerGas: parseRpcUint64(
-        suggestedPriorityRaw,
-        'EVM maximum priority fee per gas'
-      ),
+      suggestedPriorityFeePerGas: suggestedFeePerGasWei,
       ...(minimumPriority === undefined ? {} : { minimumPriorityFeePerGas: minimumPriority })
     })
   }
@@ -983,7 +1119,83 @@ async function estimatePreparedCallFee(
       })
     )
   }
-  return { gasLimit, feeQuote, blockNumber, transactionType }
+  return {
+    gasLimit,
+    feeQuote,
+    blockNumber,
+    transactionType,
+    suggestedFeePerGasWei,
+    nativeBalance,
+    transactionValue
+  }
+}
+
+function mapOpStackFeeError(error: unknown): never {
+  if (error instanceof OpStackFeeError) {
+    throw new EvmTransactionError(
+      error.code === 'overflow' ? 'fee-overflow' : 'invalid-intent',
+      error.message
+    )
+  }
+  throw error
+}
+
+async function annotatePreparedNetworkFee(input: {
+  readonly chainId: ChainId
+  readonly rpc: EvmTransactionRpc
+  readonly signal?: AbortSignal
+  readonly executionAccount?: PeaEvmExecutionAccount
+  readonly nativeBalance: bigint
+  readonly transaction: EvmPreparedTransaction
+  readonly suggestedFeePerGasWei: bigint
+}): Promise<
+  Pick<PreparedEvmTransfer, 'l1DataFeeWei' | 'suggestedFeePerGasWei' | 'priorityFeeElevated'>
+> {
+  let l1DataFeeWei: bigint
+  try {
+    l1DataFeeWei = await quoteOpStackL1DataFee({
+      chainId: input.chainId,
+      transaction: input.transaction,
+      rpc: input.rpc,
+      signal: input.signal
+    })
+  } catch (error) {
+    mapOpStackFeeError(error)
+  }
+  const transactionValue = BigInt(input.transaction.value)
+  const executionFee =
+    BigInt(input.transaction.gasLimit) *
+    BigInt(
+      input.transaction.type === 'legacy'
+        ? input.transaction.gasPrice
+        : input.transaction.maxFeePerGas
+    )
+  const maximumNetworkFee = executionFee + l1DataFeeWei
+  const requiredNativeBalance = transactionValue + maximumNetworkFee
+  if (input.nativeBalance < requiredNativeBalance) {
+    const shortfall = requiredNativeBalance - input.nativeBalance
+    throw new EvmTransactionError(
+      'insufficient-funds',
+      `${input.executionAccount ? 'Private Execution Address' : 'EVM account'} needs ${shortfall} more wei for transaction value and maximum Gas`,
+      Object.freeze({
+        requiredNativeBalanceRaw: requiredNativeBalance.toString(),
+        availableNativeBalanceRaw: input.nativeBalance.toString(),
+        shortfallRaw: shortfall.toString(),
+        maximumGasCostRaw: maximumNetworkFee.toString(),
+        transactionValueRaw: input.transaction.value
+      })
+    )
+  }
+  const chosenFeePerGasWei = BigInt(
+    input.transaction.type === 'legacy'
+      ? input.transaction.gasPrice
+      : input.transaction.maxPriorityFeePerGas
+  )
+  return Object.freeze({
+    l1DataFeeWei: l1DataFeeWei.toString(),
+    suggestedFeePerGasWei: input.suggestedFeePerGasWei.toString(),
+    priorityFeeElevated: isPriorityFeeElevated(chosenFeePerGasWei, input.suggestedFeePerGasWei)
+  })
 }
 
 async function estimateEvmCall(
@@ -993,29 +1205,69 @@ async function estimateEvmCall(
   const account = resolveExecutionAccount(input)
   const call = preparedCall(account.address)
   await input.rpc.assertExpectedChain(input.signal)
-  const codeIsEmpty =
+  // Fee estimation always simulates the call. Only a confirmed empty recipient
+  // may mark a 21,000-gas native fee as amount-independent. Bytecode and an
+  // EIP-7702 delegation designator (0xef0100...) stay on that simulated path.
+  // A missing or failed code lookup fails closed the same way.
+  const recipientHasNoRuntimeCode =
     call.kind === 'native-transfer' && input.rpc.getCode
       ? input.rpc.getCode(call.transactionTo, input.signal).then(
-          code => code === '0x',
+          code => !evmBytecodeHasRuntimeCode(code),
           () => false
         )
       : Promise.resolve(false)
-  const [fee, recipientHasNoCode] = await Promise.all([
+  const [fee, confirmedEmptyRecipient] = await Promise.all([
     estimatePreparedCallFee(input, call),
-    codeIsEmpty
+    recipientHasNoRuntimeCode
   ])
-  const { gasLimit, feeQuote, transactionType } = fee
+  const { gasLimit, feeQuote, transactionType, suggestedFeePerGasWei, nativeBalance } = fee
+  const chosenFeePerGasWei =
+    transactionType === 'legacy' ? feeQuote.maxFeePerGas : feeQuote.maxPriorityFeePerGas
+  let l1DataFeeWei = 0n
+  let priorityFeeElevated = isPriorityFeeElevated(chosenFeePerGasWei, suggestedFeePerGasWei)
+  if (isOpStackExecutionFee(input.chainId)) {
+    const pendingNonce = parseRpcUint64(
+      await input.rpc.getPendingNonce(account.address, input.signal),
+      'EVM pending nonce'
+    )
+    const nonceFloor =
+      input.nonceFloor === undefined
+        ? pendingNonce
+        : parseRpcUint64(input.nonceFloor, 'EVM local nonce floor')
+    const annotation = await annotatePreparedNetworkFee({
+      chainId: input.chainId,
+      rpc: input.rpc,
+      signal: input.signal,
+      ...(input.executionAccount === undefined ? {} : { executionAccount: input.executionAccount }),
+      nativeBalance,
+      suggestedFeePerGasWei,
+      transaction: provisionalTransaction({
+        chainId: input.chainId,
+        transactionType,
+        nonce: (pendingNonce > nonceFloor ? pendingNonce : nonceFloor).toString(),
+        gasLimit,
+        feeQuote,
+        to: call.transactionTo,
+        value: call.transactionValue,
+        input: call.transactionInput
+      })
+    })
+    l1DataFeeWei = BigInt(annotation.l1DataFeeWei)
+    priorityFeeElevated = annotation.priorityFeeElevated
+  }
   return Object.freeze({
     chainId: input.chainId,
     transactionType,
-    maximumFeeWei: (gasLimit * feeQuote.maxFeePerGas).toString(),
+    maximumFeeWei: (gasLimit * feeQuote.maxFeePerGas + l1DataFeeWei).toString(),
     maxFeePerGasWei: feeQuote.maxFeePerGas.toString(),
     maxPriorityFeePerGasWei: feeQuote.maxPriorityFeePerGas.toString(),
     gasPriceWei: transactionType === 'legacy' ? feeQuote.maxFeePerGas.toString() : null,
     gasLimit: gasLimit.toString(),
+    ...(l1DataFeeWei === 0n ? {} : { l1DataFeeWei: l1DataFeeWei.toString() }),
+    ...(priorityFeeElevated ? { priorityFeeElevated: true } : {}),
     ...(call.kind === 'native-transfer' &&
     gasLimit === EVM_SIMPLE_TRANSFER_GAS &&
-    recipientHasNoCode
+    confirmedEmptyRecipient
       ? { amountIndependent: true }
       : {})
   })
@@ -1064,8 +1316,27 @@ async function buildPreparedEvmTransaction(
       ? rpcNonce
       : parseRpcUint64(input.nonceFloor, 'EVM local nonce floor')
   const nonce = rpcNonce > nonceFloor ? rpcNonce : nonceFloor
-  const { gasLimit, feeQuote, blockNumber, transactionType } = fee
-  const maximumFee = feeQuote.maxFeePerGas
+  const { gasLimit, feeQuote, blockNumber, transactionType, suggestedFeePerGasWei, nativeBalance } =
+    fee
+  const transaction = provisionalTransaction({
+    chainId: input.chainId,
+    transactionType,
+    nonce: nonce.toString(),
+    gasLimit,
+    feeQuote,
+    to: transactionCall.transactionTo,
+    value: transactionCall.transactionValue,
+    input: transactionCall.transactionInput
+  })
+  const annotation = await annotatePreparedNetworkFee({
+    chainId: input.chainId,
+    rpc: input.rpc,
+    signal: input.signal,
+    ...(input.executionAccount === undefined ? {} : { executionAccount: input.executionAccount }),
+    nativeBalance,
+    suggestedFeePerGasWei,
+    transaction
+  })
 
   return Object.freeze({
     kind: transactionCall.kind,
@@ -1076,23 +1347,37 @@ async function buildPreparedEvmTransaction(
     recipient: transactionCall.recipient,
     amountRaw: transactionCall.amountRaw,
     observedBlockNumber: blockNumber.toString(),
-    transaction: Object.freeze({
-      ...(transactionType === 'legacy'
-        ? { type: 'legacy' as const, gasPrice: maximumFee.toString() }
-        : {
-            type: 'eip1559' as const,
-            maxFeePerGas: maximumFee.toString(),
-            maxPriorityFeePerGas: feeQuote.maxPriorityFeePerGas.toString(),
-            accessList: Object.freeze([])
-          }),
-      chainId: numericChainId(input.chainId),
-      nonce: nonce.toString(),
-      gasLimit: gasLimit.toString(),
-      to: transactionCall.transactionTo,
-      value: transactionCall.transactionValue,
-      input: transactionCall.transactionInput
-    }),
+    transaction,
+    ...annotation,
     createdAt: parseTimestamp((input.now ?? Date.now)())
+  })
+}
+
+function provisionalTransaction(input: {
+  readonly chainId: ChainId
+  readonly transactionType: 'legacy' | 'eip1559'
+  readonly nonce: string
+  readonly gasLimit: bigint
+  readonly feeQuote: EvmFeeTierQuote
+  readonly to: string
+  readonly value: string
+  readonly input: string
+}): EvmPreparedTransaction {
+  return Object.freeze({
+    ...(input.transactionType === 'legacy'
+      ? { type: 'legacy' as const, gasPrice: input.feeQuote.maxFeePerGas.toString() }
+      : {
+          type: 'eip1559' as const,
+          maxFeePerGas: input.feeQuote.maxFeePerGas.toString(),
+          maxPriorityFeePerGas: input.feeQuote.maxPriorityFeePerGas.toString(),
+          accessList: Object.freeze([])
+        }),
+    chainId: numericChainId(input.chainId),
+    nonce: input.nonce,
+    gasLimit: input.gasLimit.toString(),
+    to: input.to,
+    value: input.value,
+    input: input.input
   })
 }
 
@@ -1200,10 +1485,15 @@ export async function buildEvmSpeedUpTransaction(
   ])
   const observedBlockNumber = parseRpcUint64(blockFee.blockNumber, 'EVM block number').toString()
   let transaction: EvmPreparedTransaction
+  let suggestedFeePerGasWei: bigint
   if (original.type === 'legacy') {
+    suggestedFeePerGasWei = parseRpcUint64(
+      await input.rpc.getGasPrice(input.signal),
+      'EVM gas price'
+    )
     const quote = deriveEvmLegacyFeeQuote({
       selection: input.feeSelection ?? { kind: 'tier', tier: 'fast' },
-      suggestedGasPrice: parseRpcUint64(await input.rpc.getGasPrice(input.signal), 'EVM gas price')
+      suggestedGasPrice: suggestedFeePerGasWei
     })
     const minimum = replacementMinimum(BigInt(original.gasPrice))
     const gasPrice = quote.maxFeePerGas > minimum ? quote.maxFeePerGas : minimum
@@ -1224,13 +1514,11 @@ export async function buildEvmSpeedUpTransaction(
       baseFee,
       suggestedGasPriceRaw
     )
+    suggestedFeePerGasWei = parseRpcUint64(suggestedPriorityRaw, 'EVM maximum priority fee per gas')
     const quote = deriveEvmFeeTierQuote({
       selection: input.feeSelection ?? { kind: 'tier', tier: 'fast' },
       baseFeePerGas: baseFee,
-      suggestedPriorityFeePerGas: parseRpcUint64(
-        suggestedPriorityRaw,
-        'EVM maximum priority fee per gas'
-      ),
+      suggestedPriorityFeePerGas: suggestedFeePerGasWei,
       ...(networkMinimumPriority === undefined
         ? {}
         : { minimumPriorityFeePerGas: networkMinimumPriority })
@@ -1274,8 +1562,17 @@ export async function buildEvmSpeedUpTransaction(
     .list(input.chainId)
     .find(entry => entry.asset.kind === 'native' && entry.asset.namespace === 'slip44')
   if (!nativeAsset) invalidIntent('EVM native fee asset is not listed')
-  return Object.freeze({
-    kind: 'speed-up',
+  const annotation = await annotatePreparedNetworkFee({
+    chainId: input.chainId,
+    rpc: input.rpc,
+    signal: input.signal,
+    ...(input.executionAccount === undefined ? {} : { executionAccount: input.executionAccount }),
+    nativeBalance,
+    suggestedFeePerGasWei,
+    transaction
+  })
+  const prepared = Object.freeze({
+    kind: 'speed-up' as const,
     chainId: input.chainId,
     addressIndex: account.addressIndex,
     from: account.address,
@@ -1284,8 +1581,11 @@ export async function buildEvmSpeedUpTransaction(
     amountRaw: transaction.value,
     observedBlockNumber,
     transaction,
+    ...annotation,
     createdAt: parseTimestamp((input.now ?? Date.now)())
   })
+  await simulatePreparedEvmTransaction(prepared, input.rpc, input.signal)
+  return prepared
 }
 
 export async function assertEvmReplacementNonceAvailable(
@@ -1394,7 +1694,28 @@ async function buildEvmSelfTransaction(
     .list(input.chainId)
     .find(entry => entry.asset.kind === 'native' && entry.asset.namespace === 'slip44')
   if (!nativeAsset) invalidIntent('EVM native fee asset is not listed')
-  return Object.freeze({
+  const transaction = Object.freeze({
+    type: 'eip1559' as const,
+    chainId: numericChainId(input.chainId),
+    nonce: nonce.toString(),
+    maxFeePerGas: maxFeePerGas.toString(),
+    maxPriorityFeePerGas: maxPriorityFeePerGas.toString(),
+    gasLimit: gasLimit.toString(),
+    to: account.address,
+    value: '0',
+    input: '0x',
+    accessList: Object.freeze([])
+  })
+  const annotation = await annotatePreparedNetworkFee({
+    chainId: input.chainId,
+    rpc: input.rpc,
+    signal: input.signal,
+    ...(input.executionAccount === undefined ? {} : { executionAccount: input.executionAccount }),
+    nativeBalance,
+    suggestedFeePerGasWei: suggestedPriority,
+    transaction
+  })
+  const prepared = Object.freeze({
     kind,
     chainId: input.chainId,
     addressIndex: account.addressIndex,
@@ -1403,20 +1724,12 @@ async function buildEvmSelfTransaction(
     recipient: account.address,
     amountRaw: '0',
     observedBlockNumber: blockNumber.toString(),
-    transaction: Object.freeze({
-      type: 'eip1559' as const,
-      chainId: numericChainId(input.chainId),
-      nonce: nonce.toString(),
-      maxFeePerGas: maxFeePerGas.toString(),
-      maxPriorityFeePerGas: maxPriorityFeePerGas.toString(),
-      gasLimit: gasLimit.toString(),
-      to: account.address,
-      value: '0',
-      input: '0x',
-      accessList: Object.freeze([])
-    }),
+    transaction,
+    ...annotation,
     createdAt: parseTimestamp((input.now ?? Date.now)())
   })
+  await simulatePreparedEvmTransaction(prepared, input.rpc, input.signal)
+  return prepared
 }
 
 export async function assertEvmTransferFresh(
@@ -1442,6 +1755,9 @@ export function createEvmSigningPreparePayload(
     kind: executionMode === 'private' ? 'pea-evm-transaction' : 'evm-transaction',
     chainId: prepared.chainId,
     addressIndex: prepared.addressIndex,
-    transaction: prepared.transaction
+    transaction: prepared.transaction,
+    l1DataFeeWei: prepared.l1DataFeeWei,
+    suggestedFeePerGasWei: prepared.suggestedFeePerGasWei,
+    priorityFeeElevated: prepared.priorityFeeElevated
   })
 }

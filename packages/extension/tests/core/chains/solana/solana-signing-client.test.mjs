@@ -256,6 +256,49 @@ test('preserves a failed simulation as a review warning context', async () => {
   await client.destroy()
 })
 
+test('refuses to confirm a Solana transaction that failed simulation', async () => {
+  const built = buildSolanaNativeTransfer({
+    chainId,
+    sender,
+    recipient,
+    recentBlockhash: 'SysvarC1ock11111111111111111111111111111111',
+    lamports: '1'
+  })
+  let confirmed = false
+  const failed = preparedValue('signing-command:solana:blocked-simulation')
+  failed.summary.review = { level: 'blocked', issues: [{ code: 'simulation-failed' }] }
+  failed.summary.fields.simulationStatus = 'failed'
+  const client = new SolanaMultichainSigningClient({
+    credentials: { getCredentialBinding: async () => binding },
+    rpc: {
+      assertExpectedChain: async () => {},
+      getAddressLookupTable: async () => null,
+      getFeeForMessage: async () => ({ contextSlot: 10, feeLamports: '5000' }),
+      simulateTransaction: async () => {
+        throw new SolanaSimulationError(11, 300)
+      }
+    },
+    createCommandId: () => 'keyring-command:solana-blocked-simulation',
+    forward: async (_method, forwardedPayload) => {
+      const command = parseKeyringCommand(decodeChromeRuntimeCommand(forwardedPayload.command))
+      if (command.operation === 'signing.confirm') confirmed = true
+      return createKeyringCommandSuccess(command.commandId, failed)
+    }
+  })
+  const prepared = await client.prepare(keyDomainId, {
+    kind: 'solana-transaction',
+    chainId,
+    accountIndex: 0,
+    transaction: built.transactionBase64
+  })
+  expect(prepared.summary.review.level).toBe('blocked')
+  await expect(client.confirm(keyDomainId, prepared.commandId)).rejects.toThrow(
+    /failed simulation and cannot be signed/
+  )
+  expect(confirmed).toBe(false)
+  await client.destroy()
+})
+
 test('fails closed when the simulation RPC itself is unavailable', async () => {
   const built = buildSolanaNativeTransfer({
     chainId,

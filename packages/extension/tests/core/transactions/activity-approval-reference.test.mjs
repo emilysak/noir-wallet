@@ -35,6 +35,26 @@ test('approval details match the token contract and network and preserve unknown
     getActivityApprovalDetails(
       {
         ...item,
+        snapshot: { ...item.snapshot, evm: { methodSelector: '0x39509351' } }
+      },
+      new Map()
+    ),
+    { methodLabel: 'Increase allowance' }
+  )
+  assert.deepEqual(
+    getActivityApprovalDetails(
+      {
+        ...item,
+        snapshot: { ...item.snapshot, evm: { methodSelector: '0xa457c2d7' } }
+      },
+      new Map()
+    ),
+    { methodLabel: 'Decrease allowance' }
+  )
+  assert.deepEqual(
+    getActivityApprovalDetails(
+      {
+        ...item,
         snapshot: { ...item.snapshot, evm: { methodSelector: '0x12345678' } }
       },
       new Map()

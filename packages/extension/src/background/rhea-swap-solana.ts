@@ -281,6 +281,12 @@ export class RheaSwapSolanaCoordinator {
         .catch(() => {})
       throw new Error('RHEA Swap Solana transaction does not match the active Account or metadata')
     }
+    if (prepared.summary.review?.level === 'blocked') {
+      await this.options.signer
+        .cancel(context.chainAccount.scope.keyDomainId, prepared.commandId)
+        .catch(() => {})
+      throw new Error('Solana transaction failed simulation and cannot be signed')
+    }
     const pending = parsePending({
       schemaVersion: 1,
       quoteHandle: plan.quoteHandle,

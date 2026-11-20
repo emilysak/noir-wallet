@@ -73,6 +73,13 @@ export interface BitcoinExternalSignatureRequired {
   readonly expiresAt: number
 }
 
+export interface BitcoinReviewRequired {
+  readonly status: 'review-required'
+  readonly transactionId: TransactionId
+  readonly payloadFingerprint: string
+  readonly expiresAt: number
+}
+
 export interface BitcoinExternalSigningRequest {
   readonly vendor: 'keystone' | 'ledger'
   readonly ledgerRequest?: Extract<LedgerBitcoinSigningRequest, { kind: 'psbt' }>
@@ -88,6 +95,7 @@ export interface BitcoinExternalSigningRequest {
 export type BitcoinTransferApprovalResult =
   | BitcoinTransferSubmission
   | BitcoinExternalSignatureRequired
+  | BitcoinReviewRequired
 
 export interface BitcoinTransferPrepareOptions {
   readonly nearIntentsBinding?: NearIntentsTransactionBinding
@@ -328,6 +336,26 @@ function parseApprovalResult(
   expectedTransactionId: TransactionId
 ): BitcoinTransferApprovalResult {
   const record = readRecord(value, 'Bitcoin transfer approval result')
+  if (record.status === 'review-required') {
+    assertExactKeys(
+      record,
+      ['status', 'transactionId', 'payloadFingerprint', 'expiresAt'],
+      'Bitcoin review update'
+    )
+    if (
+      record.transactionId !== expectedTransactionId ||
+      typeof record.payloadFingerprint !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(record.payloadFingerprint)
+    ) {
+      throw new Error('Bitcoin review update does not match its transaction')
+    }
+    return Object.freeze({
+      status: 'review-required' as const,
+      transactionId: expectedTransactionId,
+      payloadFingerprint: record.payloadFingerprint,
+      expiresAt: parseTimestamp(record.expiresAt)
+    })
+  }
   if (record.status !== 'external-signature-required') {
     return parseSubmission(value, expectedTransactionId)
   }

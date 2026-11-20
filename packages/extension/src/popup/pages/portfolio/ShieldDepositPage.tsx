@@ -56,6 +56,12 @@ import {
   useCopyToClipboard
 } from '@/popup/components/common/CopyToast'
 import { InlineError } from '@/popup/components/common/InlineError'
+import { WarningBox } from '@/popup/components/ui/WarningBox'
+import {
+  containsHiddenCharacters,
+  DEPOSIT_MEMO_HIDDEN_CHARACTER_WARNING,
+  revealHiddenCharacters
+} from '@/lib/unicode-display'
 
 type Picker = 'provider' | 'token' | null
 
@@ -724,32 +730,37 @@ function ShieldDepositContent() {
                     </button>
                   </div>
                   {viewedRecord.depositMemo && (
-                    <div className="mt-2 flex min-h-11 w-full items-center gap-2 rounded-lg bg-wallet-surface px-3">
-                      <span
-                        className="min-w-0 flex-1 truncate font-mono text-xs"
-                        title={viewedRecord.depositMemo}
-                      >
-                        Memo: {viewedRecord.depositMemo}
-                      </span>
-                      <button
-                        type="button"
-                        aria-label="Copy memo"
-                        disabled={!canPayShieldDeposit(viewedRecord, now)}
-                        onClick={() => {
-                          if (canPayShieldDeposit(viewedRecord, Date.now()))
-                            void copyToClipboard(
-                              viewedRecord.depositMemo!,
-                              `deposit-memo:${viewedRecord.depositId}`
-                            )
-                        }}
-                        className="wallet-interactive flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-white/10 px-2.5 text-xs enabled:hover:bg-white/15 enabled:active:bg-white/20 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-2 disabled:opacity-45"
-                      >
-                        <CopyFeedbackIcon
-                          copied={isCopied(`deposit-memo:${viewedRecord.depositId}`)}
-                          width={14}
-                        />
-                        {isCopied(`deposit-memo:${viewedRecord.depositId}`) ? 'Copied' : 'Copy'}
-                      </button>
+                    <div className="mt-2 space-y-2">
+                      {containsHiddenCharacters(viewedRecord.depositMemo) ? (
+                        <WarningBox>{DEPOSIT_MEMO_HIDDEN_CHARACTER_WARNING}</WarningBox>
+                      ) : null}
+                      <div className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-wallet-surface px-3">
+                        <span
+                          className="min-w-0 flex-1 truncate font-mono text-xs [unicode-bidi:isolate]"
+                          title={revealHiddenCharacters(viewedRecord.depositMemo)}
+                        >
+                          Memo: {revealHiddenCharacters(viewedRecord.depositMemo)}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label="Copy memo"
+                          disabled={!canPayShieldDeposit(viewedRecord, now)}
+                          onClick={() => {
+                            if (canPayShieldDeposit(viewedRecord, Date.now()))
+                              void copyToClipboard(
+                                viewedRecord.depositMemo!,
+                                `deposit-memo:${viewedRecord.depositId}`
+                              )
+                          }}
+                          className="wallet-interactive flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-white/10 px-2.5 text-xs enabled:hover:bg-white/15 enabled:active:bg-white/20 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-2 disabled:opacity-45"
+                        >
+                          <CopyFeedbackIcon
+                            copied={isCopied(`deposit-memo:${viewedRecord.depositId}`)}
+                            width={14}
+                          />
+                          {isCopied(`deposit-memo:${viewedRecord.depositId}`) ? 'Copied' : 'Copy'}
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>

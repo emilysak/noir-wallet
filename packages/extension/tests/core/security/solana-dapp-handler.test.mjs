@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
 import { BackgroundSolanaDAppHandler } from '../../../src/background/solana-dapp-handler.ts'
+import { buildSolanaNativeTransfer } from '../../../src/infrastructure/chains/solana/solana-transaction-builder.ts'
 
 const chainId = 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1'
 const address = 'HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk'
@@ -198,6 +199,42 @@ test('returns signed bytes without broadcasting and cancels rejected requests', 
   expect(rejected.calls.map(call => call[0])).toEqual(['prepare', 'approval', 'cancel'])
 })
 
+test('shows a reverted Solana simulation and does not sign it', async () => {
+  const state = harness()
+  state.signer.prepare = async (keyDomainId, payload) => {
+    state.calls.push(['prepare', keyDomainId, payload])
+    return {
+      commandId: 'signing-command:solana:reverted',
+      chainId,
+      operation: 'transaction',
+      summary: {
+        schema: 'solana.transaction.v1',
+        review: { level: 'blocked', issues: [{ code: 'simulation-failed' }] },
+        fields: { requiredSigners: [address] }
+      },
+      payloadFingerprint: { algorithm: 'sha256', digestHex: '11'.repeat(32) },
+      execution: { kind: 'internal' },
+      expiresAt: Date.now() + 60_000
+    }
+  }
+  await expect(
+    state.handler.request(
+      { method: 'signTransaction', params: [transaction] },
+      'https://dapp.example',
+      {}
+    )
+  ).rejects.toMatchObject({
+    code: 4200,
+    message: 'This transaction reverted in simulation and cannot be signed.'
+  })
+  expect(state.calls.map(call => call[0])).toEqual(['prepare', 'approval', 'cancel'])
+  expect(state.calls.some(call => call[0] === 'confirm')).toBe(false)
+  expect(state.calls[1][2].review.summary.review).toMatchObject({
+    level: 'blocked',
+    issues: [{ code: 'simulation-failed' }]
+  })
+})
+
 test('signs Solana transaction batches and messages', async () => {
   const batch = harness()
   await expect(
@@ -218,6 +255,31 @@ test('signs Solana transaction batches and messages', async () => {
     )
   ).resolves.toEqual({ signature: '1'.repeat(64), publicKey: address, address })
   expect(message.calls.find(call => call[0] === 'approval')[1]).toBe('solanaMessage')
+})
+
+test('rejects message signing when the bytes parse as a Solana transaction', async () => {
+  const built = buildSolanaNativeTransfer({
+    chainId,
+    sender: address,
+    recipient: 'SysvarRent111111111111111111111111111111111',
+    recentBlockhash: 'SysvarC1ock11111111111111111111111111111111',
+    lamports: '1'
+  })
+  const state = harness()
+  for (const payload of [built.transactionBase64, built.messageBase64]) {
+    await expect(
+      state.handler.request(
+        { method: 'signMessage', params: [payload] },
+        'https://dapp.example',
+        {}
+      )
+    ).rejects.toMatchObject({
+      code: 4200,
+      message: 'Noir Wallet rejected this Solana message because it parses as a transaction.'
+    })
+  }
+  expect(state.calls).toEqual([])
+  expect(state.analyticsEvents).toEqual([])
 })
 
 test('rejects malformed transactions and hardware signing before preparation', async () => {

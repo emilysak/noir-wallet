@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { approvalContextMatches } from '../../../src/background/approval-context-policy.ts'
-import { signApprovedDAppMessage } from '../../../src/background/dapp-message-signing.ts'
+import {
+  assertReviewedDAppSigningIdentity,
+  parseZcashSignMessageApproval,
+  resolveDAppMessageSigningMode,
+  signApprovedDAppMessage
+} from '../../../src/background/dapp-message-signing.ts'
 
 function approval(overrides = {}) {
   return {
@@ -88,4 +93,62 @@ test('all message signing modes bind their primary signature to the reviewed HD 
     { message: 'reviewed', accountIndex: 99, addressIndex: undefined },
     { message: 'reviewed', accountIndex: 3, addressIndex: undefined }
   ])
+})
+
+test('unofficial origins cannot select a message signing mode', () => {
+  const official = 'https://app.zknoir.com'
+  const unofficial = 'https://example.com'
+  assert.equal(resolveDAppMessageSigningMode(unofficial, undefined), 'current')
+  assert.equal(resolveDAppMessageSigningMode(unofficial, {}), 'current')
+  assert.equal(resolveDAppMessageSigningMode(unofficial, { signingMode: 'current' }), 'current')
+  assert.throws(
+    () => resolveDAppMessageSigningMode(unofficial, { signingMode: 'derived' }),
+    /cannot request a signing mode/
+  )
+  assert.throws(
+    () => resolveDAppMessageSigningMode(unofficial, { signingMode: 'legacy_index0' }),
+    /cannot request a signing mode/
+  )
+  assert.equal(resolveDAppMessageSigningMode(official, { signingMode: 'derived' }), 'derived')
+  assert.equal(
+    resolveDAppMessageSigningMode(official, { signingMode: 'legacy_index0' }),
+    'legacy_index0'
+  )
+  assert.throws(
+    () => resolveDAppMessageSigningMode(official, { signingMode: 'custom' }),
+    /signingMode/
+  )
+  assert.throws(() => resolveDAppMessageSigningMode(unofficial, 'derived'), /signing options/)
+})
+
+test('message approval requires the reviewed signing identity', () => {
+  assert.deepEqual(
+    parseZcashSignMessageApproval({
+      message: 'Sign in',
+      signingMode: 'current',
+      address: 't1example',
+      pubkey: '02abc'
+    }),
+    {
+      message: 'Sign in',
+      signingMode: 'current',
+      address: 't1example',
+      pubkey: '02abc'
+    }
+  )
+  assert.equal(parseZcashSignMessageApproval({ message: 'Sign in' }), null)
+  assert.doesNotThrow(() =>
+    assertReviewedDAppSigningIdentity(
+      { signingMode: 'current', address: 't1example', pubkey: '02abc' },
+      { signingMode: 'current', address: 't1example', pubkey: '02abc' }
+    )
+  )
+  assert.throws(
+    () =>
+      assertReviewedDAppSigningIdentity(
+        { signingMode: 'current', address: 't1example', pubkey: '02abc' },
+        { signingMode: 'derived', address: 't1example', pubkey: '02abc' }
+      ),
+    /signing identity changed/
+  )
 })

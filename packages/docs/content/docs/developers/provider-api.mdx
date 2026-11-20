@@ -216,8 +216,10 @@ user selects the fee in the wallet.
 shieldFunds(): Promise<string>
 ```
 
-No amount is accepted. Noir Wallet calculates the site's selected account's currently shieldable
-transparent funds, opens approval, and returns the transaction ID after broadcast.
+No amount is accepted. Noir Wallet shows the site's selected account's current shieldable
+transparent balance. That amount is the full confirmed balance and can change. Construction uses
+the approved amount; if the balance no longer matches, the request fails and must be approved again.
+The promise resolves to the transaction ID after broadcast.
 
 Confirmed funds must meet the wallet's minimum shielding threshold. Pending transparent funds are
 excluded. Ledger completes hardware signing in a separate tab. Keystone cannot sign the transparent
@@ -231,7 +233,8 @@ inputs required to complete a shield transaction.
 
 The default signing mode is `current`. Use `derived` for a privacy-preserving identity that is not
 the main transparent address. `legacy_index0` exists for integrations that require the legacy
-BIP-44 index 0 identity.
+BIP-44 index 0 identity. For `signMessage`, only the official Noir application can request a mode
+other than `current`.
 
 <Accordions type="single">
   <Accordion title="getPublicKey(options?) — Read a public identity" id="getpublickeyoptions">
@@ -264,8 +267,10 @@ console.log(signed.pubkey)
 console.log(signed.address)
 ```
 
-Opens signature approval. The message must be non-empty and at most 10,000 characters. The result
-also contains `signingMode` and, for a derived identity, `originAddress`.
+Opens signature approval. The message must be non-empty and at most 10,000 characters. The approval
+shows the signing mode, address, and public key. Only the official Noir application can request
+`derived` or `legacy_index0`; other sites must use `current`, and another requested mode is
+rejected. The result also contains `signingMode` and, for a derived identity, `originAddress`.
 
   </Accordion>
 

@@ -11,6 +11,12 @@ import {
   type SigningResult
 } from '@/core/keyring/ports'
 import { parseNearAccountId, parseNearBase58, parseNearPublicKey } from '@/core/chains/near'
+import {
+  NearFullAccessKeyDeletionRefused,
+  type NearFullAccessKeyDeletionGrant,
+  type NearFullAccessKeyDeletionIntent
+} from '@/infrastructure/chains/near/near-full-access-key-removal'
+import type { NearFullAccessKeyRemovalStore } from '@/infrastructure/chains/near/near-full-access-key-removal-store'
 import { parseChainId } from '@/core/chains/registry'
 import { ed25519 } from '@noble/curves/ed25519'
 import * as utils from 'near-api-js/lib/utils/index.js'
@@ -60,12 +66,84 @@ export interface NearSigningCredentialBindingProvider {
   ) => Promise<Extract<KeyringCommandBinding, { readonly kind: 'credential' }>>
 }
 
+export interface NearFullAccessKeyDeletionAuthorization {
+  readonly keyDomainId: KeyDomainId
+  readonly chainId: NearTransactionSigningPreparePayload['chainId']
+  readonly signerId: string
+  readonly deletedPublicKeys: readonly string[]
+  readonly signal?: AbortSignal
+}
+
 export interface NearMultichainSigningClientOptions {
   readonly credentials: NearSigningCredentialBindingProvider
   readonly ledger?: LedgerSigningBridge<LedgerNearSigningRequest, LedgerNearSigningResponse>
   readonly forward?: BackgroundMultichainForwarder
   readonly now?: () => number
   readonly createCommandId?: () => string
+  readonly authorizeFullAccessKeyDeletion?: (
+    input: NearFullAccessKeyDeletionAuthorization
+  ) => Promise<NearFullAccessKeyDeletionGrant | null>
+  readonly fullAccessKeyRemovals?: NearFullAccessKeyRemovalStore
+  readonly onFullAccessKeyRemovalRecorded?: () => void | Promise<void>
+}
+
+function samePublicKeys(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false
+  const expected = new Set(right)
+  return left.every(key => expected.has(key))
+}
+
+function deletedNearPublicKeys(payload: NearSigningPreparePayload): readonly string[] {
+  if (payload.kind !== 'near-transaction') return Object.freeze([])
+  const actions = payload.transaction.actions
+  if (!Array.isArray(actions)) throw new Error('NEAR transaction actions are invalid')
+  const keys = actions.map(action => {
+    if (typeof action !== 'object' || action === null || Array.isArray(action)) {
+      throw new Error('NEAR transaction action is invalid')
+    }
+    const record = action as Record<string, unknown>
+    if (record.type !== 'deleteKey') return null
+    return parseNearPublicKey(record.publicKey, 'NEAR deleteKey public key')
+  })
+  const deleted = keys.filter((key): key is string => key !== null)
+  if (new Set(deleted).size !== deleted.length) {
+    throw new NearFullAccessKeyDeletionRefused('NEAR full-access key deletion target is duplicated')
+  }
+  return Object.freeze(deleted)
+}
+
+function acceptedFullAccessKeyGrant(
+  signerId: string,
+  chainId: string,
+  requested: readonly string[],
+  grant: NearFullAccessKeyDeletionGrant | null
+): NearFullAccessKeyDeletionGrant | null {
+  if (grant === null) return null
+  if (grant.chainId !== chainId || grant.signerId !== signerId) {
+    throw new Error('NEAR full-access key deletion grant does not match the transaction')
+  }
+  const deletedPublicKeys = grant.deletedPublicKeys.map(key =>
+    parseNearPublicKey(key, 'NEAR full-access key deletion public key')
+  )
+  const retainedPublicKey = parseNearPublicKey(
+    grant.retainedPublicKey,
+    'NEAR full-access key deletion retained public key'
+  )
+  if (
+    deletedPublicKeys.length === 0 ||
+    new Set(deletedPublicKeys).size !== deletedPublicKeys.length ||
+    deletedPublicKeys.some(key => !requested.includes(key) || key === retainedPublicKey)
+  ) {
+    throw new NearFullAccessKeyDeletionRefused(
+      'NEAR full-access key deletion grant does not match the transaction'
+    )
+  }
+  return Object.freeze({
+    chainId,
+    signerId,
+    deletedPublicKeys: Object.freeze(deletedPublicKeys),
+    retainedPublicKey
+  })
 }
 
 function parseCanonicalBase64(value: unknown, label: string): string {
@@ -193,6 +271,13 @@ function parseCancelledSigning(value: unknown): boolean {
 export class NearMultichainSigningClient {
   private readonly commandClient: MultichainCommandClient
   private readonly confirming = new Set<SigningCommandId>()
+  private readonly deletionIntents = new Map<
+    SigningCommandId,
+    {
+      readonly keyDomainId: KeyDomainId
+      readonly intent: NearFullAccessKeyDeletionIntent
+    }
+  >()
   private readonly ledgerPending = new Map<
     SigningCommandId,
     {
@@ -218,11 +303,167 @@ export class NearMultichainSigningClient {
     )
   }
 
+  private async authorizeDeletion(
+    keyDomainId: KeyDomainId,
+    payload: NearSigningPreparePayload,
+    signal?: AbortSignal
+  ): Promise<NearFullAccessKeyDeletionGrant | null> {
+    const deletedPublicKeys = deletedNearPublicKeys(payload)
+    if (deletedPublicKeys.length === 0 || payload.kind !== 'near-transaction') return null
+    if (!this.options.authorizeFullAccessKeyDeletion || !this.options.fullAccessKeyRemovals) {
+      throw new NearFullAccessKeyDeletionRefused('NEAR full-access key deletion cannot be verified')
+    }
+    const signerId = parseNearAccountId(payload.transaction.signerId, 'NEAR signer account ID')
+    return acceptedFullAccessKeyGrant(
+      signerId,
+      payload.chainId,
+      deletedPublicKeys,
+      await this.options.authorizeFullAccessKeyDeletion({
+        keyDomainId,
+        chainId: payload.chainId,
+        signerId,
+        deletedPublicKeys,
+        ...(signal === undefined ? {} : { signal })
+      })
+    )
+  }
+
+  private async persistDeletionIntent(
+    keyDomainId: KeyDomainId,
+    prepared: PreparedSigningCommand,
+    grant: NearFullAccessKeyDeletionGrant
+  ): Promise<void> {
+    const store = this.options.fullAccessKeyRemovals
+    if (!store) {
+      throw new NearFullAccessKeyDeletionRefused('NEAR full-access key deletion cannot be verified')
+    }
+    const intent = Object.freeze({ ...grant, expiresAt: prepared.expiresAt })
+    try {
+      await store.saveIntent(prepared.commandId, intent)
+    } catch (error) {
+      this.ledgerPending.delete(prepared.commandId)
+      if (prepared.execution.kind === 'internal')
+        await this.cancelWorker(keyDomainId, prepared.commandId)
+      throw error
+    }
+    this.deletionIntents.set(prepared.commandId, Object.freeze({ keyDomainId, intent }))
+  }
+
+  private async cancelWorker(keyDomainId: KeyDomainId, commandId: SigningCommandId): Promise<void> {
+    const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
+    await this.commandClient
+      .execute(
+        {
+          operation: 'signing.cancel',
+          binding,
+          payload: { signingCommandId: commandId }
+        },
+        parseCancelledSigning
+      )
+      .catch(() => {})
+  }
+
+  private async abandonDeletion(
+    keyDomainId: KeyDomainId,
+    commandId: SigningCommandId
+  ): Promise<void> {
+    const ledger = this.ledgerPending.delete(commandId)
+    this.deletionIntents.delete(commandId)
+    await this.options.fullAccessKeyRemovals?.deleteIntent(commandId).catch(() => {})
+    if (!ledger) await this.cancelWorker(keyDomainId, commandId)
+  }
+
+  private async reauthorizeDeletion(
+    keyDomainId: KeyDomainId,
+    commandId: SigningCommandId,
+    signal?: AbortSignal
+  ): Promise<NearFullAccessKeyDeletionIntent | null> {
+    const remembered = this.deletionIntents.get(commandId)
+    const intent =
+      remembered?.intent ??
+      (await this.options.fullAccessKeyRemovals?.readIntent(commandId)) ??
+      null
+    if (!intent) return null
+    if (remembered && remembered.keyDomainId !== keyDomainId) {
+      throw new NearFullAccessKeyDeletionRefused('NEAR full-access key deletion scope changed')
+    }
+    if ((this.options.now?.() ?? Date.now()) >= intent.expiresAt) {
+      await this.abandonDeletion(keyDomainId, commandId)
+      throw new NearFullAccessKeyDeletionRefused(
+        'NEAR full-access key deletion authorization expired'
+      )
+    }
+    if (!this.options.authorizeFullAccessKeyDeletion) {
+      throw new NearFullAccessKeyDeletionRefused('NEAR full-access key deletion cannot be verified')
+    }
+    let grant: NearFullAccessKeyDeletionGrant | null
+    try {
+      grant = acceptedFullAccessKeyGrant(
+        intent.signerId,
+        intent.chainId,
+        intent.deletedPublicKeys,
+        await this.options.authorizeFullAccessKeyDeletion({
+          keyDomainId,
+          chainId: intent.chainId as NearFullAccessKeyDeletionAuthorization['chainId'],
+          signerId: intent.signerId,
+          deletedPublicKeys: intent.deletedPublicKeys,
+          ...(signal === undefined ? {} : { signal })
+        })
+      )
+    } catch (error) {
+      if (error instanceof NearFullAccessKeyDeletionRefused) {
+        await this.abandonDeletion(keyDomainId, commandId)
+      }
+      throw error
+    }
+    if (!grant || !samePublicKeys(grant.deletedPublicKeys, intent.deletedPublicKeys)) {
+      await this.abandonDeletion(keyDomainId, commandId)
+      throw new NearFullAccessKeyDeletionRefused(
+        'NEAR full-access key deletion is no longer authorized'
+      )
+    }
+    const updated = Object.freeze({ ...intent, retainedPublicKey: grant.retainedPublicKey })
+    this.deletionIntents.set(commandId, Object.freeze({ keyDomainId, intent: updated }))
+    return updated
+  }
+
+  private async recordDeletion(
+    commandId: SigningCommandId,
+    intent: NearFullAccessKeyDeletionIntent,
+    transactionId: string
+  ): Promise<void> {
+    const store = this.options.fullAccessKeyRemovals
+    if (!store) {
+      throw new NearFullAccessKeyDeletionRefused('NEAR full-access key deletion cannot be verified')
+    }
+    const recordedAt = this.options.now?.() ?? Date.now()
+    for (const deletedPublicKey of intent.deletedPublicKeys) {
+      await store.recordRemoval(
+        Object.freeze({
+          chainId: intent.chainId,
+          transactionId,
+          signerId: intent.signerId,
+          deletedPublicKey,
+          retainedPublicKey: intent.retainedPublicKey,
+          recordedAt
+        })
+      )
+    }
+    this.deletionIntents.delete(commandId)
+    await store.deleteIntent(commandId)
+    await this.options.onFullAccessKeyRemovalRecorded?.()
+  }
+
   async prepare(
     keyDomainId: KeyDomainId,
     payload: NearSigningPreparePayload,
     signal?: AbortSignal
   ): Promise<PreparedSigningCommand> {
+    const grant = await this.authorizeDeletion(keyDomainId, payload, signal)
+    const finish = async (prepared: PreparedSigningCommand) => {
+      if (grant) await this.persistDeletionIntent(keyDomainId, prepared, grant)
+      return prepared
+    }
     if (this.options.ledger) {
       const account = await this.options.ledger.resolveAccount(
         keyDomainId,
@@ -267,18 +508,20 @@ export class NearMultichainSigningClient {
           request,
           prepared
         })
-        return prepared
+        return finish(prepared)
       }
     }
     const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
-    return this.commandClient.execute(
-      {
-        operation: 'signing.prepare',
-        binding,
-        payload: payload as unknown as KeyringCommandPayload,
-        signal
-      },
-      value => parsePreparedNearSigning(value, payload)
+    return finish(
+      await this.commandClient.execute(
+        {
+          operation: 'signing.prepare',
+          binding,
+          payload: payload as unknown as KeyringCommandPayload,
+          signal
+        },
+        value => parsePreparedNearSigning(value, payload)
+      )
     )
   }
 
@@ -294,6 +537,14 @@ export class NearMultichainSigningClient {
       throw new Error('NEAR signing command is already confirming')
     this.confirming.add(commandId)
     try {
+      const deletion = await this.reauthorizeDeletion(keyDomainId, commandId, signal)
+      const complete = async (result: SigningResult) => {
+        if (deletion && result.kind === 'signed-payload') {
+          if (!result.transactionId) throw new Error('Signed NEAR transaction has no hash')
+          await this.recordDeletion(commandId, deletion, result.transactionId)
+        }
+        return result
+      }
       if (
         !this.ledgerPending.has(commandId) &&
         execution?.kind === 'external' &&
@@ -397,35 +648,37 @@ export class NearMultichainSigningClient {
           throw new Error('Ledger NEAR response signature is invalid')
         }
         if (pending.request.kind === 'near-nep413-message') {
-          return {
+          return complete({
             kind: 'signature',
             signature: { encoding: 'base64', value: response.signatureBase64 },
             publicKey: pending.account.publicKey,
             address: pending.account.address
-          }
+          })
         }
         const signed = await ledgerNearSignedTransaction(
           pending.request.payloadBase64,
           response.signatureBase64
         )
-        return {
+        return complete({
           kind: 'signed-payload',
           payload: { encoding: 'base64', value: signed.signedTransactionBase64 },
           transactionId: signed.transactionHash
-        }
+        })
       }
       if (execution?.kind === 'external') {
         throw new Error('Ledger NEAR approval session expired; prepare the transfer again')
       }
       const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
-      return this.commandClient.execute(
-        {
-          operation: 'signing.confirm',
-          binding,
-          payload: { signingCommandId: commandId },
-          signal
-        },
-        parseSignedNearResult
+      return complete(
+        await this.commandClient.execute(
+          {
+            operation: 'signing.confirm',
+            binding,
+            payload: { signingCommandId: commandId },
+            signal
+          },
+          parseSignedNearResult
+        )
       )
     } finally {
       this.confirming.delete(commandId)
@@ -437,6 +690,8 @@ export class NearMultichainSigningClient {
     commandId: SigningCommandId,
     signal?: AbortSignal
   ): Promise<void> {
+    this.deletionIntents.delete(commandId)
+    await this.options.fullAccessKeyRemovals?.deleteIntent(commandId).catch(() => {})
     if (this.ledgerPending.delete(commandId)) return
     const binding = await this.options.credentials.getCredentialBinding(keyDomainId)
     await this.commandClient.execute(

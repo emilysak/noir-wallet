@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { getDefaultEvmRpcEndpoint } from '../../../../src/config/rpc-endpoints.ts'
 import {
   DEFAULT_CHAIN_ENDPOINT_SETTINGS,
   parseCustomEvmNetwork,
   withActiveEvmChainId,
   withChainExplorer,
+  withChainRpcEndpoint,
+  withCustomEvmNetwork,
   withSavedChainRpcEndpoint
 } from '../../../../src/core/chains/chain-endpoint-settings.ts'
+import {
+  presentEvmRevocationLabel,
+  presentUntrustedRpcCheckValue,
+  resolveEvmRpcOrigin
+} from '../../../../src/core/chains/evm-rpc-origin.ts'
+import { buildCustomEvmNetwork } from '../../../../src/popup/services/custom-evm-network-model.ts'
 import {
   assertChainEndpointSettingsUnchanged,
   assertCustomEvmNetworksHaveNoPendingTransactions,
@@ -183,6 +192,70 @@ describe('custom EVM network settings', () => {
     assert.deepEqual(removed.overrides, [])
     assert.deepEqual(removed.savedRpcEndpoints, [])
     assert.equal(resolveActiveEvmNetworkConfig('testnet', removed).chainId, 'eip155:11155111')
+  })
+
+  it('classifies the RPC that will actually be queried', () => {
+    assert.equal(network.addedBy, undefined)
+    assert.equal(
+      resolveEvmRpcOrigin('mainnet', DEFAULT_CHAIN_ENDPOINT_SETTINGS, 'eip155:1'),
+      'builtin'
+    )
+    const preset = getDefaultEvmRpcEndpoint('mainnet', 'eip155:1')
+    const presetSettings = withChainRpcEndpoint(DEFAULT_CHAIN_ENDPOINT_SETTINGS, 'eip155:1', {
+      protocol: 'evm-json-rpc',
+      label: preset.label,
+      url: preset.url
+    })
+    assert.equal(resolveEvmRpcOrigin('mainnet', presetSettings, 'eip155:1'), 'builtin')
+
+    const userSettings = withChainRpcEndpoint(DEFAULT_CHAIN_ENDPOINT_SETTINGS, 'eip155:1', {
+      protocol: 'evm-json-rpc',
+      label: 'Private',
+      url: 'https://rpc.example/ethereum'
+    })
+    assert.equal(resolveEvmRpcOrigin('mainnet', userSettings, 'eip155:1'), 'user')
+    assert.equal(
+      resolveEvmNetworkCatalog('mainnet', userSettings).find(item => item.chainId === 'eip155:1')
+        .rpcOrigin,
+      'user'
+    )
+
+    const legacySettings = withCustomEvmNetwork(DEFAULT_CHAIN_ENDPOINT_SETTINGS, network)
+    assert.equal(resolveEvmRpcOrigin('mainnet', legacySettings, network.chainId), 'user')
+
+    const dapp = parseCustomEvmNetwork({ ...network, addedBy: 'dapp' })
+    assert.equal(dapp.addedBy, 'dapp')
+    const dappSettings = withCustomEvmNetwork(DEFAULT_CHAIN_ENDPOINT_SETTINGS, dapp)
+    assert.equal(resolveEvmRpcOrigin('mainnet', dappSettings, dapp.chainId), 'dapp')
+    const replaced = withChainRpcEndpoint(dappSettings, dapp.chainId, {
+      protocol: 'evm-json-rpc',
+      label: 'Other',
+      url: 'https://rpc.example/local'
+    })
+    assert.equal(resolveEvmRpcOrigin('mainnet', replaced, dapp.chainId), 'user')
+    assert.throws(() => parseCustomEvmNetwork({ ...network, addedBy: 'registry' }), /source/)
+
+    const saved = buildCustomEvmNetwork(
+      {
+        name: 'Local EVM',
+        chainId: '31337',
+        currencyName: 'Local Ether',
+        currencySymbol: 'LETH',
+        decimals: '18',
+        rpcUrl: 'http://localhost:8545',
+        explorerUrl: ''
+      },
+      'mainnet'
+    )
+    assert.equal(saved.network.addedBy, 'user')
+    assert.equal(presentUntrustedRpcCheckValue('Simulation', 'Success'), 'UNKNOWN')
+    assert.equal(presentUntrustedRpcCheckValue('Balance check', 'Success'), 'UNKNOWN')
+    assert.equal(presentUntrustedRpcCheckValue('Authorization check', 'Verified'), 'UNKNOWN')
+    assert.equal(presentUntrustedRpcCheckValue('Node', 'Unverified node'), 'Unverified node')
+    assert.equal(presentEvmRevocationLabel(undefined), 'Revoked')
+    assert.equal(presentEvmRevocationLabel('builtin'), 'Revoked')
+    assert.equal(presentEvmRevocationLabel('user'), 'UNKNOWN')
+    assert.equal(presentEvmRevocationLabel('dapp'), 'UNKNOWN')
   })
 
   it('accepts management commands only from trusted extension pages', () => {

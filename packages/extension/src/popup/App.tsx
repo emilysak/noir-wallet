@@ -37,6 +37,7 @@ import { UnlockPage } from './pages/onboarding/UnlockPage'
 // Account Pages
 import { AccountList } from './pages/account/AccountList'
 import { AccountDetail } from './pages/account/AccountDetail'
+import { TokenApprovals } from './pages/account/TokenApprovals'
 import { ManageAccountNetworksPage } from './pages/account/ManageAccountNetworksPage'
 import { AddressesList } from './pages/account/AddressesList'
 import { ZcashSettings } from './pages/account/ZcashSettings'
@@ -67,6 +68,7 @@ import { KeystoneEvmSignPage } from './pages/hardware/KeystoneEvmSignPage'
 // DApp Pages
 import { ApprovalPage } from './pages/dapp/ApprovalPage'
 import { EvmWalletChoice } from './pages/dapp/EvmWalletChoice'
+import { SiteInterceptPage } from './pages/dapp/SiteInterceptPage'
 import { DAppConnections } from './pages/dapp/DAppConnections'
 
 // Settings Pages
@@ -243,6 +245,7 @@ function AppRoutes() {
       <Route path="/asset-detail" element={<AssetDetail />} />
       <Route path="/account-list" element={<AccountList />} />
       <Route path="/account-detail" element={<AccountDetail />} />
+      <Route path="/token-approvals" element={<TokenApprovals />} />
       <Route path="/account-networks" element={<ManageAccountNetworksPage />} />
       <Route path="/add-wallet" element={<AddWalletEntry />} />
       <Route path="/import-wallet" element={<ImportWalletEntry />} />
@@ -446,16 +449,19 @@ function App() {
   }
 
   const initialPath = getInitialPath()
-  const isEvmWalletChoice = initialPath.split('?')[0] === '/evm-wallet-choice'
+  const isolatedPath = initialPath.split('?')[0]
+  const isEvmWalletChoice = isolatedPath === '/evm-wallet-choice'
+  const isSiteIntercept = isolatedPath === '/site-intercept'
 
   return (
     <RouterProvider initialPath={initialPath}>
       <ModalProvider>
         <DialogProvider>
-          {isEvmWalletChoice ? (
+          {isEvmWalletChoice || isSiteIntercept ? (
             <div className="flex h-full w-full items-center justify-center bg-background">
               <Routes>
                 <Route path="/evm-wallet-choice" element={<EvmWalletChoice />} />
+                <Route path="/site-intercept" element={<SiteInterceptPage />} />
               </Routes>
             </div>
           ) : (

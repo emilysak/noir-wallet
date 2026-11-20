@@ -3,10 +3,13 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { mapWasmAccountBalanceToZcashBalance } from '../../../src/core/wallet/balance-summary.ts'
 import {
+  assertApprovedShieldAmount,
   canShieldTransparentFunds,
   getShieldableTransparentBalance,
   getShieldInputAmountFromHistory,
-  MIN_SHIELDING_BALANCE_MESSAGE
+  MIN_SHIELDING_BALANCE_MESSAGE,
+  SHIELD_BALANCE_CHANGED_MESSAGE,
+  transparentShieldAmountZats
 } from '../../../src/core/zcash/shielding.ts'
 import {
   getZcashTransparentToShieldMoveAmountError,
@@ -31,6 +34,7 @@ const approvalSource = readSource('../../../src/popup/pages/dapp/ApprovalPage.ts
 const backgroundSource = readSource('../../../src/background/index.ts')
 const dappHandlerSource = readSource('../../../src/background/dapp-handler.ts')
 const walletRpcErrorsSource = readSource('../../../src/core/zcash/wallet-rpc-errors.ts')
+const workerSource = readSource('../../../src/core/worker/zcash.worker.ts')
 
 describe('Shielding minimum balance regressions', () => {
   it('excludes pending transparent funds from the shield amount', () => {
@@ -106,6 +110,47 @@ describe('Shielding minimum balance regressions', () => {
     )
     const transactionCreation = shieldHookSource.indexOf("type: 'ADD_TRANSACTION'")
     assert.ok(validation !== -1 && validation < transactionCreation)
+  })
+
+  it('binds the approved dApp shield amount and asks for review when it changes', () => {
+    assert.equal(transparentShieldAmountZats('0.00328475'), '328475')
+    assert.doesNotThrow(() => assertApprovedShieldAmount('328475', '328475'))
+    assert.doesNotThrow(() => assertApprovedShieldAmount('400000', '328475'))
+    assert.throws(
+      () => assertApprovedShieldAmount('328475', '400000'),
+      error => error instanceof Error && error.message === SHIELD_BALANCE_CHANGED_MESSAGE
+    )
+    assert.throws(
+      () => transparentShieldAmountZats('0.003284751'),
+      error =>
+        error instanceof Error &&
+        error.message === 'Approved shield amount is unavailable. Review the shield request again.'
+    )
+
+    const dappShieldHandler = dappHandlerSource.slice(
+      dappHandlerSource.indexOf('private async shieldFunds'),
+      dappHandlerSource.indexOf('private async getTransactionHistory')
+    )
+    const approvedCheck = dappShieldHandler.indexOf('assertApprovedShieldAmount')
+    const dappShieldCall = dappShieldHandler.indexOf('walletCore.shieldFunds')
+    assert.ok(approvedCheck !== -1 && dappShieldCall !== -1 && approvedCheck < dappShieldCall)
+    assert.match(dappShieldHandler, /approvedShieldAmountZats/)
+    assert.match(approvalSource, /The amount can change/)
+
+    const workerShield = workerSource.slice(
+      workerSource.indexOf("case 'transaction.oneclick_shield'"),
+      workerSource.indexOf("case 'transaction.estimateFee'")
+    )
+    const workerCheck = workerShield.indexOf('assertApprovedShieldAmount')
+    const workerBuild = workerShield.indexOf('oneclick_pczt_shield_dynamic_fee')
+    const freshSummary = workerShield.indexOf('requireFreshWalletSummary')
+    assert.ok(workerCheck !== -1 && workerBuild !== -1 && workerCheck < workerBuild)
+    assert.ok(freshSummary !== -1 && freshSummary < workerBuild)
+    assert.doesNotMatch(workerShield, /getSummaryOrCached/)
+    assert.match(
+      workerSource,
+      /summaryGateClosed\.has\(walletId\)[\s\S]*Approved shield amount is unavailable/
+    )
   })
 
   it('blocks dApp approval and both background execution paths below the minimum', () => {

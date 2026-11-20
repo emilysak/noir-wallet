@@ -369,6 +369,89 @@ export class BitcoinTransferPreparationCoordinator {
     }
   }
 
+  async reselectIfInputsUnavailable(input: {
+    readonly chainAccount: PrepareBitcoinTransferFromDiscoveryInput['chainAccount']
+    readonly accountIndex: PrepareBitcoinTransferFromDiscoveryInput['accountIndex']
+    readonly addressType: BitcoinSupportedAddressType
+    readonly transactionId: TransactionId
+    readonly recipient: string
+    readonly amountSats: string
+    readonly feeRateSatsPerVbyte: number
+    readonly reservedOutpoints: readonly { transactionId: string; outputIndex: number }[]
+    readonly hasChangeReservation: boolean
+    readonly ledgerAccount: boolean
+    readonly signal?: AbortSignal
+  }): Promise<PreparedBitcoinTransferPlan | null> {
+    const scope = parseScope({
+      chainAccount: input.chainAccount,
+      accountIndex: input.accountIndex
+    })
+    const chainId = parseBitcoinChain(scope.chainAccount.scope.chainId)
+    const state = await this.options.discoveryRepository.get(scope)
+    if (state === null) return null
+    const ledgerRoot = input.ledgerAccount
+      ? bitcoinAccountRootFromPath(scope.chainAccount.derivation.path, chainId, 'p2wpkh', false, 0)
+      : undefined
+    const observations = state.observations.map(value => parseObservation(value, scope))
+    const unavailableOutpoints = new Set(
+      (await this.options.inputReservations.list({ ...scope, addressType: input.addressType }))
+        .filter(reservation => reservation.transactionId !== input.transactionId)
+        .flatMap(reservation =>
+          reservation.outpoints.map(outpoint => `${outpoint.transactionId}:${outpoint.outputIndex}`)
+        )
+    )
+    const spendable = new Set(
+      collectBitcoinSpendableUtxos(observations, input.addressType, ledgerRoot)
+        .filter(utxo => !unavailableOutpoints.has(`${utxo.transactionId}:${utxo.outputIndex}`))
+        .map(utxo => `${utxo.transactionId}:${utxo.outputIndex}`)
+    )
+    if (
+      input.reservedOutpoints.every(outpoint =>
+        spendable.has(`${outpoint.transactionId}:${outpoint.outputIndex}`)
+      )
+    ) {
+      return null
+    }
+    await this.options.inputReservations.release(
+      {
+        chainAccount: input.chainAccount,
+        accountIndex: input.accountIndex,
+        addressType: input.addressType
+      },
+      input.transactionId
+    )
+    if (input.hasChangeReservation && this.options.changeReservations) {
+      try {
+        await this.options.changeReservations.abandon(
+          {
+            chainAccount: input.chainAccount,
+            accountIndex: input.accountIndex,
+            addressType: input.addressType
+          },
+          input.transactionId
+        )
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          error.message !== 'Bitcoin change reservation is missing'
+        ) {
+          throw error
+        }
+      }
+    }
+    return this.prepare({
+      chainAccount: input.chainAccount,
+      accountIndex: input.accountIndex,
+      transactionId: input.transactionId,
+      addressType: input.addressType,
+      recipient: input.recipient,
+      amount: { mode: 'exact', valueSats: input.amountSats },
+      feeRateSatsPerVbyte: input.feeRateSatsPerVbyte,
+      ledgerAccount: input.ledgerAccount,
+      signal: input.signal
+    })
+  }
+
   private async changeOutputPosition(
     transactionId: TransactionId
   ): Promise<BitcoinChangeOutputPosition> {

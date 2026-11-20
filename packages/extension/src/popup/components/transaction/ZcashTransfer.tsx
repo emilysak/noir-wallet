@@ -63,7 +63,16 @@ import {
 } from '@/lib/number-format'
 import { cn } from '@/lib/utils'
 import { AmountDisplay } from '@/popup/components/common/AmountDisplay'
+import { AddressPoisoningNotice } from '@/popup/components/transaction/AddressPoisoningNotice'
 import { TransactionReviewView } from '@/popup/components/transaction/TransactionReviewView'
+import {
+  addressPoisoningNeedsCaution,
+  useAddressPoisoningWarning
+} from '@/popup/services/use-address-poisoning'
+import {
+  containsHiddenCharacters,
+  MEMO_DRAFT_HIDDEN_CHARACTER_WARNING
+} from '@/lib/unicode-display'
 import { BalanceDomainTabs } from '@/popup/components/account/BalanceDomainTabs'
 import { ChainIcon } from '../../components/common/ChainIcon'
 import nearLogo from '@/images/figma-near-confidential.svg'
@@ -420,6 +429,11 @@ export function ZcashTransfer({
   const setFeeTier = useSettingsStore(state => state.setFeeTier)
 
   const fromAddress = currentAccount?.addresses[fundingSource] || ''
+  const addressPoisoning = useAddressPoisoningWarning(
+    showReview && !isSelfMove && effectiveToAddress && effectiveToAddress !== fromAddress
+      ? { chainId: getZcashChainId(currentNetwork), address: effectiveToAddress }
+      : null
+  )
   const fundingOptions = getFundingSourceOptions(
     balance,
     currentAccount?.addresses ?? {},
@@ -1286,8 +1300,13 @@ export function ZcashTransfer({
             }}
             placeholder="Add a private memo"
             rows={2}
-            className="w-full resize-none rounded-xl border border-border/60 bg-card/50 px-4 py-3 text-sm placeholder:text-muted/50 focus:border-primary/50 focus:outline-none disabled:opacity-40"
+            className="w-full resize-none rounded-xl border border-border/60 bg-card/50 px-4 py-3 text-sm [unicode-bidi:isolate] placeholder:text-muted/50 focus:border-primary/50 focus:outline-none disabled:opacity-40"
           />
+          {containsHiddenCharacters(memo) && (
+            <p role="status" className="mt-1 px-1 text-xs text-warning">
+              {MEMO_DRAFT_HIDDEN_CHARACTER_WARNING}
+            </p>
+          )}
           {memoUnsupported && (
             <p id="zcash-send-memo-error" role="alert" className="mt-1 px-1 text-xs text-warning">
               This recipient cannot receive a memo.
@@ -1735,15 +1754,22 @@ export function ZcashTransfer({
               }
             ]}
             afterRows={
-              reviewedMoveQuote && (
-                <QuoteReviewChanges
-                  changes={moveReviewStatus.changes}
-                  output={{
-                    decimals: reviewedMoveQuote.destinationDecimals,
-                    symbol: reviewedMoveQuote.destinationSymbol
-                  }}
-                />
-              )
+              reviewedMoveQuote || addressPoisoningNeedsCaution(addressPoisoning) ? (
+                <>
+                  {reviewedMoveQuote ? (
+                    <QuoteReviewChanges
+                      changes={moveReviewStatus.changes}
+                      output={{
+                        decimals: reviewedMoveQuote.destinationDecimals,
+                        symbol: reviewedMoveQuote.destinationSymbol
+                      }}
+                    />
+                  ) : null}
+                  {addressPoisoningNeedsCaution(addressPoisoning) ? (
+                    <AddressPoisoningNotice />
+                  ) : null}
+                </>
+              ) : undefined
             }
             error={
               isConfidentialMove && !moveReviewReady && !moveReviewStatus.acceptLabel ? (
@@ -1767,7 +1793,8 @@ export function ZcashTransfer({
             confirmLabel={
               isHardwareSigning
                 ? 'Waiting for wallet...'
-                : (moveReviewStatus.acceptLabel ?? 'Confirm')
+                : (moveReviewStatus.acceptLabel ??
+                  (addressPoisoningNeedsCaution(addressPoisoning) ? 'Send anyway' : 'Confirm'))
             }
             confirmTone={moveReviewStatus.acceptLabel ? 'warning' : 'default'}
             preparing={showReview && !syncBlocked && (moveQuoteLoading || feeCalculating)}
@@ -1780,7 +1807,8 @@ export function ZcashTransfer({
               reviewInsufficient ||
               !feeReady ||
               syncBlocked ||
-              isHardwareSigning
+              isHardwareSigning ||
+              addressPoisoning === 'pending'
             }
             cancelDisabled={isConfirming || isHardwareSigning}
             onCancel={() => {

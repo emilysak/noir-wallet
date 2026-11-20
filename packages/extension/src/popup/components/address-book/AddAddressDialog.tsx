@@ -1,4 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { assessAddressPoisoning } from '@/core/security/address-poisoning'
+import { AddressPoisoningNotice } from '@/popup/components/transaction/AddressPoisoningNotice'
+import { evmWalletClient } from '@/popup/services/evm-wallet-client'
 import { Icon } from '@iconify/react'
 import evmGroupIcon from '@/images/figma-evm-group.svg'
 import { Button } from '@/popup/components/ui/button'
@@ -37,9 +40,15 @@ export function AddAddressDialog({
 }) {
   const addContact = useAddressBookStore(state => state.addContact)
   const getExactContact = useAddressBookStore(state => state.getExactContact)
+  const contacts = useAddressBookStore(state => state.contacts)
   const [name, setName] = useState('')
   const [address, setAddress] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [checkingSimilarity, setCheckingSimilarity] = useState(false)
+  const [similarWarning, setSimilarWarning] = useState(false)
+  const similarityRequest = useRef(0)
+  const dialogOpen = useRef(open)
+  dialogOpen.current = open
   const [showNetworks, setShowNetworks] = useState(false)
   const [evmChainId, setEvmChainId] = useState<string>(ALL_EVM_NETWORKS_CHOICE.chainId)
   const initialNetwork = networks.find(choice => choice.chainId === initialChainId)
@@ -74,37 +83,101 @@ export function AddAddressDialog({
   }, [detectedNetwork?.family])
 
   useEffect(() => {
-    if (!open) return
+    return () => {
+      similarityRequest.current += 1
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!open) {
+      similarityRequest.current += 1
+      return
+    }
     setName('')
     setAddress('')
     setError(null)
+    setCheckingSimilarity(false)
+    setSimilarWarning(false)
     setShowNetworks(false)
     setEvmChainId(ALL_EVM_NETWORKS_CHOICE.chainId)
   }, [open, initialChainId])
 
+  const handleOpenChange = (next: boolean) => {
+    if (!next) similarityRequest.current += 1
+    onOpenChange(next)
+  }
+
+  const saveContact = () => {
+    if (!dialogOpen.current || !network) return
+    addContact({
+      chainId: network.chainId,
+      chainFamily: network.family,
+      network: DEFAULT_NETWORK,
+      networkName: network.name,
+      address: address.trim(),
+      name: name.trim()
+    })
+    onOpenChange(false)
+  }
+
   const save = () => {
-    if (!network || !name.trim() || !address.trim()) return
+    if (!network || !name.trim() || !address.trim() || checkingSimilarity) return
     try {
       if (getExactContact(network.chainId, address)) {
         setError('This address is already saved on this network')
         return
       }
-      addContact({
-        chainId: network.chainId,
-        chainFamily: network.family,
-        network: DEFAULT_NETWORK,
-        networkName: network.name,
-        address: address.trim(),
-        name: name.trim()
-      })
-      onOpenChange(false)
+      if (similarWarning) {
+        saveContact()
+        return
+      }
+      const candidate = { chainId: network.chainId, address: address.trim() }
+      const savedContacts = contacts
+        .filter(contact => contact.network === DEFAULT_NETWORK)
+        .map(contact => ({ chainId: contact.chainId, address: contact.address }))
+      const request = similarityRequest.current + 1
+      similarityRequest.current = request
+      setCheckingSimilarity(true)
+      void evmWalletClient
+        .getActivity('read')
+        .then(model =>
+          assessAddressPoisoning({
+            candidate,
+            activity: model?.items ?? [],
+            plantedRecipients: model?.plantedRecipients ?? [],
+            plantedSenders: model?.plantedSenders ?? [],
+            contacts: savedContacts
+          })
+        )
+        .catch(() =>
+          assessAddressPoisoning({
+            candidate,
+            activity: [],
+            contacts: savedContacts
+          })
+        )
+        .then(warning => {
+          if (!dialogOpen.current || similarityRequest.current !== request) return
+          if (warning) {
+            setSimilarWarning(true)
+            return
+          }
+          saveContact()
+        })
+        .catch(cause => {
+          if (similarityRequest.current !== request) return
+          setError(cause instanceof Error ? cause.message : 'Unable to save address')
+        })
+        .finally(() => {
+          if (similarityRequest.current === request) setCheckingSimilarity(false)
+        })
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Unable to save address')
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
         position="bottom"
         className={cn(
@@ -144,6 +217,9 @@ export function AddAddressDialog({
               onChange={event => {
                 setAddress(event.target.value)
                 setError(null)
+                setSimilarWarning(false)
+                setCheckingSimilarity(false)
+                similarityRequest.current += 1
               }}
               onBlur={() => {
                 if (address.trim() && !network) {
@@ -184,6 +260,7 @@ export function AddAddressDialog({
               </div>
             )}
           </div>
+          {similarWarning && <AddressPoisoningNotice />}
           {error && (
             <p role="alert" className="text-xs text-danger">
               {error}
@@ -193,10 +270,10 @@ export function AddAddressDialog({
         <div className={cn('p-5', fullHeight && 'mt-auto')}>
           <Button
             className="w-full"
-            disabled={!network || !name.trim() || !address.trim()}
+            disabled={!network || !name.trim() || !address.trim() || checkingSimilarity}
             onClick={save}
           >
-            Save address
+            {similarWarning ? 'Save anyway' : 'Save address'}
           </Button>
         </div>
         <ChainSelector
@@ -207,6 +284,9 @@ export function AddAddressDialog({
           onSelect={id => {
             setEvmChainId(id)
             setError(null)
+            setSimilarWarning(false)
+            setCheckingSimilarity(false)
+            similarityRequest.current += 1
           }}
         />
       </DialogContent>

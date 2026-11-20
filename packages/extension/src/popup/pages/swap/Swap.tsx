@@ -195,6 +195,7 @@ import {
   type QuoteDepositExecutionMode,
   type PreparedQuoteDepositTransfer
 } from '@/popup/services/quote-deposit-transfer-client'
+import { bitcoinWalletClient } from '@/popup/services/bitcoin-wallet-client'
 import {
   receiveTargetsClient,
   type AdditionalReceiveTargetsView
@@ -312,6 +313,19 @@ type PendingRheaSigningReview =
   | Readonly<{ kind: 'solana-transaction'; review: RheaSwapSolanaTransactionReview }>
   | Readonly<{ kind: 'near-transaction-batch'; review: RheaSwapNearTransactionBatchReview }>
 
+function quoteFeeExceedsReviewed(
+  actualFeeZats: string | number | null | undefined,
+  reviewedFeeZats: string | number | null | undefined
+): boolean {
+  if (actualFeeZats === null || actualFeeZats === undefined) return true
+  if (reviewedFeeZats === null || reviewedFeeZats === undefined) return true
+  try {
+    return BigInt(actualFeeZats) > BigInt(reviewedFeeZats)
+  } catch {
+    return true
+  }
+}
+
 function sameNativeZecDestination(
   left: NativeZecIntentsSwapReview['destination'],
   right: NativeZecIntentsSwapReview['destination']
@@ -322,6 +336,12 @@ function sameNativeZecDestination(
     left.protocolAssetId === right.protocolAssetId &&
     left.recipient === right.recipient
   )
+}
+
+function bitcoinPreparedInputCount(prepared: PreparedQuoteDepositTransfer | null): number | null {
+  if (prepared?.family !== 'bitcoin') return null
+  const summary = prepared.review.review.summary
+  return summary.schema === 'bitcoin.psbt.v1' ? summary.fields.inputs.length : null
 }
 
 export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-send' }) {
@@ -788,6 +808,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
   const feeConfirmationInFlight = useRef(false)
   const [isPrivateFundingSubmitting, setIsPrivateFundingSubmitting] = useState(false)
   const [transferPreparationError, setTransferPreparationError] = useState<string | null>(null)
+  const [bitcoinInputReviewNotice, setBitcoinInputReviewNotice] = useState<string | null>(null)
   const [networkFeeTier, setNetworkFeeTier] = useState<NetworkFeeTier>(DEFAULT_NETWORK_FEE_TIER)
   const [evmMoveFeeSelection, setEvmMoveFeeSelection] = useState<EvmFeeSelection>({
     kind: 'tier',
@@ -4283,7 +4304,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
         })
         if (
           estimate.feeQuote.id !== feeQuote.id ||
-          estimate.feeZats !== String(selectedFee.feeZats) ||
+          quoteFeeExceedsReviewed(estimate.feeZats, selectedFee.feeZats) ||
           sequence !== quoteRequestSequence.current ||
           latestFee.current.feeSelectionKey !== feeKey ||
           review.expiresAt <= Date.now() + 5_000
@@ -4577,7 +4598,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             latestFee.current.feeSelectionKey !== reviewedKey ||
             !latestFee.current.ready ||
             latestFee.current.feeQuote?.id !== reviewedFeeQuote.id ||
-            latestFee.current.feeZats !== reviewedFee.feeZats ||
+            quoteFeeExceedsReviewed(latestFee.current.feeZats, reviewedFee.feeZats) ||
             currentQuote.id !== reviewedFeeQuote.id ||
             reviewedFeeQuote.expiresAt <= Date.now()
           ) {
@@ -4623,13 +4644,13 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           })
           if (
             updatedEstimate.feeQuote.id !== reviewedFeeQuote.id ||
-            updatedEstimate.feeZats !== String(reviewedFee.feeZats) ||
+            quoteFeeExceedsReviewed(updatedEstimate.feeZats, reviewedFee.feeZats) ||
             Number(updatedEstimate.marginalFeeZats) !== marginalFeeZats ||
             updatedEstimate.feeQuote.expiresAt <= Date.now() ||
             latestFee.current.feeSelectionKey !== reviewedKey ||
             !latestFee.current.ready ||
             latestFee.current.feeQuote?.id !== reviewedFeeQuote.id ||
-            latestFee.current.feeZats !== reviewedFee.feeZats ||
+            quoteFeeExceedsReviewed(latestFee.current.feeZats, reviewedFee.feeZats) ||
             reviewSequence !== quoteRequestSequence.current
           ) {
             feeEstimate.retry()
@@ -4856,10 +4877,39 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
       setIsSending(true)
       try {
         const submission = await quoteDepositTransferClient.approve(preparedQuoteTransfer)
+        const approved = submission.value
+        if (approved.status === 'review-required') {
+          if (submission.family !== 'bitcoin' || preparedQuoteTransfer.family !== 'bitcoin') {
+            throw new Error('The Bitcoin inputs changed. Review the transaction again.')
+          }
+          const latest = await bitcoinWalletClient.getPendingTransfer(approved.transactionId)
+          const summary = latest?.review.summary
+          if (
+            !latest ||
+            latest.graph.root.id !== preparedQuoteTransfer.review.graph.root.id ||
+            latest.review.payloadFingerprint.digestHex !== approved.payloadFingerprint ||
+            summary?.schema !== 'bitcoin.psbt.v1'
+          ) {
+            await quoteDepositTransferClient.reject(preparedQuoteTransfer).catch(() => {})
+            pendingQuoteTransfer.current = null
+            setPreparedQuoteTransfer(null)
+            throw new Error('The Bitcoin inputs changed. Review the transaction again.')
+          }
+          const replacement = Object.freeze({
+            family: 'bitcoin' as const,
+            source: preparedQuoteTransfer.source,
+            review: latest
+          })
+          pendingQuoteTransfer.current = replacement
+          setPreparedQuoteTransfer(replacement)
+          setBitcoinInputReviewNotice('The Bitcoin inputs changed. Review the transaction again.')
+          return
+        }
+        setBitcoinInputReviewNotice(null)
         pendingQuoteTransfer.current = null
         setPreparedQuoteTransfer(null)
-        if (submission.value.status === 'external-signature-required') {
-          const approvalTransactionId = submission.value.transactionId
+        if (approved.status === 'external-signature-required') {
+          const approvalTransactionId = approved.transactionId
           try {
             if (pendingRheaEvmAfterApproval) {
               if (
@@ -4909,7 +4959,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           return
         }
         if (pendingRheaEvmAfterApproval) {
-          if (submission.value.status !== 'broadcast') {
+          if (approved.status !== 'broadcast') {
             setIsPrivateFundingSubmitting(false)
             setPendingRheaEvmAfterApproval(null)
             setViewStep('input')
@@ -4923,7 +4973,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             return
           }
           setSubmittedApproval({
-            graph: submission.value.graph,
+            graph: approved.graph,
             owner: preparedQuoteTransfer.source.refundAddress,
             executionMode: executionSourceMode,
             ...pendingRheaEvmAfterApproval.approval
@@ -4933,7 +4983,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           setViewStep('approval-pending')
           return
         }
-        if (!isTransferAnalyticsFlow && hasSubmittedRheaOrigin(submission.value.graph)) {
+        if (!isTransferAnalyticsFlow && hasSubmittedRheaOrigin(approved.graph)) {
           sendAnalyticsEvent(ANALYTICS_EVENTS.SWAP_DEPOSIT_SENT, {
             ...submitBase,
             collector: { ...submitBase.collector, settlement: 'broadcast' },
@@ -4941,11 +4991,11 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             idempotencyKey: `rhea-initiated:${quoteResult.quoteHandle}`
           })
         }
-        const origin = submission.value.graph.segments.find(segment => segment.role === 'origin')
+        const origin = approved.graph.segments.find(segment => segment.role === 'origin')
         navigateToSwapResult(
           origin?.evidence?.transactionHash,
           getChainFromAssetId(swap.tokenIn?.assetId || ''),
-          submission.value.graph.root.id
+          approved.graph.root.id
         )
       } catch (error) {
         if (!pendingRheaEvmAfterApproval) {
@@ -6362,6 +6412,14 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
                 }
               ]
             : []),
+          ...(bitcoinPreparedInputCount(preparedQuoteTransfer) === null
+            ? []
+            : [
+                {
+                  label: 'Inputs',
+                  content: bitcoinPreparedInputCount(preparedQuoteTransfer)
+                }
+              ]),
           ...(pendingRheaEvmAfterApproval
             ? [
                 {
@@ -6406,6 +6464,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
                   retrying={isPreparingReview}
                   className="mt-3 px-1"
                 />
+              ) : bitcoinInputReviewNotice ? (
+                <InlineError message={bitcoinInputReviewNotice} className="mt-3 px-1" />
               ) : !transferReview && !isPreparingReview ? (
                 <p className="mt-3 px-1 text-xs text-warning" role="alert">
                   Transfer review is unavailable. Go back and try again.
@@ -6480,6 +6540,8 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
             quoteChanges={quoteChanges}
             transferPreparationError={transferPreparationError}
             insufficientFunds={hasInsufficientFunds || preparedFeeUnaffordable}
+            inputCount={bitcoinPreparedInputCount(preparedQuoteTransfer)}
+            inputReviewNotice={bitcoinInputReviewNotice}
             onRefresh={() => void reviewLiveQuote(undefined, true)}
             onAccept={acceptRheaQuote}
             onRetryPreparation={() => void reviewLiveQuote(networkFeeTier).catch(() => {})}
@@ -6557,6 +6619,7 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
           onConfirm={handleConfirmSwap}
           isLoading={isSending || isPreparingReview || refreshingMaximumReview}
           preparationError={transferPreparationError ?? (reviewExpired ? 'Quote expired.' : null)}
+          notice={bitcoinInputReviewNotice}
           onRetryPreparation={
             reviewExpired
               ? refreshReview
@@ -6613,7 +6676,10 @@ export function Swap({ purpose = 'swap' }: { purpose?: 'swap' | 'cross-chain-sen
                     prepared: preparedQuoteTransfer,
                     tokenIn: swap.tokenIn,
                     approvalPending: Boolean(pendingRheaEvmAfterApproval)
-                  })
+                  }),
+                  ...(bitcoinPreparedInputCount(preparedQuoteTransfer) === null
+                    ? {}
+                    : { inputs: bitcoinPreparedInputCount(preparedQuoteTransfer) ?? undefined })
                 }
               : undefined
           }

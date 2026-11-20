@@ -53,8 +53,14 @@ function setup(active = activeContext, readBalance = async () => '0') {
     expiresAt: 5_000
   })
   const results = {
-    prepare: Object.freeze({ graph: { root: { id: 'transaction:prepared' } }, signing }),
-    pending: Object.freeze({ graph: { root: { id: 'transaction:pending' } }, signing }),
+    prepare: Object.freeze({
+      graph: { root: { id: 'transaction:prepared', createdAt: 0 } },
+      signing
+    }),
+    pending: Object.freeze({
+      graph: { root: { id: 'transaction:pending', createdAt: 0 } },
+      signing
+    }),
     approve: Object.freeze({
       status: 'broadcast',
       graph: { root: { id: 'transaction:approved' } }
@@ -430,7 +436,7 @@ test.describe('Background EVM transfer controller', () => {
       orchestrator: {
         prepare: async input => {
           calls.push(['prepare', input])
-          return { graph: { root: { id: 'transaction:prepared' } }, signing }
+          return { graph: { root: { id: 'transaction:prepared', createdAt: 0 } }, signing }
         }
       },
       loadActiveContext: async () => hardwareContext,

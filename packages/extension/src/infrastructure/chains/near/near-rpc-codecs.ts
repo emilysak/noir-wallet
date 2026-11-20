@@ -4,6 +4,7 @@ import {
   NearRpcError,
   type NearAccessKeyPermission,
   type NearAccountSnapshot,
+  type NearAccessKeyListSnapshot,
   type NearAccessKeySnapshot,
   type NearFinalBlockSnapshot,
   type NearFungibleTokenBalanceSnapshot,
@@ -14,6 +15,7 @@ import {
 const MAXIMUM_U64 = 18_446_744_073_709_551_615n
 const MAXIMUM_U128 = 340_282_366_920_938_463_463_374_607_431_768_211_455n
 const MAXIMUM_METHOD_NAMES = 128
+const MAXIMUM_ACCESS_KEYS = 100
 const MAXIMUM_VIEW_RESULT_BYTES = 1_024
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -201,6 +203,52 @@ export function parseNearAccessKeySnapshot(
     permission: parseNearAccessKeyPermission(value.permission),
     blockHash: readNearHash(value.block_hash, 'NEAR access key block hash'),
     blockHeight: readSafeUnsignedInteger(value.block_height, 'NEAR access key block height')
+  })
+}
+
+export function parseNearAccessKeyList(
+  value: unknown,
+  accountId: string
+): NearAccessKeyListSnapshot {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['block_hash', 'block_height', 'keys']) ||
+    !Array.isArray(value.keys) ||
+    value.keys.length > MAXIMUM_ACCESS_KEYS
+  ) {
+    throw invalid('NEAR access key list response')
+  }
+  const blockHash = readNearHash(value.block_hash, 'NEAR access key list block hash')
+  const blockHeight = readSafeUnsignedInteger(
+    value.block_height,
+    'NEAR access key list block height'
+  )
+  const keys = value.keys.map(entry => {
+    if (!isRecord(entry) || !hasExactKeys(entry, ['public_key', 'access_key'])) {
+      throw invalid('NEAR access key list entry')
+    }
+    const publicKey = readNearPublicKey(entry.public_key, 'NEAR access key list public key')
+    const accessKey = entry.access_key
+    if (!isRecord(accessKey) || !hasExactKeys(accessKey, ['nonce', 'permission'])) {
+      throw invalid('NEAR access key list entry')
+    }
+    return Object.freeze({
+      accountId,
+      publicKey,
+      nonce: readU64String(accessKey.nonce, 'NEAR access key list nonce'),
+      permission: parseNearAccessKeyPermission(accessKey.permission),
+      blockHash,
+      blockHeight
+    })
+  })
+  if (new Set(keys.map(key => key.publicKey)).size !== keys.length) {
+    throw invalid('NEAR access key list response')
+  }
+  return Object.freeze({
+    accountId,
+    blockHash,
+    blockHeight,
+    keys: Object.freeze(keys)
   })
 }
 

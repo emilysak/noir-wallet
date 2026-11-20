@@ -2,6 +2,7 @@ import { Icon } from '@iconify/react'
 import { AmountDisplay } from '@/popup/components/common/AmountDisplay'
 import { InlineError } from '@/popup/components/common/InlineError'
 import nearLogo from '@/images/figma-near-confidential.svg'
+import { ELEVATED_PRIORITY_FEE_MESSAGE } from '@/infrastructure/chains/evm/evm-fee-tier'
 import { NetworkFeeTierPicker } from '@/popup/components/transaction/NetworkFeeTierPicker'
 import { SendRouteInfoCard } from '@/popup/components/transaction/SendInputCards'
 import type { EvmSendTransferState } from '@/popup/hooks/useEvmSendTransfer'
@@ -111,6 +112,11 @@ export function EvmSendRoutePanels({ state }: { readonly state: EvmSendTransferS
           }
         />
       )}
+      {route === 'onchain' && feePreview.details?.priorityFeeElevated ? (
+        <p role="status" className="px-1 text-xs text-warning">
+          {ELEVATED_PRIORITY_FEE_MESSAGE}
+        </p>
+      ) : null}
 
       {amountRaw !== null && BigInt(amountRaw) > BigInt(availableRaw) && (
         <p role="alert" className="mt-3 text-xs text-danger">

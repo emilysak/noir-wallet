@@ -2,9 +2,17 @@ import { test } from 'node:test'
 import { expect } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { hashTypedData } from 'viem'
+import {
+  PERMIT2_CONTRACT,
+  PERMIT2_LOCKDOWN_EFFECT,
+  PERMIT2_TOKEN_REVOKE_EFFECT
+} from '../../../src/infrastructure/chains/evm/evm-contract-call-classification.ts'
+import { encodePermit2Lockdown } from '../../../src/infrastructure/chains/evm/evm-permit2-allowance.ts'
 
 import { SIGNING_SUMMARY_SCHEMAS } from '../../../src/core/keyring/domain/index.ts'
+import { sensitiveOperationCategory } from '../../../src/core/security/sensitive-operation-policy.ts'
 import { decodeEvmPermitReview } from '../../../src/infrastructure/chains/evm/evm-permit-review.ts'
+import { decodeEvmTypedDataRecognition } from '../../../src/infrastructure/chains/evm/evm-typed-data-recognition.ts'
 import { buildSigningSummaryReviewModel } from '../../../src/popup/components/signing/signing-summary-review-model.ts'
 
 const digest = '00'.repeat(32)
@@ -416,7 +424,15 @@ test('presents exact signed token permissions with trusted metadata and raw type
   )
   const before = JSON.stringify(input)
   const known = buildSigningSummaryReviewModel(input, {
-    tokenMetadata: [{ contractAddress: permitToken, symbol: 'USDC', decimals: 6 }]
+    tokenMetadata: [
+      {
+        contractAddress: permitToken,
+        name: 'USD Coin',
+        symbol: 'USDC',
+        decimals: 6,
+        verification: 'trusted'
+      }
+    ]
   })
   expect(known.title).toBe('Token authorization')
   expect(known.tokenAuthorization).toMatchObject({
@@ -448,6 +464,22 @@ test('presents exact signed token permissions with trusted metadata and raw type
     symbol: null,
     unlimited: false
   })
+  expect(unknown.tokenAuthorization.tokens[0].unlimitedUnit).toBeUndefined()
+  const unusableDecimals = buildSigningSummaryReviewModel(input, {
+    tokenMetadata: [
+      {
+        contractAddress: permitToken,
+        symbol: 'USDC',
+        decimals: 6.5,
+        verification: 'trusted'
+      }
+    ]
+  })
+  expect(unusableDecimals.tokenAuthorization.tokens[0]).toMatchObject({
+    amount: '6000000',
+    symbol: null,
+    unlimited: false
+  })
 
   const maximumAllowance = structuredClone(input)
   maximumAllowance.fields.message.fields[0].value.fields[1].value.value = (
@@ -455,8 +487,12 @@ test('presents exact signed token permissions with trusted metadata and raw type
     1n
   ).toString()
   expect(
-    buildSigningSummaryReviewModel(maximumAllowance).tokenAuthorization.tokens[0].unlimited
-  ).toBe(true)
+    buildSigningSummaryReviewModel(maximumAllowance).tokenAuthorization.tokens[0]
+  ).toMatchObject({
+    amount: 'Unlimited',
+    unlimited: true,
+    unlimitedUnit: 'uint160'
+  })
 
   const maximumTransfer = permitSummary(
     typedStruct('PermitTransferFrom', [
@@ -474,7 +510,11 @@ test('presents exact signed token permissions with trusted metadata and raw type
   )
   const transferModel = buildSigningSummaryReviewModel(maximumTransfer)
   expect(transferModel.title).toBe('Token transfer authorization')
-  expect(transferModel.tokenAuthorization.tokens[0].unlimited).toBe(false)
+  expect(transferModel.tokenAuthorization.tokens[0]).toMatchObject({
+    amount: ((1n << 256n) - 1n).toString(),
+    unlimited: false
+  })
+  expect(transferModel.tokenAuthorization.tokens[0].unlimitedUnit).toBeUndefined()
   expect(JSON.stringify(input)).toBe(before)
 })
 
@@ -521,7 +561,15 @@ test('shows requested ERC-20 call arguments only for canonical calldata of known
   const sender = '0x4444444444444444444444444444444444444444'
   const options = {
     nativeCurrency: { symbol: 'ETH', decimals: 18 },
-    tokenMetadata: [{ contractAddress: tokenContract, symbol: 'USDC', decimals: 6 }]
+    tokenMetadata: [
+      {
+        contractAddress: tokenContract,
+        name: 'USD Coin',
+        symbol: 'USDC',
+        decimals: 6,
+        verification: 'trusted'
+      }
+    ]
   }
   const reviewCall = calldata => {
     const input = {
@@ -571,12 +619,57 @@ test('shows requested ERC-20 call arguments only for canonical calldata of known
   expect(
     reviewCall(unlimited)
       .sections.find(section => section.title === 'Calldata request')
-      .rows.find(row => row.label === 'Requested allowance').value
-  ).toBe('Unlimited')
-  for (const calldata of [
-    unlimited,
-    `0x23b872dd${addressWord(sender)}${addressWord(recipient)}${word(42)}`
-  ]) {
+      .rows.find(row => row.label === 'Requested allowance')
+  ).toMatchObject({
+    value: 'Unlimited',
+    title: 'Maximum uint256 (2^256−1)'
+  })
+  const unknownApprove = buildSigningSummaryReviewModel(
+    {
+      ...original,
+      fields: {
+        ...original.fields,
+        calldata: content('hex', unlimited),
+        methodSelector: unlimited.slice(0, 10)
+      }
+    },
+    { nativeCurrency: options.nativeCurrency }
+  )
+  expect(unknownApprove.title).toBe('Token authorization')
+  expect(unknownApprove.tokenAuthorization?.tokens[0]).toMatchObject({
+    unlimited: true,
+    unlimitedUnit: 'uint256',
+    amount: 'Unlimited'
+  })
+  expect(
+    unknownApprove.sections.find(section => section.title === 'Calldata request')?.rows
+  ).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Requested allowance', value: 'Unlimited' })
+    ])
+  )
+
+  const decrease = reviewCall(`0xa457c2d7${addressWord(recipient)}${word(42)}`)
+  expect(decrease.tokenAuthorization).toMatchObject({
+    protocol: 'ERC-20',
+    kind: 'allowance',
+    spender: recipient,
+    tokens: [expect.objectContaining({ unlimited: false })]
+  })
+  expect(decrease.tokenAuthorization.effect).toBeUndefined()
+  expect(decrease.sections.find(section => section.title === 'Calldata request').rows).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Requested method', value: 'decreaseAllowance' }),
+      expect.objectContaining({ label: 'Allowance decrease' })
+    ])
+  )
+  const permit2Decrease = reviewCall(
+    `0xa457c2d7${addressWord(permit2Address.toLowerCase())}${word(42)}`
+  )
+  expect(permit2Decrease.tokenAuthorization.effect).toBe('revoke-permit2')
+  expect(permit2Decrease.description).toContain('Revoking this stops Permit2')
+
+  for (const calldata of [`0x23b872dd${addressWord(sender)}${addressWord(recipient)}${word(42)}`]) {
     const unknownToken = buildSigningSummaryReviewModel(
       {
         ...original,
@@ -819,6 +912,8 @@ test.describe('Signing summary review model', () => {
       'TRON active permission',
       'Partially signed transaction'
     ])
+    expect(caution.issues[0].description).toContain('2^256−1')
+    expect(caution.issues[0].description).toContain('2^160−1')
 
     const blocked = buildSigningSummaryReviewModel(
       tronTransaction(
@@ -863,7 +958,7 @@ test.describe('Signing summary review model', () => {
     const typedData = model.sections.find(section => section.title === 'Typed data')
     expect(typedData?.rows).toContainEqual({
       label: 'Domain.name',
-      value: 'string · Noir Wallet',
+      value: 'Self-reported · Noir Wallet',
       code: true
     })
     expect(typedData?.rows).toContainEqual({
@@ -872,6 +967,42 @@ test.describe('Signing summary review model', () => {
       code: true
     })
     expect(JSON.stringify(typedData)).not.toContain('"kind":"scalar"')
+  })
+
+  test('shows bidirectional controls in messages and typed-data strings without changing the signed payload', () => {
+    const hidden = 'Send 1 ZEC\u202E to attacker'
+    const personal = summary('evm.personal-message.v1', 'eip155:1', 'message', {
+      signer: '0x1111111111111111111111111111111111111111',
+      message: content('utf8', hidden)
+    })
+    const personalModel = buildSigningSummaryReviewModel(personal)
+    const contentRow = personalModel.sections
+      .flatMap(section => section.rows)
+      .find(row => row.label === 'Content')
+    expect(contentRow).toMatchObject({
+      value: 'Send 1 ZEC[U+202E] to attacker',
+      hiddenCharacters: true
+    })
+    expect(personal.fields.message.value).toBe(hidden)
+    expect(personal.fields.message.sha256).toBe(digest)
+
+    const typed = summary('evm.typed-data.v1', 'eip155:1', 'message', {
+      signer: '0x1111111111111111111111111111111111111111',
+      primaryType: 'Message',
+      domain: { kind: 'struct', typeName: 'EIP712Domain', fields: [] },
+      message: { kind: 'scalar', solidityType: 'string', value: hidden },
+      digestHex: `0x${digest}`
+    })
+    const typedModel = buildSigningSummaryReviewModel(typed)
+    const messageRow = typedModel.sections
+      .flatMap(section => section.rows)
+      .find(row => row.label === 'Message')
+    expect(messageRow).toMatchObject({
+      value: 'string · Send 1 ZEC[U+202E] to attacker',
+      hiddenCharacters: true
+    })
+    expect(typed.fields.message.value).toBe(hidden)
+    expect(typed.fields.digestHex).toBe(`0x${digest}`)
   })
 
   test('keeps the renderer independent from runtime, Worker, store, and WASM inputs', () => {
@@ -894,4 +1025,1078 @@ test.describe('Signing summary review model', () => {
     expect(source).not.toMatch(/@\/store|zcash-wallet-runtime/)
     expect(source).toMatch(/disabled=\{isBlocked \|\| confirmDisabled\}/)
   })
+
+  test('withholds success for simulation and verification on a dApp RPC', () => {
+    const original = baseSummaries.find(item => item.schema === 'evm.transaction.v1')
+    const recipient = '0x3333333333333333333333333333333333333333'
+    const word = value => value.toString(16).padStart(64, '0')
+    const calldata = `0x095ea7b3${recipient.slice(2).padStart(64, '0')}${word(1)}`
+    const input = {
+      ...original,
+      fields: {
+        ...original.fields,
+        valueWei: '0',
+        calldata: content('hex', calldata),
+        methodSelector: calldata.slice(0, 10)
+      }
+    }
+    const model = buildSigningSummaryReviewModel(input, { rpcOrigin: 'dapp' })
+    expect(model.title).toBe('Token authorization')
+    expect(model.sections.find(section => section.title === 'Network node').rows).toEqual([
+      { label: 'RPC', value: 'Added by dApp' },
+      { label: 'Simulation', value: 'UNKNOWN' },
+      { label: 'Balance check', value: 'UNKNOWN' },
+      { label: 'Authorization check', value: 'UNKNOWN' },
+      { label: 'Node', value: 'Unverified node' }
+    ])
+    expect(JSON.stringify(model)).not.toMatch(/Success/)
+    const builtin = buildSigningSummaryReviewModel(input, { rpcOrigin: 'builtin' })
+    expect(builtin.sections.some(section => section.title === 'Network node')).toBe(false)
+    expect(JSON.stringify(builtin)).not.toMatch(/Success/)
+  })
+
+  test('does not confirm an ERC-721 revocation on a non-builtin RPC', () => {
+    const original = baseSummaries.find(item => item.schema === 'evm.transaction.v1')
+    const operator = '0x3333333333333333333333333333333333333333'
+    const word = value => value.toString(16).padStart(64, '0')
+    const calldata = approved => `0xa22cb465${operator.slice(2).padStart(64, '0')}${word(approved)}`
+    const input = approved => ({
+      ...original,
+      fields: {
+        ...original.fields,
+        valueWei: '0',
+        calldata: content('hex', calldata(approved)),
+        methodSelector: '0xa22cb465'
+      }
+    })
+    const amountFor = origin =>
+      buildSigningSummaryReviewModel(input(0), { rpcOrigin: origin }).tokenAuthorization.tokens[0]
+        .amount
+
+    expect(amountFor('dapp')).toBe('UNKNOWN')
+    expect(amountFor('user')).toBe('UNKNOWN')
+    expect(amountFor('builtin')).toBe('Revoked')
+    expect(buildSigningSummaryReviewModel(input(0)).tokenAuthorization.tokens[0].amount).toBe(
+      'Revoked'
+    )
+    expect(
+      buildSigningSummaryReviewModel(input(1), { rpcOrigin: 'dapp' }).tokenAuthorization.tokens[0]
+        .amount
+    ).toBe('All token IDs')
+    expect(JSON.stringify(input(0))).not.toMatch(/Revoked|UNKNOWN/)
+  })
+})
+
+const zeroAddress = '0x0000000000000000000000000000000000000000'
+const bytes32Value = `0x${'11'.repeat(32)}`
+const seaport15 = '0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC'
+const blurExchange = '0x000000000000Ad05Ccc4F10045630fb830B95127'
+const inchRouter = '0x111111125421cA6dc452d289314280a0f8842A65'
+const cowSettlement = '0x9008D19f58AAbD9eD0D60971565AA8510560ab41'
+
+function domainFields(domain) {
+  const order = ['name', 'version', 'chainId', 'verifyingContract', 'salt']
+  const solidity = {
+    name: 'string',
+    version: 'string',
+    chainId: 'uint256',
+    verifyingContract: 'address',
+    salt: 'bytes32'
+  }
+  return order
+    .filter(name => Object.hasOwn(domain, name))
+    .map(name => ({ name, type: solidity[name] }))
+}
+
+function encodeTypedValue(solidityType, value, types) {
+  const array = solidityType.match(/^(.*)\[([0-9]*)\]$/)
+  if (array) {
+    return {
+      kind: 'array',
+      itemType: array[1],
+      items: value.map(item => encodeTypedValue(array[1], item, types))
+    }
+  }
+  const struct = types[solidityType]
+  if (struct) {
+    return {
+      kind: 'struct',
+      typeName: solidityType,
+      fields: struct.map(field => ({
+        name: field.name,
+        value: encodeTypedValue(field.type, value[field.name], types)
+      }))
+    }
+  }
+  return {
+    kind: 'scalar',
+    solidityType,
+    value:
+      typeof value === 'bigint'
+        ? value.toString()
+        : typeof value === 'boolean'
+          ? value
+            ? 'true'
+            : 'false'
+          : `${value}`
+  }
+}
+
+function recognizedSummary({
+  primaryType,
+  domain,
+  types,
+  message,
+  signer = permitOwner,
+  chainId = 'eip155:1',
+  digestTypes = types
+}) {
+  const digestHex = hashTypedData({
+    domain,
+    types: { EIP712Domain: domainFields(domain), ...digestTypes },
+    primaryType,
+    message
+  })
+  return summary('evm.typed-data.v1', chainId, 'message', {
+    signer,
+    primaryType,
+    domain: encodeTypedValue('EIP712Domain', domain, { EIP712Domain: domainFields(domain) }),
+    message: encodeTypedValue(primaryType, message, types),
+    digestHex
+  })
+}
+
+const permit2Domain = { name: 'Permit2', chainId: 1, verifyingContract: permit2Address }
+const daiTypes = {
+  Permit: [
+    { name: 'holder', type: 'address' },
+    { name: 'spender', type: 'address' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'expiry', type: 'uint256' },
+    { name: 'allowed', type: 'bool' }
+  ]
+}
+const tokenPermissionFields = [
+  { name: 'token', type: 'address' },
+  { name: 'amount', type: 'uint256' }
+]
+const exampleTrade = [
+  { name: 'receiver', type: 'address' },
+  { name: 'minimum', type: 'uint256' }
+]
+const witnessFields = witnessType => [
+  { name: 'permitted', type: witnessType },
+  { name: 'spender', type: 'address' },
+  { name: 'nonce', type: 'uint256' },
+  { name: 'deadline', type: 'uint256' },
+  { name: 'witness', type: 'ExampleTrade' }
+]
+const transferAuthorization = [
+  { name: 'from', type: 'address' },
+  { name: 'to', type: 'address' },
+  { name: 'value', type: 'uint256' },
+  { name: 'validAfter', type: 'uint256' },
+  { name: 'validBefore', type: 'uint256' },
+  { name: 'nonce', type: 'bytes32' }
+]
+const seaportTypes = {
+  OfferItem: [
+    { name: 'itemType', type: 'uint8' },
+    { name: 'token', type: 'address' },
+    { name: 'identifierOrCriteria', type: 'uint256' },
+    { name: 'startAmount', type: 'uint256' },
+    { name: 'endAmount', type: 'uint256' }
+  ],
+  ConsiderationItem: [
+    { name: 'itemType', type: 'uint8' },
+    { name: 'token', type: 'address' },
+    { name: 'identifierOrCriteria', type: 'uint256' },
+    { name: 'startAmount', type: 'uint256' },
+    { name: 'endAmount', type: 'uint256' },
+    { name: 'recipient', type: 'address' }
+  ],
+  OrderComponents: [
+    { name: 'offerer', type: 'address' },
+    { name: 'zone', type: 'address' },
+    { name: 'offer', type: 'OfferItem[]' },
+    { name: 'consideration', type: 'ConsiderationItem[]' },
+    { name: 'orderType', type: 'uint8' },
+    { name: 'startTime', type: 'uint256' },
+    { name: 'endTime', type: 'uint256' },
+    { name: 'zoneHash', type: 'bytes32' },
+    { name: 'salt', type: 'uint256' },
+    { name: 'conduitKey', type: 'bytes32' },
+    { name: 'counter', type: 'uint256' }
+  ]
+}
+const blurTypes = {
+  Fee: [
+    { name: 'rate', type: 'uint16' },
+    { name: 'recipient', type: 'address' }
+  ],
+  Order: [
+    { name: 'trader', type: 'address' },
+    { name: 'side', type: 'uint8' },
+    { name: 'matchingPolicy', type: 'address' },
+    { name: 'collection', type: 'address' },
+    { name: 'tokenId', type: 'uint256' },
+    { name: 'amount', type: 'uint256' },
+    { name: 'paymentToken', type: 'address' },
+    { name: 'price', type: 'uint256' },
+    { name: 'listingTime', type: 'uint256' },
+    { name: 'expirationTime', type: 'uint256' },
+    { name: 'fees', type: 'Fee[]' },
+    { name: 'salt', type: 'uint256' },
+    { name: 'extraParams', type: 'bytes' },
+    { name: 'nonce', type: 'uint256' }
+  ]
+}
+const inchTypes = {
+  Order: [
+    { name: 'salt', type: 'uint256' },
+    { name: 'maker', type: 'address' },
+    { name: 'receiver', type: 'address' },
+    { name: 'makerAsset', type: 'address' },
+    { name: 'takerAsset', type: 'address' },
+    { name: 'makingAmount', type: 'uint256' },
+    { name: 'takingAmount', type: 'uint256' },
+    { name: 'makerTraits', type: 'uint256' }
+  ]
+}
+const cowTypes = {
+  Order: [
+    { name: 'sellToken', type: 'address' },
+    { name: 'buyToken', type: 'address' },
+    { name: 'receiver', type: 'address' },
+    { name: 'sellAmount', type: 'uint256' },
+    { name: 'buyAmount', type: 'uint256' },
+    { name: 'validTo', type: 'uint32' },
+    { name: 'appData', type: 'bytes32' },
+    { name: 'feeAmount', type: 'uint256' },
+    { name: 'kind', type: 'bytes32' },
+    { name: 'partiallyFillable', type: 'bool' },
+    { name: 'sellTokenBalance', type: 'bytes32' },
+    { name: 'buyTokenBalance', type: 'bytes32' }
+  ]
+}
+const safeTypes = {
+  SafeTx: [
+    { name: 'to', type: 'address' },
+    { name: 'value', type: 'uint256' },
+    { name: 'data', type: 'bytes' },
+    { name: 'operation', type: 'uint8' },
+    { name: 'safeTxGas', type: 'uint256' },
+    { name: 'baseGas', type: 'uint256' },
+    { name: 'gasPrice', type: 'uint256' },
+    { name: 'gasToken', type: 'address' },
+    { name: 'refundReceiver', type: 'address' },
+    { name: 'nonce', type: 'uint256' }
+  ]
+}
+const seaportDomain = {
+  name: 'Seaport',
+  version: '1.5',
+  chainId: 1,
+  verifyingContract: seaport15
+}
+const seaportMessage = {
+  offerer: permitOwner,
+  zone: permitSpender,
+  offer: [
+    {
+      itemType: 2n,
+      token: permitToken,
+      identifierOrCriteria: 7n,
+      startAmount: 1n,
+      endAmount: 1n
+    }
+  ],
+  consideration: [
+    {
+      itemType: 0n,
+      token: zeroAddress,
+      identifierOrCriteria: 0n,
+      startAmount: 9n,
+      endAmount: 9n,
+      recipient: permitSpender
+    }
+  ],
+  orderType: 0n,
+  startTime: 500n,
+  endTime: 900n,
+  zoneHash: bytes32Value,
+  salt: 1n,
+  conduitKey: bytes32Value,
+  counter: 0n
+}
+const blurMessage = {
+  trader: permitOwner,
+  side: 1n,
+  matchingPolicy: permitSpender,
+  collection: permitToken,
+  tokenId: 4n,
+  amount: 1n,
+  paymentToken: zeroAddress,
+  price: 10n,
+  listingTime: 500n,
+  expirationTime: 0n,
+  fees: [{ rate: 250n, recipient: permitSpender }],
+  salt: 1n,
+  extraParams: '0x01',
+  nonce: 2n
+}
+const safeMessage = {
+  to: permitToken,
+  value: 5n,
+  data: '0x1234',
+  operation: 1n,
+  safeTxGas: 0n,
+  baseGas: 0n,
+  gasPrice: 0n,
+  gasToken: zeroAddress,
+  refundReceiver: zeroAddress,
+  nonce: 3n
+}
+
+function daiPermit(allowed = true, expiry = 0n, holder = permitOwner) {
+  return recognizedSummary({
+    primaryType: 'Permit',
+    domain: { name: 'Dai Stablecoin', version: '1', chainId: 1, verifyingContract: permitToken },
+    types: daiTypes,
+    signer: holder,
+    message: { holder, spender: permitSpender, nonce: 1n, expiry, allowed }
+  })
+}
+
+function witnessTransfer(batch = false) {
+  const primaryType = batch ? 'PermitBatchWitnessTransferFrom' : 'PermitWitnessTransferFrom'
+  const permitted = { token: permitToken, amount: 42n }
+  return recognizedSummary({
+    primaryType,
+    domain: permit2Domain,
+    types: {
+      TokenPermissions: tokenPermissionFields,
+      ExampleTrade: exampleTrade,
+      [primaryType]: witnessFields(batch ? 'TokenPermissions[]' : 'TokenPermissions')
+    },
+    message: {
+      permitted: batch ? [permitted, permitted] : permitted,
+      spender: permitSpender,
+      nonce: 1n,
+      deadline: 500n,
+      witness: { receiver: permitSpender, minimum: 7n }
+    }
+  })
+}
+
+function eip3009(primaryType = 'TransferWithAuthorization', from = permitOwner) {
+  const cancel = primaryType === 'CancelAuthorization'
+  return recognizedSummary({
+    primaryType,
+    domain: { name: 'USD Coin', version: '2', chainId: 1, verifyingContract: permitToken },
+    types: cancel
+      ? {
+          CancelAuthorization: [
+            { name: 'authorizer', type: 'address' },
+            { name: 'nonce', type: 'bytes32' }
+          ]
+        }
+      : { [primaryType]: transferAuthorization },
+    signer: from,
+    message: cancel
+      ? { authorizer: from, nonce: bytes32Value }
+      : {
+          from,
+          to: permitSpender,
+          value: 42n,
+          validAfter: 0n,
+          validBefore: 500n,
+          nonce: bytes32Value
+        }
+  })
+}
+
+function blurOrder(trader = permitOwner) {
+  return recognizedSummary({
+    primaryType: 'Order',
+    domain: { name: 'Blur Exchange', version: '1.0', chainId: 1, verifyingContract: blurExchange },
+    types: blurTypes,
+    signer: trader,
+    message: { ...blurMessage, trader }
+  })
+}
+
+function inchOrder(receiver = zeroAddress, maker = permitOwner) {
+  return recognizedSummary({
+    primaryType: 'Order',
+    domain: {
+      name: '1inch Aggregation Router',
+      version: '6',
+      chainId: 1,
+      verifyingContract: inchRouter
+    },
+    types: inchTypes,
+    signer: maker,
+    message: {
+      salt: 1n,
+      maker,
+      receiver,
+      makerAsset: permitToken,
+      takerAsset: permitSpender,
+      makingAmount: 5n,
+      takingAmount: 6n,
+      makerTraits: 0n
+    }
+  })
+}
+
+function cowOrder(receiver = zeroAddress) {
+  return recognizedSummary({
+    primaryType: 'Order',
+    domain: {
+      name: 'Gnosis Protocol',
+      version: 'v2',
+      chainId: 1,
+      verifyingContract: cowSettlement
+    },
+    types: cowTypes,
+    message: {
+      sellToken: permitToken,
+      buyToken: permitSpender,
+      receiver,
+      sellAmount: 5n,
+      buyAmount: 6n,
+      validTo: 1_700_000_000n,
+      appData: bytes32Value,
+      feeAmount: 0n,
+      kind: bytes32Value,
+      partiallyFillable: false,
+      sellTokenBalance: bytes32Value,
+      buyTokenBalance: bytes32Value
+    }
+  })
+}
+
+function safeTransaction(operation = 1n) {
+  return recognizedSummary({
+    primaryType: 'SafeTx',
+    domain: { chainId: 1, verifyingContract: permitSpender },
+    types: safeTypes,
+    message: { ...safeMessage, operation }
+  })
+}
+
+function recognizedRows(model) {
+  return model.sections.find(section => section.title === 'Recognized signature').rows
+}
+
+test('recognizes DAI permit, EIP-3009, and Permit2 witness transfers', () => {
+  const dai = daiPermit()
+  expect(decodeEvmPermitReview(dai)).toMatchObject({
+    protocol: 'Permit',
+    kind: 'allowance',
+    deadlineUnbounded: true,
+    spender: permitSpender
+  })
+  expect(decodeEvmPermitReview(dai).tokens[0].amountRaw).toBe(((1n << 256n) - 1n).toString())
+  const daiModel = buildSigningSummaryReviewModel(dai)
+  expect(daiModel.title).toBe('Token authorization')
+  expect(daiModel.tokenAuthorization.signatureDeadline).toBe('No expiry')
+  expect(daiModel.tokenAuthorization.tokens[0]).toMatchObject({
+    unlimited: true,
+    unlimitedUnit: 'uint256',
+    amount: 'Unlimited'
+  })
+  expect(sensitiveOperationCategory(dai)).toBe('authorization')
+
+  const revoked = daiPermit(false, 500n)
+  expect(decodeEvmPermitReview(revoked).tokens[0].amountRaw).toBe('0')
+  expect(decodeEvmPermitReview(revoked).deadlineUnbounded).toBeUndefined()
+
+  const witness = witnessTransfer()
+  expect(decodeEvmPermitReview(witness)).toMatchObject({
+    protocol: 'Permit2',
+    kind: 'transfer',
+    witnessReceivers: [permitSpender]
+  })
+  expect(decodeEvmPermitReview(witnessTransfer(true)).tokens).toHaveLength(2)
+  expect(sensitiveOperationCategory(witness)).toBe('authorization')
+  const bytes32Witness = recognizedSummary({
+    primaryType: 'PermitWitnessTransferFrom',
+    domain: permit2Domain,
+    types: {
+      TokenPermissions: tokenPermissionFields,
+      PermitWitnessTransferFrom: witnessFields('TokenPermissions').map(field =>
+        field.name === 'witness' ? { name: 'witness', type: 'bytes32' } : field
+      )
+    },
+    message: {
+      permitted: { token: permitToken, amount: 42n },
+      spender: permitSpender,
+      nonce: 1n,
+      deadline: 500n,
+      witness: bytes32Value
+    }
+  })
+  expect(decodeEvmPermitReview(bytes32Witness).witnessReceivers).toBeUndefined()
+
+  const transferModel = buildSigningSummaryReviewModel(eip3009(), {
+    tokenMetadata: [
+      {
+        contractAddress: permitToken,
+        name: 'USD Coin',
+        symbol: 'USDC',
+        decimals: 6,
+        verification: 'trusted'
+      }
+    ]
+  })
+  expect(transferModel.tokenAuthorization).toMatchObject({
+    protocol: 'EIP-3009',
+    kind: 'transfer',
+    recipient: permitSpender,
+    validAfter: 'Immediately',
+    submission: 'Relayers can submit',
+    tokens: [{ symbol: 'USDC', amount: '0.000042' }]
+  })
+  expect(sensitiveOperationCategory(eip3009())).toBe('authorization')
+  expect(transferModel.tokenAuthorization.tokens[0].selfReportedName).toBeUndefined()
+  const matchingDomainName = transferModel.sections
+    .find(section => section.title === 'Typed data')
+    ?.rows.find(row => row.label === 'Domain.name')
+  expect(matchingDomainName).toMatchObject({ value: 'string · USD Coin', code: true })
+
+  const reportedPermit = permitSummary(
+    typedStruct('Permit', [
+      ['owner', typedScalar('address', permitOwner)],
+      ['spender', typedScalar('address', permitSpender)],
+      ['value', typedScalar('uint256', '42')],
+      ['nonce', typedScalar('uint256', '1')],
+      ['deadline', typedScalar('uint256', '500')]
+    ]),
+    permitToken
+  )
+  const reportedModel = buildSigningSummaryReviewModel(reportedPermit)
+  expect(reportedModel.tokenAuthorization.tokens[0]).toMatchObject({
+    contractAddress: permitToken,
+    symbol: null,
+    selfReportedName: 'Token',
+    amount: '42'
+  })
+  expect(
+    reportedModel.sections
+      .find(section => section.title === 'Typed data')
+      ?.rows.find(row => row.label === 'Domain.name')
+  ).toMatchObject({
+    value: `Self-reported · Token\n${permitToken}`,
+    code: true,
+    breakAll: true
+  })
+
+  const spoofed = recognizedSummary({
+    primaryType: 'TransferWithAuthorization',
+    domain: { name: 'Tether USD', version: '2', chainId: 1, verifyingContract: permitToken },
+    types: { TransferWithAuthorization: transferAuthorization },
+    message: {
+      from: permitOwner,
+      to: permitSpender,
+      value: 42n,
+      validAfter: 0n,
+      validBefore: 500n,
+      nonce: bytes32Value
+    }
+  })
+  const spoofedModel = buildSigningSummaryReviewModel(spoofed, {
+    tokenMetadata: [
+      {
+        contractAddress: permitToken,
+        name: 'USD Coin',
+        symbol: 'USDC',
+        decimals: 6,
+        verification: 'trusted'
+      }
+    ]
+  })
+  expect(spoofedModel.tokenAuthorization.tokens[0]).toMatchObject({
+    symbol: 'USDC',
+    amount: '0.000042',
+    selfReportedName: 'Tether USD'
+  })
+  expect(
+    spoofedModel.sections
+      .find(section => section.title === 'Typed data')
+      ?.rows.find(row => row.label === 'Domain.name')?.value
+  ).toBe(`Self-reported · Tether USD\n${permitToken}`)
+
+  const permit2Model = buildSigningSummaryReviewModel(
+    permitSummary(
+      typedStruct('PermitSingle', [
+        ['details', permitDetails()],
+        ['spender', typedScalar('address', permitSpender)],
+        ['sigDeadline', typedScalar('uint256', '500')]
+      ])
+    ),
+    {
+      tokenMetadata: [
+        {
+          contractAddress: permitToken,
+          name: 'USD Coin',
+          symbol: 'USDC',
+          decimals: 6,
+          verification: 'trusted'
+        }
+      ]
+    }
+  )
+  expect(permit2Model.tokenAuthorization.tokens[0]).toMatchObject({
+    symbol: 'USDC',
+    amount: '0.000042'
+  })
+  expect(permit2Model.tokenAuthorization.tokens[0].selfReportedName).toBeUndefined()
+  expect(
+    buildSigningSummaryReviewModel(eip3009('ReceiveWithAuthorization')).tokenAuthorization
+      .submission
+  ).toBe('Only the recipient can submit')
+  const cancelModel = buildSigningSummaryReviewModel(eip3009('CancelAuthorization'))
+  expect(cancelModel.title).toBe('Cancel token authorization')
+  expect(cancelModel.tokenAuthorization).toBeUndefined()
+  expect(sensitiveOperationCategory(eip3009('CancelAuthorization'))).toBe(null)
+  expect(recognizedRows(cancelModel)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Authorizer', value: permitOwner }),
+      expect.objectContaining({ label: 'Nonce', value: bytes32Value })
+    ])
+  )
+})
+
+test('recognizes Seaport, Blur, receiver orders, and Safe transactions', () => {
+  const seaport = recognizedSummary({
+    primaryType: 'OrderComponents',
+    domain: seaportDomain,
+    types: seaportTypes,
+    message: seaportMessage
+  })
+  const seaportModel = buildSigningSummaryReviewModel(seaport)
+  expect(seaportModel.title).toBe('Seaport order')
+  expect(seaportModel.description).toBe('This signature creates a Seaport order.')
+  expect(sensitiveOperationCategory(seaport)).toBe('authorization')
+  expect(recognizedRows(seaportModel)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Offerer', value: permitOwner }),
+      expect.objectContaining({ label: 'Offer 1', value: 'ERC-721' }),
+      expect.objectContaining({
+        label: 'Consideration 1 recipient',
+        value: permitSpender,
+        tone: 'warning'
+      })
+    ])
+  )
+  expect(seaportModel.sections.find(section => section.title === 'Typed data').rows).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Primary type', value: 'OrderComponents' })
+    ])
+  )
+
+  const blurModel = buildSigningSummaryReviewModel(blurOrder())
+  expect(blurModel.title).toBe('Blur order')
+  expect(sensitiveOperationCategory(blurOrder())).toBe('authorization')
+  expect(recognizedRows(blurModel)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Side', value: 'Sell' }),
+      expect.objectContaining({ label: 'Expiration', value: 'Oracle cancellation' }),
+      expect.objectContaining({ label: 'Fee 1', value: '250 bps' }),
+      expect.objectContaining({ label: 'Fee 1 recipient', value: permitSpender })
+    ])
+  )
+
+  const defaultReceiver = buildSigningSummaryReviewModel(inchOrder())
+  expect(defaultReceiver.title).toBe('1inch order')
+  expect(sensitiveOperationCategory(inchOrder())).toBe('authorization')
+  expect(recognizedRows(defaultReceiver)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Receiver', value: `Maker · ${permitOwner}` })
+    ])
+  )
+  expect(recognizedRows(buildSigningSummaryReviewModel(inchOrder(permitSpender)))).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Receiver', value: permitSpender, tone: 'warning' })
+    ])
+  )
+  const cowModel = buildSigningSummaryReviewModel(cowOrder(permitSpender))
+  expect(cowModel.title).toBe('CoW order')
+  expect(sensitiveOperationCategory(cowOrder())).toBe('authorization')
+  expect(recognizedRows(cowModel)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Receiver', value: permitSpender, tone: 'warning' }),
+      expect.objectContaining({ label: 'Sell token', value: permitToken })
+    ])
+  )
+
+  const safeModel = buildSigningSummaryReviewModel(safeTransaction())
+  expect(safeModel.title).toBe('Safe transaction')
+  expect(sensitiveOperationCategory(safeTransaction())).toBe('account-control')
+  expect(recognizedRows(safeModel)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Safe', value: permitSpender }),
+      expect.objectContaining({ label: 'Operation', value: 'DelegateCall', tone: 'warning' }),
+      expect.objectContaining({ label: 'Value', value: '5 wei' })
+    ])
+  )
+  expect(recognizedRows(safeModel).some(row => row.value.includes('0x1234'))).toBe(false)
+  expect(safeModel.sections.find(section => section.title === 'Typed data').rows).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Message.data', value: 'bytes · 0x1234' })
+    ])
+  )
+})
+
+test('rejects altered canonical typed-data domains, signers, fields, and array lengths', () => {
+  const seaport = recognizedSummary({
+    primaryType: 'OrderComponents',
+    domain: seaportDomain,
+    types: seaportTypes,
+    message: seaportMessage
+  })
+  const reordered = structuredClone(seaport)
+  reordered.fields.message.fields.reverse()
+  const fixedOffer = recognizedSummary({
+    primaryType: 'OrderComponents',
+    domain: seaportDomain,
+    types: seaportTypes,
+    digestTypes: {
+      ...seaportTypes,
+      OrderComponents: seaportTypes.OrderComponents.map(field =>
+        field.name === 'offer' ? { ...field, type: 'OfferItem[1]' } : field
+      )
+    },
+    message: seaportMessage
+  })
+  const fixedWitness = recognizedSummary({
+    primaryType: 'PermitBatchWitnessTransferFrom',
+    domain: permit2Domain,
+    types: {
+      TokenPermissions: tokenPermissionFields,
+      ExampleTrade: exampleTrade,
+      PermitBatchWitnessTransferFrom: witnessFields('TokenPermissions[]')
+    },
+    digestTypes: {
+      TokenPermissions: tokenPermissionFields,
+      ExampleTrade: exampleTrade,
+      PermitBatchWitnessTransferFrom: witnessFields('TokenPermissions[2]')
+    },
+    message: {
+      permitted: [
+        { token: permitToken, amount: 42n },
+        { token: permitToken, amount: 42n }
+      ],
+      spender: permitSpender,
+      nonce: 1n,
+      deadline: 500n,
+      witness: { receiver: permitSpender, minimum: 7n }
+    }
+  })
+  for (const input of [
+    recognizedSummary({
+      primaryType: 'OrderComponents',
+      domain: { ...seaportDomain, version: '1.1' },
+      types: seaportTypes,
+      message: seaportMessage
+    }),
+    recognizedSummary({
+      primaryType: 'OrderComponents',
+      domain: { ...seaportDomain, verifyingContract: permitToken },
+      types: seaportTypes,
+      message: seaportMessage
+    }),
+    recognizedSummary({
+      primaryType: 'OrderComponents',
+      domain: seaportDomain,
+      types: seaportTypes,
+      message: seaportMessage,
+      signer: permitSpender
+    }),
+    reordered,
+    fixedOffer,
+    recognizedSummary({
+      primaryType: 'Permit',
+      domain: { name: 'Dai Stablecoin', version: '1', chainId: 1, verifyingContract: permitToken },
+      types: daiTypes,
+      message: {
+        holder: permitSpender,
+        spender: permitSpender,
+        nonce: 1n,
+        expiry: 0n,
+        allowed: true
+      }
+    }),
+    recognizedSummary({
+      primaryType: 'TransferWithAuthorization',
+      domain: { salt: bytes32Value, verifyingContract: permitToken },
+      types: { TransferWithAuthorization: transferAuthorization },
+      message: {
+        from: permitOwner,
+        to: permitSpender,
+        value: 42n,
+        validAfter: 0n,
+        validBefore: 500n,
+        nonce: bytes32Value
+      }
+    }),
+    recognizedSummary({
+      primaryType: 'Order',
+      domain: { name: 'Blur Exchange', version: '1.0', chainId: 1, verifyingContract: permitToken },
+      types: blurTypes,
+      message: blurMessage
+    }),
+    recognizedSummary({
+      primaryType: 'SafeTx',
+      domain: { name: 'Safe', chainId: 1, verifyingContract: permitSpender },
+      types: safeTypes,
+      message: safeMessage
+    }),
+    recognizedSummary({
+      primaryType: 'Order',
+      domain: {
+        name: '1inch Aggregation Router',
+        version: '6',
+        chainId: 1,
+        verifyingContract: inchRouter
+      },
+      types: inchTypes,
+      message: {
+        salt: 1n,
+        maker: permitSpender,
+        receiver: zeroAddress,
+        makerAsset: permitToken,
+        takerAsset: permitSpender,
+        makingAmount: 5n,
+        takingAmount: 6n,
+        makerTraits: 0n
+      }
+    }),
+    fixedWitness
+  ]) {
+    expect(decodeEvmTypedDataRecognition(input)).toBeNull()
+  }
+})
+
+test('explains a Permit2 lockdown and a zero approval of Permit2', () => {
+  const original = baseSummaries.find(item => item.schema === 'evm.transaction.v1')
+  const word = value => value.toString(16).padStart(64, '0')
+  const addressWord = address => address.slice(2).toLowerCase().padStart(64, '0')
+  const spender = '0x3333333333333333333333333333333333333333'
+  const revoke = `0x095ea7b3${addressWord(PERMIT2_CONTRACT)}${word(0)}`
+  const revokeModel = buildSigningSummaryReviewModel({
+    ...original,
+    fields: {
+      ...original.fields,
+      valueWei: '0',
+      calldata: content('hex', revoke),
+      methodSelector: revoke.slice(0, 10)
+    }
+  })
+  expect(revokeModel.description).toBe(PERMIT2_TOKEN_REVOKE_EFFECT)
+  expect(revokeModel.tokenAuthorization).toMatchObject({ effect: 'revoke-permit2' })
+  expect(revokeModel.sections.find(section => section.title === 'Calldata request').rows).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Revoke effect', value: PERMIT2_TOKEN_REVOKE_EFFECT })
+    ])
+  )
+
+  const lockdown = encodePermit2Lockdown([{ token: original.fields.to, spender }])
+  const model = buildSigningSummaryReviewModel({
+    ...original,
+    fields: {
+      ...original.fields,
+      to: PERMIT2_CONTRACT,
+      valueWei: '0',
+      calldata: content('hex', lockdown),
+      methodSelector: lockdown.slice(0, 10)
+    }
+  })
+  expect(model.title).toBe('Clear Permit2 allowance')
+  expect(model.description).toBe(PERMIT2_LOCKDOWN_EFFECT)
+  expect(model.tokenAuthorization).toMatchObject({
+    effect: 'lockdown',
+    spender,
+    tokens: [expect.objectContaining({ amount: 'Cleared', unlimited: false })]
+  })
+  const rows = model.sections.find(section => section.title === 'Calldata request').rows
+  expect(rows).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Requested method', value: 'Permit2.lockdown' }),
+      expect.objectContaining({ label: 'Effect', value: 'Amount and expiration set to zero' })
+    ])
+  )
+  expect(rows.some(row => row.value === 'Unlimited' || row.label === 'Requested allowance')).toBe(
+    false
+  )
+})
+
+function nearArgs(value) {
+  const json = typeof value === 'string' ? value : JSON.stringify(value)
+  return {
+    encoding: 'base64',
+    value: Buffer.from(json, 'utf8').toString('base64'),
+    byteLength: Buffer.byteLength(json),
+    sha256: digest
+  }
+}
+
+function nearFunctionCall(methodName, args, receiverId = 'token.near', signerId = 'alice.near') {
+  return summary('near.transaction.v1', 'near:mainnet', 'transaction', {
+    signerId,
+    publicKey: 'ed25519:public-key',
+    nonce: '1',
+    receiverId,
+    blockHash: digest,
+    actions: [
+      {
+        kind: 'function-call',
+        methodName,
+        args,
+        gas: '30000000000000',
+        depositYocto: '1'
+      }
+    ]
+  })
+}
+
+function nearActionReviewRows(item) {
+  return buildSigningSummaryReviewModel(item).sections.find(section =>
+    section.title.startsWith('Actions')
+  ).rows
+}
+
+test('decodes NEAR fungible transfers into recipient, amount, and token contract', () => {
+  const transfer = nearActionReviewRows(
+    nearFunctionCall(
+      'ft_transfer',
+      nearArgs({ receiver_id: 'bob.near', amount: '1000', memo: 'invoice' })
+    )
+  )
+  const transferMethod = transfer.findIndex(row => row.label === 'Method')
+  expect(transfer[transferMethod + 1]).toMatchObject({ label: 'Recipient', value: 'bob.near' })
+  expect(transfer[transferMethod + 2]).toMatchObject({ label: 'Amount', value: '1000' })
+  expect(transfer[transferMethod + 3]).toMatchObject({
+    label: 'Token contract',
+    value: 'token.near'
+  })
+  expect(transfer.some(row => row.label === 'Arguments')).toBe(true)
+
+  const transferCall = nearActionReviewRows(
+    nearFunctionCall(
+      'ft_transfer_call',
+      nearArgs({ receiver_id: 'defi.near', amount: '42', msg: 'swap' }),
+      'token.near'
+    )
+  )
+  expect(transferCall).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ label: 'Recipient', value: 'defi.near' }),
+      expect.objectContaining({ label: 'Amount', value: '42' }),
+      expect.objectContaining({ label: 'Token contract', value: 'token.near' }),
+      expect.objectContaining({
+        label: 'Arguments',
+        value: nearArgs({ receiver_id: 'defi.near', amount: '42', msg: 'swap' }).value
+      })
+    ])
+  )
+
+  for (const contractId of ['wrap.near', 'wrap.testnet']) {
+    const wrapped = nearActionReviewRows(
+      nearFunctionCall(
+        'ft_transfer',
+        nearArgs({ receiver_id: 'bob.near', amount: '1500000000000000000000000' }),
+        contractId
+      )
+    )
+    expect(wrapped.find(row => row.label === 'Amount')).toMatchObject({
+      value: '1.5 wNEAR',
+      title: '1500000000000000000000000'
+    })
+    expect(wrapped.find(row => row.label === 'Token contract')).toMatchObject({ value: contractId })
+  }
+})
+
+test('decodes NEAR NFT transfer and approval subjects', () => {
+  const transfer = nearActionReviewRows(
+    nearFunctionCall(
+      'nft_transfer',
+      nearArgs({ receiver_id: 'bob.near', token_id: 'token-1', memo: 'gift' })
+    )
+  )
+  const transferMethod = transfer.findIndex(row => row.label === 'Method')
+  expect(transfer[transferMethod + 1]).toMatchObject({ label: 'Recipient', value: 'bob.near' })
+  expect(transfer[transferMethod + 2]).toMatchObject({ label: 'Token ID', value: 'token-1' })
+  expect(transfer.some(row => row.label === 'Amount')).toBe(false)
+
+  const approval = nearActionReviewRows(
+    nearFunctionCall('nft_approve', nearArgs({ token_id: 'token-1', account_id: 'market.near' }))
+  )
+  const approvalMethod = approval.findIndex(row => row.label === 'Method')
+  expect(approval[approvalMethod + 1]).toMatchObject({
+    label: 'Approved account',
+    value: 'market.near'
+  })
+  expect(approval[approvalMethod + 2]).toMatchObject({ label: 'Token ID', value: 'token-1' })
+  expect(approval.some(row => row.label === 'Recipient' || row.label === 'Amount')).toBe(false)
+  expect(approval.some(row => row.label === 'Arguments')).toBe(true)
+})
+
+test('decodes NEAR storage and native withdrawals to the signer', () => {
+  const storage = nearActionReviewRows(
+    nearFunctionCall(
+      'storage_withdraw',
+      nearArgs({ amount: '1000000000000000000000000' }),
+      'token.near',
+      'alice.near'
+    )
+  )
+  expect(storage.find(row => row.label === 'Recipient')).toMatchObject({ value: 'alice.near' })
+  expect(storage.find(row => row.label === 'Amount')).toMatchObject({
+    value: '1 NEAR',
+    title: '1000000000000000000000000'
+  })
+
+  for (const args of [{}, { amount: null }]) {
+    const available = nearActionReviewRows(nearFunctionCall('storage_withdraw', nearArgs(args)))
+    const amount = available.find(row => row.label === 'Amount')
+    expect(amount).toMatchObject({ value: 'All available' })
+    expect(amount.title).toBeUndefined()
+    expect(available.find(row => row.label === 'Recipient')).toMatchObject({ value: 'alice.near' })
+  }
+
+  const unwrap = nearActionReviewRows(
+    nearFunctionCall(
+      'near_withdraw',
+      nearArgs({ amount: '2500000000000000000000000' }),
+      'wrap.near'
+    )
+  )
+  expect(unwrap.find(row => row.label === 'Recipient')).toMatchObject({ value: 'alice.near' })
+  expect(unwrap.find(row => row.label === 'Amount')).toMatchObject({
+    value: '2.5 NEAR',
+    title: '2500000000000000000000000'
+  })
+  expect(unwrap.some(row => row.label === 'Arguments')).toBe(true)
+})
+
+test('keeps raw NEAR arguments when a known method payload cannot be decoded', () => {
+  const payloads = [
+    nearFunctionCall('ft_transfer', nearArgs('{')),
+    nearFunctionCall('ft_transfer', nearArgs({ receiver_id: 'Bob.near', amount: '1' })),
+    nearFunctionCall('ft_transfer', nearArgs({ receiver_id: 'bob.near', amount: 1 })),
+    nearFunctionCall('ft_transfer', {
+      encoding: 'base64',
+      value: '!!!',
+      byteLength: 1,
+      sha256: digest
+    })
+  ]
+  for (const payload of payloads) {
+    const rows = nearActionReviewRows(payload)
+    expect(rows.some(row => row.label === 'Recipient' || row.label === 'Amount')).toBe(false)
+    expect(rows.some(row => row.label === 'Arguments')).toBe(true)
+  }
 })

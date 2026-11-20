@@ -5,6 +5,7 @@ import {
   createEvmBitcoinChainRegistry,
   getBundledEvmAssetDefinitions
 } from '../../../../src/core/chains/registry/index.ts'
+import { evmBytecodeHasRuntimeCode } from '../../../../src/core/chains/evm/evm-runtime-code.ts'
 import {
   buildEvmContractCall,
   buildEvmTransfer,
@@ -189,6 +190,91 @@ it('quotes the same fee as transaction preparation without reading nonce or crea
   })
   assert.equal(transfer.gasLimit, '21000')
   assert.equal(transfer.amountIndependent, undefined)
+})
+
+it('treats only canonical empty code as an account without runtime code', () => {
+  const delegation = `0xef0100${'ab'.repeat(20)}`
+  assert.equal(evmBytecodeHasRuntimeCode('0x'), false)
+  assert.equal(evmBytecodeHasRuntimeCode('0X'), false)
+  assert.equal(evmBytecodeHasRuntimeCode('0x6000'), true)
+  assert.equal(evmBytecodeHasRuntimeCode(delegation), true)
+  assert.equal(evmBytecodeHasRuntimeCode(delegation.toUpperCase()), true)
+  assert.equal(evmBytecodeHasRuntimeCode('0xef0100'), true)
+  assert.equal(evmBytecodeHasRuntimeCode(''), true)
+  assert.equal(evmBytecodeHasRuntimeCode('0x0'), true)
+  assert.equal(evmBytecodeHasRuntimeCode('not-code'), true)
+})
+
+it('simulates a native transfer when the recipient has code, including a 7702 delegation', async () => {
+  const intent = { assetId: 'eip155:1/slip44:60', recipient, amountRaw: '1' }
+  const delegation = `0xef0100${'ab'.repeat(20)}`
+  const expectedCall = { from: address, to: recipient, valueRaw: '1', data: '0x' }
+  for (const entry of [
+    { code: '0x', amountIndependent: true },
+    { code: '0x6000', amountIndependent: undefined },
+    { code: delegation, amountIndependent: undefined },
+    { code: delegation.toUpperCase(), amountIndependent: undefined }
+  ]) {
+    const calls = []
+    const estimate = await estimateEvmTransferFee({
+      chainId,
+      chainAccount,
+      assets,
+      intent,
+      rpc: rpc({
+        estimateGas: async () => '21000',
+        getCode: async codeAddress => {
+          assert.equal(codeAddress, recipient)
+          return entry.code
+        },
+        simulateCall: async call => {
+          calls.push(call)
+          return '0x'
+        }
+      })
+    })
+    assert.equal(estimate.amountIndependent, entry.amountIndependent)
+    assert.equal(estimate.gasLimit, '21000')
+    assert.deepEqual(calls, [expectedCall])
+  }
+
+  const failedLookupCalls = []
+  const failedLookup = await estimateEvmTransferFee({
+    chainId,
+    chainAccount,
+    assets,
+    intent,
+    rpc: rpc({
+      estimateGas: async () => '21000',
+      getCode: async () => {
+        throw new Error('code RPC offline')
+      },
+      simulateCall: async call => {
+        failedLookupCalls.push(call)
+        return '0x'
+      }
+    })
+  })
+  assert.equal(failedLookup.amountIndependent, undefined)
+  assert.equal(failedLookup.gasLimit, '21000')
+  assert.deepEqual(failedLookupCalls, [expectedCall])
+
+  const missingCodeCalls = []
+  const missingCode = await estimateEvmTransferFee({
+    chainId,
+    chainAccount,
+    assets,
+    intent,
+    rpc: rpc({
+      estimateGas: async () => '21000',
+      simulateCall: async call => {
+        missingCodeCalls.push(call)
+        return '0x'
+      }
+    })
+  })
+  assert.equal(missingCode.amountIndependent, undefined)
+  assert.deepEqual(missingCodeCalls, [expectedCall])
 })
 
 it('reuses a native Max fee only after chain attestation and an empty-code recipient check', async () => {

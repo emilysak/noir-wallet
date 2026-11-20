@@ -1,6 +1,6 @@
 import type { ActivityItem, ActivityScope } from '@/core/activity'
 import { EvmRpcError } from './evm-rpc-client'
-import { isZeroValueEvmTokenActivity } from './evm-indexed-activity'
+import { isZeroValueEvmTokenActivity, mergePlantedEvmRecipients } from './evm-indexed-activity'
 import {
   indexedDbEvmHistoryCache,
   type EvmHistoryCacheRecord,
@@ -197,6 +197,8 @@ function successfulRecord(input: {
   readonly attemptedAt: number
   readonly previous: EvmHistoryCacheRecord | null
   readonly fresh: readonly ActivityItem[]
+  readonly plantedRecipients?: readonly string[]
+  readonly plantedSenders?: readonly string[]
   readonly partial: boolean
   readonly hasMore?: boolean
   readonly fullScan?: boolean
@@ -205,6 +207,14 @@ function successfulRecord(input: {
   readonly pendingTtlMs: number
 }): EvmHistoryCacheRecord {
   const items = mergeItems(input.previous?.items ?? [], input.fresh, input.scope)
+  const plantedRecipients = mergePlantedEvmRecipients(
+    input.previous?.plantedRecipients,
+    input.plantedRecipients
+  )
+  const plantedSenders = mergePlantedEvmRecipients(
+    input.previous?.plantedSenders,
+    input.plantedSenders
+  )
   return Object.freeze({
     schemaVersion: 1,
     chainId: input.chainId,
@@ -228,7 +238,9 @@ function successfulRecord(input: {
       (input.historyPageCount ?? 1) > 1 || (input.previous?.historyPageCount ?? 1) <= 1
         ? input.attemptedAt
         : (input.previous?.historySyncAt ?? input.previous?.successfulSyncAt ?? null),
-    items
+    items,
+    ...(plantedRecipients.length > 0 ? { plantedRecipients } : {}),
+    ...(plantedSenders.length > 0 ? { plantedSenders } : {})
   })
 }
 
@@ -251,7 +263,13 @@ function failedRecord(input: {
     hasMore: input.previous?.hasMore ?? false,
     historyPageCount: input.previous?.historyPageCount ?? 1,
     historySyncAt: input.previous?.historySyncAt ?? input.previous?.successfulSyncAt ?? null,
-    items: normalizeItems(input.previous?.items ?? [], input.scope)
+    items: normalizeItems(input.previous?.items ?? [], input.scope),
+    ...(input.previous?.plantedRecipients?.length
+      ? { plantedRecipients: input.previous.plantedRecipients }
+      : {}),
+    ...(input.previous?.plantedSenders?.length
+      ? { plantedSenders: input.previous.plantedSenders }
+      : {})
   })
 }
 
@@ -327,6 +345,8 @@ export function createCachedEvmActivityHistorySource(
           attemptedAt,
           previous: latestPrevious,
           fresh,
+          plantedRecipients: 'plantedRecipients' in result ? result.plantedRecipients : undefined,
+          plantedSenders: 'plantedSenders' in result ? result.plantedSenders : undefined,
           partial: fresh.some(item => item.completeness === 'partial'),
           hasMore: result.hasMore,
           fullScan: sourceInput.fromBlock === undefined,
@@ -621,6 +641,9 @@ export function createCachedEvmAnkrHistoryBatchSource(options: {
               attemptedAt,
               previous,
               fresh: result.items,
+              plantedRecipients:
+                'plantedRecipients' in result ? result.plantedRecipients : undefined,
+              plantedSenders: 'plantedSenders' in result ? result.plantedSenders : undefined,
               partial: result.partial,
               hasMore: result.hasMore,
               fullScan: target.fromBlock === undefined,

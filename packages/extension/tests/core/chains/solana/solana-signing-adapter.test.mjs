@@ -138,7 +138,7 @@ test('rejects a fee quote bound to different Solana message bytes', async () => 
   ).rejects.toThrow(/different transaction message/)
 })
 
-test('preserves a failed simulation as an explicit review warning', async () => {
+test('blocks signing when Solana simulation fails', async () => {
   const adapted = await adaptSolanaPreparedSigning(
     rawPrepared(),
     {
@@ -158,7 +158,7 @@ test('preserves a failed simulation as an explicit review warning', async () => 
   )
   expect(adapted.prepared.summary).toMatchObject({
     review: {
-      level: 'caution',
+      level: 'blocked',
       issues: [{ code: 'unrecognized-instruction', subjectIndex: 2 }, { code: 'simulation-failed' }]
     },
     fields: {

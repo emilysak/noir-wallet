@@ -192,6 +192,7 @@ export {
   type BitcoinTransferOrchestratorOptions,
   type BitcoinExternalSignatureRequired,
   type BitcoinExternalSigningRequest,
+  type BitcoinReviewRequired,
   type BitcoinTransferApprovalResult,
   type BitcoinTransferSigningPort,
   type BitcoinTransferSubmission,

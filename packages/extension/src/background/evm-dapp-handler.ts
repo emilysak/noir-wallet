@@ -1,5 +1,9 @@
 import { transactionBroadcasted } from '@/core/transactions/transaction-analytics'
-import { createEvmWalletRuntimeError, supportsEvmPrivateExecution } from '@/core/chains/evm'
+import {
+  createEvmWalletRuntimeError,
+  evmBytecodeHasRuntimeCode,
+  supportsEvmPrivateExecution
+} from '@/core/chains/evm'
 import { IndexedDbTransactionRepository } from '@/infrastructure/persistence/repositories'
 import { ANALYTICS_EVENTS } from '../lib/analytics/constants'
 import type { TrackOptions } from '../lib/analytics/types'
@@ -38,6 +42,14 @@ import {
   type EvmDAppRuntimeMethod,
   type ParsedEip1193Transfer
 } from '@/core/dapp/eip1193'
+import {
+  inspectNearIntentsSigningPayload,
+  INTERNAL_SIGNATURE_DOMAIN_REJECTION_MESSAGE
+} from '@/core/dapp/internal-signature-domains'
+import {
+  inspectIntentsAddPublicKey,
+  NEAR_DAPP_ADD_INTENTS_PUBLIC_KEY_REJECTION
+} from '@/core/dapp/near-intents-add-public-key'
 import { parseChainId } from '@/core/chains/registry'
 import {
   connectionHasEvmAuthorization,
@@ -196,6 +208,15 @@ export interface EvmDAppTabInfo {
   readonly title?: string
   readonly favIconUrl?: string
   readonly pageUrl?: string
+}
+
+function rejectNearIntentsDappPayload(payload: string): void {
+  if (inspectNearIntentsSigningPayload(payload) !== 'clear') {
+    throw new Eip1193ProviderError(4200, INTERNAL_SIGNATURE_DOMAIN_REJECTION_MESSAGE)
+  }
+  if (inspectIntentsAddPublicKey(payload) === 'match') {
+    throw new Eip1193ProviderError(4200, NEAR_DAPP_ADD_INTENTS_PUBLIC_KEY_REJECTION)
+  }
 }
 
 function dappApprovalMetadata(tabInfo: EvmDAppTabInfo): Readonly<Record<string, string>> {
@@ -1128,7 +1149,9 @@ export class BackgroundEvmDAppHandler {
         try {
           if (
             parsed.kind === 'native-transfer' &&
-            (await this.options.rpc.getCode(privateTransferInput.intent.recipient)) !== '0x'
+            evmBytecodeHasRuntimeCode(
+              await this.options.rpc.getCode(privateTransferInput.intent.recipient)
+            )
           ) {
             throw new Eip1193ProviderError(
               4200,
@@ -1319,6 +1342,7 @@ export class BackgroundEvmDAppHandler {
     tabInfo: EvmDAppTabInfo
   ): Promise<string> {
     const parsed = parsePersonalSignRequest(params)
+    rejectNearIntentsDappPayload(new TextDecoder('latin1').decode(parsed.message))
     const active = await this.requireAuthorizedAccount(origin, parsed.address)
     if (
       active.context.keyDomainSource.kind === 'hardware' &&
@@ -1361,6 +1385,7 @@ export class BackgroundEvmDAppHandler {
     tabInfo: EvmDAppTabInfo
   ): Promise<string> {
     const parsed = parseTypedDataV4Request(params, this.options.network.numericChainId)
+    rejectNearIntentsDappPayload(parsed.typedDataJson)
     const active = await this.requireAuthorizedAccount(origin, parsed.address)
     if (
       active.context.keyDomainSource.kind === 'hardware' &&

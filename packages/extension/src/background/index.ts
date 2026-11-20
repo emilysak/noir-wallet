@@ -97,9 +97,11 @@ import {
 import { applyTransactionBroadcast } from '@/lib/transaction-replacement'
 import { WalletCleanupCoordinator } from './wallet-cleanup'
 import {
+  assertApprovedShieldAmount,
   getShieldableTransparentBalance,
   hasEnoughTransparentBalanceToShield,
-  MIN_SHIELDING_BALANCE_MESSAGE
+  MIN_SHIELDING_BALANCE_MESSAGE,
+  transparentShieldAmountZats
 } from '@/core/zcash/shielding'
 import type { TransactionStatusUpdatedMessage } from '@/types/transaction-messages'
 import { initializeExtensionUpdates, refreshExtensionUpdateNotice } from './extension-update'
@@ -227,6 +229,8 @@ import {
   type AssetDefinitionInput
 } from '@/core/chains/registry'
 
+import { readEvmAccountDelegation } from './evm-account-delegation'
+import { knownPermit2Tokens, readAccountPermit2Allowances } from './evm-permit2-allowances'
 import {
   computeEvmSigningPayloadFingerprint,
   createConfiguredEvmRpcClient,
@@ -309,7 +313,25 @@ import {
   toCaip25ErrorShape
 } from './multichain-session-dapp-handler'
 import { readFirstPartyDAppSessionSnapshot } from './first-party-dapp-session'
-import { caip25SessionAllowsMethod, type Caip25RuntimeMethod } from '@/core/dapp/caip25'
+import {
+  Caip25ProviderError,
+  caip25SessionAllowsMethod,
+  type Caip25RuntimeMethod
+} from '@/core/dapp/caip25'
+import {
+  acknowledgeListedOrigin,
+  addSiteListAppliedListener,
+  isCachedHardBlockedSite,
+  readDAppSiteVerdict,
+  refreshSiteList
+} from './site-list'
+import { handleSiteListInterceptMessage, promptSiteListIntercept } from './site-list-intercept'
+import {
+  BLOCKED_SITE_DISCONNECTED_TITLE,
+  blockedSiteDisconnectedMessage,
+  revokeListedSiteConnections,
+  type ListedSiteRevocationDeps
+} from './site-list-connection-revocation'
 import {
   resolveNearRuntimeNetworkConfig,
   resolveSolanaRuntimeNetworkConfig
@@ -2455,6 +2477,13 @@ async function isWalletUiContextOpen(): Promise<boolean> {
   }
 }
 
+void trustedStorageAccessReady
+  .then(storageRestricted => {
+    if (!storageRestricted) return
+    watchListedSiteConnections()
+  })
+  .catch(() => {})
+
 void trustedStorageAccessReady.then(() => initializeAnalyticsReporting()).catch(() => {})
 
 chrome.alarms.onAlarm.addListener(alarm => {
@@ -2632,6 +2661,99 @@ async function applyLatestZeroIndexerRuntime(): Promise<string | undefined> {
   }
 }
 
+function dAppSiteError(chainId: string, message: string): Error {
+  if (chainId === 'evm') return new Eip1193ProviderError(4200, message)
+  if (chainId === 'bitcoin') return new BitcoinProviderError(4200, message)
+  if (chainId === 'solana' || chainId === 'near') {
+    return new NativeTransferProviderError(4200, message)
+  }
+  if (chainId === 'multichain') return new Caip25ProviderError(4200, message)
+  return new Error(message)
+}
+
+function blockedDAppSiteError(chainId: string): Error {
+  return dAppSiteError(chainId, 'This site is blocked.')
+}
+
+let blockedSiteNotificationSerial = 0
+
+function notifyBlockedSiteDisconnected(host: string): void {
+  blockedSiteNotificationSerial += 1
+  try {
+    chrome.notifications.create(
+      `site-list-disconnect-${Date.now()}-${blockedSiteNotificationSerial}`,
+      {
+        type: 'basic',
+        iconUrl: chrome.runtime.getURL('icons/icon128.png'),
+        title: BLOCKED_SITE_DISCONNECTED_TITLE,
+        message: blockedSiteDisconnectedMessage(host),
+        priority: 1
+      }
+    )
+  } catch {
+    // The connection stays revoked when the browser cannot show a notification.
+  }
+}
+
+async function revokeConnectedOrigin(origin: string): Promise<boolean> {
+  const connection = await dappManager.getConnection(origin)
+  if (!connection) return false
+  await accountContextTransition.runActiveOperation(() => dappHandler.revokeAllPermissions(origin))
+  return true
+}
+
+function savedSiteRevocationDeps(
+  listConnections: ListedSiteRevocationDeps['listConnections'],
+  isBlocked: ListedSiteRevocationDeps['isBlocked']
+): ListedSiteRevocationDeps {
+  return {
+    listConnections,
+    isBlocked,
+    revoke: revokeConnectedOrigin,
+    notify: notifyBlockedSiteDisconnected
+  }
+}
+
+function scanSavedListedSiteConnections(): Promise<readonly string[]> {
+  return revokeListedSiteConnections(
+    savedSiteRevocationDeps(async () => {
+      const connections = await dappManager.getAllConnections()
+      return connections.map(connection => ({
+        origin: connection.origin,
+        host: connection.host
+      }))
+    }, isCachedHardBlockedSite)
+  )
+}
+
+function revokeRequestedListedSite(origin: string): Promise<readonly string[]> {
+  return revokeListedSiteConnections(
+    savedSiteRevocationDeps(
+      async () => {
+        const connection = await dappManager.getConnection(origin)
+        return connection ? [{ origin: connection.origin, host: connection.host }] : []
+      },
+      async () => true
+    )
+  )
+}
+
+function watchListedSiteConnections(): void {
+  addSiteListAppliedListener(() => {
+    void scanSavedListedSiteConnections().catch(() => {
+      console.warn('[Background] Failed to revoke blocked site connections')
+    })
+  })
+  void scanSavedListedSiteConnections().catch(() => {
+    console.warn('[Background] Failed to revoke blocked site connections')
+  })
+  void refreshSiteList()
+}
+
+function siteListNotLoadedError(chainId: string): Error {
+  return dAppSiteError(chainId, 'The site list is not loaded.')
+}
+
 const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListener>[0] = (
   message,
   sender,
@@ -2688,6 +2810,39 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
 
       try {
         const { chainId, request } = parsedMessage
+        const pageUrl = typeof sender.tab?.url === 'string' ? sender.tab.url : undefined
+        let siteListVerdict = await readDAppSiteVerdict(origin, pageUrl)
+        if (siteListVerdict.unknownReason === 'not-loaded') {
+          await refreshSiteList()
+          siteListVerdict = await readDAppSiteVerdict(origin, pageUrl)
+        }
+        if (siteListVerdict.block === 'hard') {
+          // A path hit still removes the origin grant; permissions are not path-scoped.
+          await revokeRequestedListedSite(origin).catch(() => {
+            console.warn('[Background] Failed to revoke a blocked site connection')
+          })
+          await promptSiteListIntercept({
+            kind: 'hard',
+            originKey: siteListVerdict.originKey,
+            sender
+          })
+          throw blockedDAppSiteError(chainId)
+        }
+        if (siteListVerdict.block === 'list') {
+          const continued = await promptSiteListIntercept({
+            kind: 'list',
+            originKey: siteListVerdict.originKey,
+            sender
+          })
+          if (!continued || siteListVerdict.originKey === null) {
+            await revokeRequestedListedSite(origin).catch(() => {
+              console.warn('[Background] Failed to revoke a blocked site connection')
+            })
+            throw blockedDAppSiteError(chainId)
+          }
+          await acknowledgeListedOrigin(siteListVerdict.originKey)
+        }
+        if (siteListVerdict.unknownReason === 'not-loaded') throw siteListNotLoadedError(chainId)
         if (
           chainId === 'evm' ||
           chainId === 'bitcoin' ||
@@ -4521,6 +4676,59 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
     return true
   }
 
+  if (message.type === 'GET_EVM_ACCOUNT_DELEGATION') {
+    const controller = new AbortController()
+    const networks = resolveEvmNetworkCatalog(DEFAULT_NETWORK, getActiveChainEndpointSettings())
+    void readEvmAccountDelegation({
+      walletId: message.walletId as string,
+      accountId: message.accountId as string,
+      signal: controller.signal,
+      readCatalog: () => accountNetworksCoordinator.readCatalog({ deriveMissingAddresses: false }),
+      networks,
+      getCode: (chainId, address, signal) => {
+        const network = networks.find(item => item.chainId === chainId)
+        if (!network) throw new Error('EVM network is unavailable')
+        return createConfiguredEvmRpcClient(DEFAULT_NETWORK, network).getCode(address, signal)
+      }
+    })
+      .then(result => sendResponse({ result }))
+      .catch(error => {
+        console.warn(
+          '[Background] EVM delegation request failed:',
+          error instanceof Error ? error.name : 'UnknownError'
+        )
+        sendResponse({ error: 'EVM delegation status unavailable' })
+      })
+    return true
+  }
+
+  if (message.type === 'GET_EVM_PERMIT2_ALLOWANCES') {
+    const controller = new AbortController()
+    const networks = resolveEvmNetworkCatalog(DEFAULT_NETWORK, getActiveChainEndpointSettings())
+    void readAccountPermit2Allowances({
+      walletId: message.walletId as string,
+      accountId: message.accountId as string,
+      signal: controller.signal,
+      networks,
+      tokens: knownPermit2Tokens(
+        DEFAULT_NETWORK,
+        networks,
+        userEvmAssetRecords,
+        detectedEvmAssetRecords
+      ),
+      readCatalog: () => accountNetworksCoordinator.readCatalog({ deriveMissingAddresses: false })
+    })
+      .then(result => sendResponse({ result }))
+      .catch(error => {
+        console.warn(
+          '[Background] Permit2 allowance request failed:',
+          error instanceof Error ? error.name : 'UnknownError'
+        )
+        sendResponse({ error: 'Permit2 allowances unavailable' })
+      })
+    return true
+  }
+
   if (message.type === 'GET_BITCOIN_ADDRESS_BALANCES') {
     if (!bitcoinFeatureRuntimePolicy.newOperationsEnabled) {
       sendResponse({ error: createBitcoinWalletRuntimeError('unavailable') })
@@ -4650,6 +4858,7 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
     message.type === 'PREPARE_EVM_TRANSFER' ||
     message.type === 'PREPARE_EVM_CONTRACT_CALL' ||
     message.type === 'GET_EVM_TOKEN_ALLOWANCE' ||
+    message.type === 'SELECT_EVM_ERC20_REVOKE' ||
     message.type === 'GET_EVM_TOKEN_BALANCE' ||
     message.type === 'PREPARE_EVM_CANCEL' ||
     message.type === 'PREPARE_EVM_SPEED_UP' ||
@@ -4755,40 +4964,47 @@ const handleRuntimeMessage: Parameters<typeof chrome.runtime.onMessage.addListen
                       message.expectedOwner,
                       message.executionMode
                     )
-                  : message.type === 'GET_EVM_TOKEN_BALANCE'
-                    ? evmTransferRouter.getTokenBalance(
+                  : message.type === 'SELECT_EVM_ERC20_REVOKE'
+                    ? evmTransferRouter.selectTokenRevoke(
                         message.chainId,
                         message.token,
-                        message.walletId,
-                        message.accountId,
-                        message.executionMode
+                        message.spender,
+                        message.expectedOwner
                       )
-                    : message.type === 'GET_EVM_NONCE_RECOVERY'
-                      ? evmTransferRouter.getNonceRecovery(message.chainId, message.executionMode)
-                      : message.type === 'PREPARE_EVM_NONCE_RECOVERY'
-                        ? evmTransferRouter.prepareNonceRecovery(
-                            message.chainId,
-                            message.executionMode,
-                            message.feeSelection
-                          )
-                        : message.type === 'GET_PENDING_EVM_TRANSFER'
-                          ? evmTransferRouter.getPendingApproval(message.transactionId)
-                          : message.type === 'APPROVE_EVM_TRANSFER'
-                            ? evmTransferRouter.approve(
-                                message.transactionId,
-                                message.payloadFingerprint
-                              )
-                            : message.type === 'GET_KEYSTONE_EVM_SIGNING_REQUEST'
-                              ? evmTransferRouter.getExternalSigningRequest(message.transactionId)
-                              : message.type === 'SUBMIT_KEYSTONE_EVM_SIGNATURE'
-                                ? evmTransferRouter.submitExternalSignature(
-                                    message.transactionId,
-                                    message.payloadFingerprint,
-                                    message.signatureCborBase64
-                                  )
-                                : message.type === 'REJECT_EVM_TRANSFER'
-                                  ? evmTransferRouter.reject(message.transactionId)
-                                  : evmTransferRouter.resumeBroadcast(message.transactionId)
+                    : message.type === 'GET_EVM_TOKEN_BALANCE'
+                      ? evmTransferRouter.getTokenBalance(
+                          message.chainId,
+                          message.token,
+                          message.walletId,
+                          message.accountId,
+                          message.executionMode
+                        )
+                      : message.type === 'GET_EVM_NONCE_RECOVERY'
+                        ? evmTransferRouter.getNonceRecovery(message.chainId, message.executionMode)
+                        : message.type === 'PREPARE_EVM_NONCE_RECOVERY'
+                          ? evmTransferRouter.prepareNonceRecovery(
+                              message.chainId,
+                              message.executionMode,
+                              message.feeSelection
+                            )
+                          : message.type === 'GET_PENDING_EVM_TRANSFER'
+                            ? evmTransferRouter.getPendingApproval(message.transactionId)
+                            : message.type === 'APPROVE_EVM_TRANSFER'
+                              ? evmTransferRouter.approve(
+                                  message.transactionId,
+                                  message.payloadFingerprint
+                                )
+                              : message.type === 'GET_KEYSTONE_EVM_SIGNING_REQUEST'
+                                ? evmTransferRouter.getExternalSigningRequest(message.transactionId)
+                                : message.type === 'SUBMIT_KEYSTONE_EVM_SIGNATURE'
+                                  ? evmTransferRouter.submitExternalSignature(
+                                      message.transactionId,
+                                      message.payloadFingerprint,
+                                      message.signatureCborBase64
+                                    )
+                                  : message.type === 'REJECT_EVM_TRANSFER'
+                                    ? evmTransferRouter.reject(message.transactionId)
+                                    : evmTransferRouter.resumeBroadcast(message.transactionId)
     void operation
       .then(result => {
         if (debugRequestId) {
@@ -6460,6 +6676,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (isRuntimeRecord(message) && handleEvmWalletChoiceMessage(message, sender, sendResponse)) {
     return true
   }
+
+  if (isRuntimeRecord(message) && handleSiteListInterceptMessage(message, sender, sendResponse)) {
+    return true
+  }
   if (isRuntimeRecord(message) && message.type === 'GET_WALLET_SESSION_STATE') {
     return handleRuntimeMessage(message, sender, sendResponse)
   }
@@ -7601,10 +7821,16 @@ async function handleHardwarePcztBuild(
     const built = await withTxSyncPause(walletId, async () => {
       const walletCore = await prepareWalletCoreForTx(walletId, accountId, siteBound)
       if (kind === 'shield' || fundingSource === 'transparent') {
-        await prepareTransparentSpend(
+        const transparentBalance = await prepareTransparentSpend(
           walletCore,
           kind === 'send' && !maxTransfer ? amount : undefined
         )
+        if (kind === 'shield') {
+          assertApprovedShieldAmount(
+            transparentShieldAmountZats(amount ?? ''),
+            transparentShieldAmountZats(getShieldableTransparentBalance(transparentBalance))
+          )
+        }
       }
       let effectiveAmount = amount
       if (maxTransfer) {
@@ -7759,6 +7985,10 @@ async function handleBackgroundZcashTx(params: {
         if (!hasEnoughTransparentBalanceToShield(transparentBalance)) {
           throw new Error(MIN_SHIELDING_BALANCE_MESSAGE)
         }
+        assertApprovedShieldAmount(
+          transparentShieldAmountZats(pendingRecord.amount),
+          transparentShieldAmountZats(transparentBalance)
+        )
         onChainAmount = transparentBalance
         await transactionRecorder.updateTransaction(accountKey, transactionId, {
           amount: transparentBalance
@@ -7778,7 +8008,8 @@ async function handleBackgroundZcashTx(params: {
           marginalFeeZats,
           approvedAccountIndex,
           transactionContext,
-          feeQuoteId
+          feeQuoteId,
+          transparentShieldAmountZats(pendingRecord.amount)
         )
         txid = shieldResult.txid
         txHashes = [txid]

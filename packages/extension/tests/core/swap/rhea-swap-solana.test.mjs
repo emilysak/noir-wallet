@@ -238,6 +238,40 @@ test('does not sign twice when a Solana broadcast is recovered after quote expir
   expect(harness.calls.filter(call => call === 'read-plan')).toHaveLength(2)
 })
 
+test('does not keep a confirmable pending when Solana simulation is blocked', async () => {
+  const harness = createHarness({
+    signer: {
+      async prepare() {
+        harness.calls.push('prepare-signing')
+        return {
+          commandId: 'command-solana-reverted',
+          chainId: 'solana:mainnet',
+          operation: 'transaction',
+          summary: {
+            schema: 'solana.transaction.v1',
+            review: { level: 'blocked', issues: [{ code: 'simulation-failed' }] },
+            fields: {
+              requiredSigners: [sender],
+              recentBlockhash: sourceHash,
+              addressTableLookups: []
+            }
+          },
+          payloadFingerprint: { algorithm: 'sha256', digestHex: fingerprint },
+          execution: { kind: 'internal' },
+          expiresAt: 5_000
+        }
+      }
+    }
+  })
+  await expect(harness.coordinator.prepare(binding().quoteHandle, binding())).rejects.toThrow(
+    /failed simulation and cannot be signed/
+  )
+  expect(harness.store.values.size).toBe(0)
+  expect(harness.calls).toContain('cancel-signing')
+  expect(harness.calls).not.toContain('confirm-signing')
+  await expect(harness.coordinator.confirm(binding().quoteHandle, fingerprint)).rejects.toThrow()
+})
+
 test('rejects metadata that is not bound to the serialized Solana transaction', async () => {
   const harness = createHarness({
     service: {

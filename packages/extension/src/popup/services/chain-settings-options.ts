@@ -17,8 +17,13 @@ import {
   resolveNearFeatureRuntimePolicy,
   resolveSolanaFeatureRuntimePolicy
 } from '@/core/chains/feature-runtime-policy'
-import type { ChainEndpointSettings, ChainRpcProtocol } from '@/core/chains/chain-endpoint-settings'
+import {
+  findChainEndpointOverride,
+  type ChainEndpointSettings,
+  type ChainRpcProtocol
+} from '@/core/chains/chain-endpoint-settings'
 import { resolveEvmNetworkCatalog } from '@/core/chains/evm-runtime-config'
+import { resolveEvmRpcOrigin, rpcUrlsMatch, type EvmRpcOrigin } from '@/core/chains/evm-rpc-origin'
 import { DEFAULT_NETWORK } from '@/lib/runtime-network'
 import {
   getEvmRpcEndpointOptions,
@@ -63,8 +68,19 @@ export interface NetworkSettingsOption {
   readonly label: string
   readonly iconChain: string
   readonly source: 'builtin' | 'custom'
+  readonly rpcOrigin: EvmRpcOrigin
   readonly numericChainId?: number
   readonly currencySymbol: string
+}
+
+function displayedRpcOrigin(settings: ChainEndpointSettings, option: RpcChainOption): EvmRpcOrigin {
+  if (option.protocol === 'evm-json-rpc') {
+    return resolveEvmRpcOrigin(DEFAULT_NETWORK, settings, option.chainId)
+  }
+  const selected = findChainEndpointOverride(settings, option.chainId)?.rpc
+  if (!selected) return 'builtin'
+  const preset = option.presets?.some(candidate => rpcUrlsMatch(candidate.url, selected.url))
+  return preset ? 'builtin' : 'user'
 }
 
 export function buildNetworkSettingsOptions(
@@ -75,6 +91,12 @@ export function buildNetworkSettingsOptions(
     ? resolveEvmNetworkCatalog(DEFAULT_NETWORK, settings)
     : []
   const evmById = new Map(evmNetworks.map(network => [network.chainId, network]))
+  const rpcOriginByChain = new Map(
+    buildRpcChainOptions(settings).map(option => [
+      option.chainId,
+      displayedRpcOrigin(settings, option)
+    ])
+  )
   const nativeSymbols: Readonly<Record<string, string>> = {
     zec: 'ZEC',
     btc: 'BTC',
@@ -89,6 +111,7 @@ export function buildNetworkSettingsOptions(
         label: option.label,
         iconChain: option.iconChain,
         source: evm?.source ?? 'builtin',
+        rpcOrigin: rpcOriginByChain.get(option.chainId) ?? 'builtin',
         ...(evm ? { numericChainId: evm.numericChainId } : {}),
         currencySymbol: evm?.nativeCurrency.symbol ?? nativeSymbols[option.iconChain] ?? ''
       })

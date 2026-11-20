@@ -4,6 +4,7 @@ import { parseAssetId, parseChainId } from '@/core/chains/registry'
 import { EvmRpcError } from './evm-rpc-client'
 import {
   EVM_HISTORY_LIMIT,
+  collectPlantedEvmCounterparties,
   mapEvmIndexedActivity,
   type EvmActivityHistorySource,
   type FindEvmConfirmedReplacementInput,
@@ -339,60 +340,68 @@ export function createEvmBlockscoutHistoryClient(
     })
   }
 
-  return Object.freeze({
-    readAddressActivity: async (input: ReadEvmAddressActivityInput) => {
-      const address = parseAddress(input.address, 'EVM history address')
-      const [normalResult, tokenResults] = await Promise.all([
-        readNormalTransactions(address, input.signal, input.fromBlock).then(
-          value => ({ status: 'fulfilled' as const, value }),
-          reason => ({ status: 'rejected' as const, reason: reason as unknown })
-        ),
-        Promise.all(
-          trackedAssets.map(async asset =>
-            request('tokentx', address, input.signal, asset.contract, input.fromBlock).then(
-              response =>
-                ({
-                  status: 'fulfilled' as const,
-                  value: Object.freeze({
-                    items: Object.freeze(
-                      response.items.map(item => parseTokenTransfer(item, asset))
-                    ),
-                    partial: response.partial
-                  })
-                }) as const,
-              reason => ({ status: 'rejected' as const, reason: reason as unknown })
-            )
+  const readAddressActivityWithMetadata = async (input: ReadEvmAddressActivityInput) => {
+    const address = parseAddress(input.address, 'EVM history address')
+    const [normalResult, tokenResults] = await Promise.all([
+      readNormalTransactions(address, input.signal, input.fromBlock).then(
+        value => ({ status: 'fulfilled' as const, value }),
+        reason => ({ status: 'rejected' as const, reason: reason as unknown })
+      ),
+      Promise.all(
+        trackedAssets.map(async asset =>
+          request('tokentx', address, input.signal, asset.contract, input.fromBlock).then(
+            response =>
+              ({
+                status: 'fulfilled' as const,
+                value: Object.freeze({
+                  items: Object.freeze(response.items.map(item => parseTokenTransfer(item, asset))),
+                  partial: response.partial
+                })
+              }) as const,
+            reason => ({ status: 'rejected' as const, reason: reason as unknown })
           )
         )
-      ])
-      const firstFailure =
-        normalResult.status === 'rejected'
-          ? normalResult.reason
-          : tokenResults.find(result => result.status === 'rejected')?.reason
-      const sourcePartial =
-        firstFailure !== undefined ||
-        (normalResult.status === 'fulfilled' && normalResult.value.partial) ||
-        tokenResults.some(result => result.status === 'fulfilled' && result.value.partial)
-      const normalTransactions =
-        normalResult.status === 'fulfilled' ? normalResult.value.items : Object.freeze([])
-      const tokenGroups = tokenResults.map(result =>
-        result.status === 'fulfilled' ? result.value.items : Object.freeze([])
       )
-      const tokenTransfers = tokenGroups.flat()
-      const items = mapEvmIndexedActivity({
-        request: input,
-        chainId: chain.id,
-        nativeAssetId: nativeAssetId.id,
-        normalTransactions,
-        tokenTransfers,
-        sourcePartial
-      })
-      if (items.length === 0 && sourcePartial) {
-        if (firstFailure !== undefined) throw firstFailure
-        throw new EvmRpcError('invalid-response', 'EVM token history scan is incomplete')
-      }
-      return items
-    },
+    ])
+    const firstFailure =
+      normalResult.status === 'rejected'
+        ? normalResult.reason
+        : tokenResults.find(result => result.status === 'rejected')?.reason
+    const sourcePartial =
+      firstFailure !== undefined ||
+      (normalResult.status === 'fulfilled' && normalResult.value.partial) ||
+      tokenResults.some(result => result.status === 'fulfilled' && result.value.partial)
+    const normalTransactions =
+      normalResult.status === 'fulfilled' ? normalResult.value.items : Object.freeze([])
+    const tokenGroups = tokenResults.map(result =>
+      result.status === 'fulfilled' ? result.value.items : Object.freeze([])
+    )
+    const tokenTransfers = tokenGroups.flat()
+    const items = mapEvmIndexedActivity({
+      request: input,
+      chainId: chain.id,
+      nativeAssetId: nativeAssetId.id,
+      normalTransactions,
+      tokenTransfers,
+      sourcePartial
+    })
+    if (items.length === 0 && sourcePartial) {
+      if (firstFailure !== undefined) throw firstFailure
+      throw new EvmRpcError('invalid-response', 'EVM token history scan is incomplete')
+    }
+    const planted = collectPlantedEvmCounterparties(address, tokenTransfers)
+    return {
+      items,
+      hasMore: false,
+      ...(planted.recipients.length > 0 ? { plantedRecipients: planted.recipients } : {}),
+      ...(planted.senders.length > 0 ? { plantedSenders: planted.senders } : {})
+    }
+  }
+
+  return Object.freeze({
+    readAddressActivity: async (input: ReadEvmAddressActivityInput) =>
+      (await readAddressActivityWithMetadata(input)).items,
+    readAddressActivityWithMetadata,
     findConfirmedReplacement: async (input: FindEvmConfirmedReplacementInput) => {
       const sender = parseAddress(input.sender, 'EVM replacement sender')
       const nonce = parseUnsignedDecimal(input.nonce, 'EVM replacement nonce')

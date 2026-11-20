@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
 import { NEAR_NETWORKS } from '../../../../src/config/networks.ts'
+import { nearPublicKeyFromImplicitAccountId } from '../../../../src/core/chains/near/identifiers.ts'
 import {
   createNearRpcClient,
   NearRpcError
@@ -198,6 +199,86 @@ test.describe('NEAR JSON-RPC client', () => {
         code: 'invalid-response'
       }
     )
+  })
+
+  test('lists finalized access keys and rejects an ambiguous list', async () => {
+    const retained = nearPublicKeyFromImplicitAccountId('11'.repeat(32))
+    const state = harness(body => {
+      expect(body.params).toEqual({
+        request_type: 'view_access_key_list',
+        finality: 'final',
+        account_id: 'alice.testnet'
+      })
+      return jsonResult(body, {
+        block_hash: blockHash,
+        block_height: 44,
+        keys: [
+          {
+            public_key: publicKey,
+            access_key: { nonce: '7', permission: 'FullAccess' }
+          },
+          {
+            public_key: retained,
+            access_key: {
+              nonce: 8,
+              permission: {
+                FunctionCall: {
+                  allowance: '1',
+                  method_names: [],
+                  receiver_id: 'contract.testnet'
+                }
+              }
+            }
+          }
+        ]
+      })
+    })
+
+    await expect(state.client.listAccessKeys('alice.testnet')).resolves.toEqual({
+      accountId: 'alice.testnet',
+      blockHash,
+      blockHeight: 44,
+      keys: [
+        {
+          accountId: 'alice.testnet',
+          publicKey,
+          nonce: '7',
+          permission: { kind: 'full-access' },
+          blockHash,
+          blockHeight: 44
+        },
+        {
+          accountId: 'alice.testnet',
+          publicKey: retained,
+          nonce: '8',
+          permission: {
+            kind: 'function-call',
+            allowanceRaw: '1',
+            receiverId: 'contract.testnet',
+            methodNames: []
+          },
+          blockHash,
+          blockHeight: 44
+        }
+      ]
+    })
+
+    const duplicate = harness(() =>
+      jsonResult(
+        { id: 1 },
+        {
+          block_hash: blockHash,
+          block_height: 1,
+          keys: [
+            { public_key: publicKey, access_key: { nonce: 1, permission: 'FullAccess' } },
+            { public_key: publicKey, access_key: { nonce: 1, permission: 'FullAccess' } }
+          ]
+        }
+      )
+    )
+    await expect(duplicate.client.listAccessKeys('alice.testnet')).rejects.toMatchObject({
+      code: 'invalid-response'
+    })
   })
 
   test('maps both structured RPC and in-result missing account/access-key responses to null', async () => {

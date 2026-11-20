@@ -107,6 +107,8 @@ export const PAGE_IDS = {
   SETTINGS: 'noir_settings',
   DEFAULT_EVM_WALLET: 'noir_default_evm_wallet',
   EVM_WALLET_CHOICE: 'noir_evm_wallet_choice',
+  /** dApp site block: hard close, or typed-host continue for a list hit */
+  SITE_INTERCEPT: 'noir_site_intercept',
   /** Settings: general (auto-lock, currency…) */
   SETTINGS_GENERAL: 'noir_settings_general',
   /** Settings: network configuration */
@@ -192,6 +194,7 @@ const ROUTE_PAGE_IDS: Record<string, string> = {
   '/settings': PAGE_IDS.SETTINGS,
   '/default-evm-wallet': PAGE_IDS.DEFAULT_EVM_WALLET,
   '/evm-wallet-choice': PAGE_IDS.EVM_WALLET_CHOICE,
+  '/site-intercept': PAGE_IDS.SITE_INTERCEPT,
   '/general': PAGE_IDS.SETTINGS_GENERAL,
   '/networks': PAGE_IDS.SETTINGS_NETWORKS,
   '/zero-indexer-nodes': PAGE_IDS.SETTINGS_ZERO_INDEXER_NODES,

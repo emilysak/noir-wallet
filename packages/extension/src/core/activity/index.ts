@@ -9,6 +9,7 @@ export {
   ACTIVITY_SOURCES,
   type ActivityCompleteness,
   type ActivityItem,
+  type ActivityPlantedRecipient,
   type ActivityReadModel,
   type ActivityScope,
   type ActivitySegment,

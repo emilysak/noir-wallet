@@ -13,18 +13,33 @@ import type {
   ZcashMessageSummary,
   ZcashTransactionSummary
 } from '@/core/keyring/domain'
+import { nearFunctionCallReviewRows } from './near-function-call-review'
 import {
   canonicalContentRows,
   completeReviewModel,
   payloadDigestRows,
   reviewRow,
+  UNLIMITED_AMOUNT_LABEL,
   type SigningSummaryReviewModel,
   type SigningSummaryReviewRow,
   type TokenAuthorizationReview
 } from './signing-summary-review-model-types'
-import { decodeEvmPermitReview } from '@/infrastructure/chains/evm/evm-permit-review'
+import {
+  decodeEvmTypedDataRecognition,
+  type EvmBlurOrder,
+  type EvmReceiverOrder,
+  type EvmSafeTx,
+  type EvmSeaportOrder,
+  type EvmTypedDataRecognition
+} from '@/infrastructure/chains/evm/evm-typed-data-recognition'
 import { formatEvmWeiAsGwei } from '@/infrastructure/chains/evm'
-import { decodeErc20CalldataRequest } from '@/infrastructure/chains/evm/evm-contract-call-classification'
+import {
+  decodeErc20CalldataRequest,
+  decodeEvmAuthorizationCall,
+  PERMIT2_CONTRACT,
+  PERMIT2_LOCKDOWN_EFFECT,
+  PERMIT2_TOKEN_REVOKE_EFFECT
+} from '@/infrastructure/chains/evm/evm-contract-call-classification'
 import { formatSortAddress } from '@/lib/format'
 import {
   formatAmount,
@@ -32,18 +47,252 @@ import {
   formatFeeAmount,
   formatReviewAmount
 } from '@/lib/number-format'
+import {
+  evmRpcOriginLabel,
+  presentEvmRevocationLabel,
+  type EvmRpcOrigin
+} from '@/core/chains/evm-rpc-origin'
+import {
+  aggregateEvmSimulationAssetChanges,
+  type EvmSimulationTransfers
+} from '@/core/chains/evm/evm-simulation-asset-changes'
 
 export interface EvmReviewPresentationOptions {
   readonly nativeCurrency?: { readonly symbol: string; readonly decimals: number }
   readonly directContract?: boolean
+  readonly rpcOrigin?: EvmRpcOrigin
   readonly tokenMetadata?: readonly {
     readonly contractAddress: string
     readonly symbol: string
+    readonly name?: string
     readonly decimals: number
+    readonly verification?: 'trusted' | 'user-approved' | 'unverified'
   }[]
+  readonly simulationTransfers?: EvmSimulationTransfers
 }
 
 const MAX_UINT256 = ((1n << 256n) - 1n).toString()
+
+type UnlimitedAmountUnit = keyof typeof UNLIMITED_AMOUNT_LABEL
+
+function unlimitedAllowanceUnit(
+  amountRaw: string,
+  amountBits: 160 | 256
+): UnlimitedAmountUnit | undefined {
+  // Unlimited is exact equality with the field maximum, not a large-value cutoff.
+  if (BigInt(amountRaw) !== (1n << BigInt(amountBits)) - 1n) return undefined
+  return amountBits === 160 ? 'uint160' : 'uint256'
+}
+
+const DISPLAY_CONTROL_CHARACTERS =
+  /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/
+const MAXIMUM_REPORTED_SYMBOL_CODE_POINTS = 32
+const MAXIMUM_REPORTED_NAME_CODE_POINTS = 128
+const TOKEN_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/
+
+function readDisplayText(value: string, maximumCodePoints: number): string | undefined {
+  const text = value.normalize('NFC')
+  if (
+    text.length === 0 ||
+    text.trim() !== text ||
+    [...text].length > maximumCodePoints ||
+    DISPLAY_CONTROL_CHARACTERS.test(text)
+  ) {
+    return undefined
+  }
+  return text
+}
+
+function sameContractAddress(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase()
+}
+
+function decimalsInRange(value: number): boolean {
+  return Number.isInteger(value) && value >= 0 && value <= 255
+}
+
+function reviewToken(options: EvmReviewPresentationOptions, contractAddress: string) {
+  return options.tokenMetadata?.find(token =>
+    sameContractAddress(token.contractAddress, contractAddress)
+  )
+}
+
+function bundledToken(
+  options: EvmReviewPresentationOptions,
+  contractAddress: string
+): { readonly symbol: string; readonly name?: string; readonly decimals: number } | undefined {
+  const token = reviewToken(options, contractAddress)
+  if (!token || token.verification !== 'trusted' || !decimalsInRange(token.decimals)) {
+    return undefined
+  }
+  const symbol = readDisplayText(token.symbol, MAXIMUM_REPORTED_SYMBOL_CODE_POINTS)
+  if (!symbol) return undefined
+  const name =
+    token.name === undefined
+      ? undefined
+      : readDisplayText(token.name, MAXIMUM_REPORTED_NAME_CODE_POINTS)
+  return { symbol, decimals: token.decimals, ...(name === undefined ? {} : { name }) }
+}
+
+function userApprovedToken(
+  options: EvmReviewPresentationOptions,
+  contractAddress: string
+): { readonly symbol: string; readonly decimals: number } | undefined {
+  const token = reviewToken(options, contractAddress)
+  if (!token || token.verification !== 'user-approved' || !decimalsInRange(token.decimals)) {
+    return undefined
+  }
+  const symbol = readDisplayText(token.symbol, MAXIMUM_REPORTED_SYMBOL_CODE_POINTS)
+  if (!symbol) return undefined
+  return { symbol, decimals: token.decimals }
+}
+
+function reportedMetadataSymbol(
+  options: EvmReviewPresentationOptions,
+  contractAddress: string
+): string | undefined {
+  const token = reviewToken(options, contractAddress)
+  if (!token || token.verification === 'trusted' || token.verification === 'user-approved') {
+    return undefined
+  }
+  return readDisplayText(token.symbol, MAXIMUM_REPORTED_SYMBOL_CODE_POINTS)
+}
+
+function presentTokenIdentity(
+  options: EvmReviewPresentationOptions,
+  contractAddress: string,
+  amountRaw: string,
+  domainName?: string
+): { readonly symbol: string | null; readonly amount: string; readonly selfReportedName?: string } {
+  const bundled = bundledToken(options, contractAddress)
+  if (bundled) {
+    const conflicts =
+      domainName !== undefined && domainName !== bundled.symbol && domainName !== bundled.name
+    return {
+      symbol: bundled.symbol,
+      amount: formatBaseUnitDecimalAmount(amountRaw, bundled.decimals),
+      ...(conflicts ? { selfReportedName: domainName } : {})
+    }
+  }
+  const approved = userApprovedToken(options, contractAddress)
+  const selfReportedName =
+    domainName ?? approved?.symbol ?? reportedMetadataSymbol(options, contractAddress)
+  return {
+    symbol: null,
+    amount: approved ? formatBaseUnitDecimalAmount(amountRaw, approved.decimals) : amountRaw,
+    ...(selfReportedName === undefined ? {} : { selfReportedName })
+  }
+}
+
+function evmAuthorizationCallRows(
+  summary: EvmTransactionSummary,
+  options: EvmReviewPresentationOptions
+): readonly SigningSummaryReviewRow[] {
+  const contract = summary.fields.to
+  if (contract === null || summary.fields.calldata.encoding !== 'hex') return []
+  const authorization = decodeEvmAuthorizationCall(summary.fields.calldata.value, contract)
+  if (!authorization) return []
+  const addressRow = (label: string, value: string) =>
+    reviewRow(label, formatSortAddress(value), { code: true, title: value })
+  const formatTokenAmount = (contractAddress: string, raw: string, unlimited: boolean) => {
+    if (unlimited) return 'Unlimited'
+    const knownToken = bundledToken(options, contractAddress)
+    return knownToken ? `${formatAmount(raw, knownToken.decimals)} ${knownToken.symbol}` : raw
+  }
+  const allowanceRow = (
+    contractAddress: string,
+    raw: string,
+    unlimitedUnit: UnlimitedAmountUnit | undefined
+  ) =>
+    reviewRow(
+      'Requested allowance',
+      formatTokenAmount(contractAddress, raw, unlimitedUnit !== undefined),
+      {
+        code: true,
+        breakAll: true,
+        ...(unlimitedUnit === undefined
+          ? {}
+          : { tone: 'warning' as const, title: UNLIMITED_AMOUNT_LABEL[unlimitedUnit] })
+      }
+    )
+  const permit2RevokeRow = clearsPermit2TokenAllowance(authorization)
+    ? [reviewRow('Revoke effect', PERMIT2_TOKEN_REVOKE_EFFECT)]
+    : []
+  switch (authorization.kind) {
+    case 'erc20-approve':
+      return [
+        reviewRow('Requested method', 'approve', { code: true }),
+        addressRow('Requested spender', authorization.spender),
+        allowanceRow(
+          contract,
+          authorization.amountRaw,
+          authorization.unlimited ? 'uint256' : undefined
+        ),
+        ...permit2RevokeRow
+      ]
+    case 'erc20-increase-allowance':
+      return [
+        reviewRow('Requested method', 'increaseAllowance', { code: true }),
+        addressRow('Requested spender', authorization.spender),
+        reviewRow(
+          'Allowance increase',
+          formatTokenAmount(contract, authorization.amountRaw, false),
+          { code: true, breakAll: true }
+        )
+      ]
+    case 'erc20-decrease-allowance':
+      return [
+        reviewRow('Requested method', 'decreaseAllowance', { code: true }),
+        addressRow('Requested spender', authorization.spender),
+        reviewRow(
+          'Allowance decrease',
+          formatTokenAmount(contract, authorization.amountRaw, false),
+          { code: true, breakAll: true }
+        ),
+        ...permit2RevokeRow
+      ]
+    case 'erc721-set-approval-for-all':
+      return [
+        reviewRow('Requested method', 'setApprovalForAll', { code: true }),
+        addressRow('Requested operator', authorization.operator),
+        reviewRow('Approve all tokens', authorization.approved ? 'Yes' : 'No', {
+          ...(authorization.approved ? { tone: 'warning' as const } : {})
+        })
+      ]
+    case 'permit2-approve':
+      return [
+        reviewRow('Requested method', 'Permit2.approve', { code: true }),
+        addressRow('Token contract', authorization.token),
+        addressRow('Requested spender', authorization.spender),
+        allowanceRow(
+          authorization.token,
+          authorization.amountRaw,
+          authorization.unlimited ? 'uint160' : undefined
+        ),
+        reviewRow(
+          'Expiration',
+          authorization.expirationRaw === '0' ? 'On submission' : authorization.expirationRaw,
+          {
+            code: authorization.expirationRaw !== '0'
+          }
+        )
+      ]
+    case 'permit2-lockdown':
+      return [
+        reviewRow('Requested method', 'Permit2.lockdown', { code: true }),
+        ...authorization.pairs.flatMap((pair, index) => {
+          const suffix = authorization.pairs.length > 1 ? ` ${index + 1}` : ''
+          return [
+            addressRow(`Token contract${suffix}`, pair.token),
+            addressRow(`Spender${suffix}`, pair.spender),
+            reviewRow(`Effect${suffix}`, 'Amount and expiration set to zero')
+          ]
+        })
+      ]
+    default:
+      return assertNever(authorization)
+  }
+}
 
 function evmRequestedTokenCallRows(
   summary: EvmTransactionSummary,
@@ -51,20 +300,13 @@ function evmRequestedTokenCallRows(
 ): readonly SigningSummaryReviewRow[] {
   const contract = summary.fields.to
   if (contract === null || summary.fields.calldata.encoding !== 'hex') return []
+  const authorizationRows = evmAuthorizationCallRows(summary, options)
+  if (authorizationRows.length > 0) return authorizationRows
   const request = decodeErc20CalldataRequest(summary.fields.calldata.value)
   if (!request) return []
-  const knownToken = options.tokenMetadata?.find(
-    token => token.contractAddress.toLowerCase() === contract.toLowerCase()
-  )
+  const knownToken = bundledToken(options, contract)
   // ERC-721 shares approve/transferFrom selectors; the selector alone cannot establish ERC-20 semantics.
-  if (
-    !knownToken ||
-    !Number.isInteger(knownToken.decimals) ||
-    knownToken.decimals < 0 ||
-    knownToken.decimals > 255
-  ) {
-    return []
-  }
+  if (!knownToken) return []
   const amount = (raw: string) => {
     if (request.kind === 'approve' && raw === MAX_UINT256) {
       return 'Unlimited'
@@ -94,6 +336,21 @@ function evmRequestedTokenCallRows(
             reviewRow('Requested amount', amount(request.amountRaw), { code: true, breakAll: true })
           ])
   ]
+}
+
+function clearsPermit2TokenAllowance(
+  authorization: NonNullable<ReturnType<typeof decodeEvmAuthorizationCall>>
+): boolean {
+  if (authorization.kind === 'erc20-approve') {
+    return (
+      authorization.amountRaw === '0' && authorization.spender.toLowerCase() === PERMIT2_CONTRACT
+    )
+  }
+  // approve(spender, 0) is the usual clear. decreaseAllowance is the fallback when that call reverts.
+  return (
+    authorization.kind === 'erc20-decrease-allowance' &&
+    authorization.spender.toLowerCase() === PERMIT2_CONTRACT
+  )
 }
 
 function assertNever(value: never): never {
@@ -133,7 +390,8 @@ function typedDataRows(
 
 function nearActionRows(
   action: NearActionSummary,
-  index: number
+  index: number,
+  context: { readonly signerId: string; readonly receiverId: string }
 ): readonly SigningSummaryReviewRow[] {
   const prefix = `Action ${index + 1}`
   switch (action.kind) {
@@ -148,6 +406,10 @@ function nearActionRows(
       return [
         reviewRow(prefix, 'Function call'),
         reviewRow('Method', action.methodName, { code: true }),
+        ...nearFunctionCallReviewRows(action.methodName, action.args, {
+          signerId: context.signerId,
+          tokenContractId: context.receiverId
+        }),
         reviewRow('Gas', action.gas, { code: true }),
         reviewRow('Deposit', `${action.depositYocto} yoctoNEAR`, { code: true }),
         ...canonicalContentRows('Arguments', action.args)
@@ -267,16 +529,236 @@ export function zcashMessageReview(summary: ZcashMessageSummary): SigningSummary
   })
 }
 
+function evmOnChainTokenAuthorization(
+  summary: EvmTransactionSummary,
+  options: EvmReviewPresentationOptions
+): TokenAuthorizationReview | undefined {
+  const contract = summary.fields.to
+  if (contract === null || summary.fields.calldata.encoding !== 'hex') return undefined
+  const authorization = decodeEvmAuthorizationCall(summary.fields.calldata.value, contract)
+  if (!authorization) return undefined
+  const tokenFields = (
+    tokenContract: string,
+    raw: string,
+    unlimitedUnit: UnlimitedAmountUnit | undefined
+  ) => {
+    const identity = presentTokenIdentity(options, tokenContract, unlimitedUnit ? '0' : raw)
+    return {
+      symbol: identity.symbol,
+      amount: unlimitedUnit ? 'Unlimited' : identity.amount,
+      ...(identity.selfReportedName === undefined
+        ? {}
+        : { selfReportedName: identity.selfReportedName }),
+      ...(unlimitedUnit === undefined ? {} : { unlimitedUnit })
+    }
+  }
+  switch (authorization.kind) {
+    case 'erc20-approve':
+      return {
+        protocol: 'ERC-20',
+        kind: 'allowance',
+        ...(clearsPermit2TokenAllowance(authorization)
+          ? { effect: 'revoke-permit2' as const }
+          : {}),
+        owner: summary.fields.from,
+        spender: authorization.spender,
+        signatureDeadline: 'On submission',
+        tokens: [
+          {
+            contractAddress: contract,
+            assetId: `${summary.chainId}/erc20:${contract.toLowerCase()}`,
+            ...tokenFields(
+              contract,
+              authorization.amountRaw,
+              authorization.unlimited ? 'uint256' : undefined
+            ),
+            unlimited: authorization.unlimited
+          }
+        ]
+      }
+    case 'erc20-increase-allowance':
+      return {
+        protocol: 'ERC-20',
+        kind: 'allowance',
+        owner: summary.fields.from,
+        spender: authorization.spender,
+        signatureDeadline: 'On submission',
+        tokens: [
+          {
+            contractAddress: contract,
+            assetId: `${summary.chainId}/erc20:${contract.toLowerCase()}`,
+            ...tokenFields(contract, authorization.amountRaw, undefined),
+            unlimited: false
+          }
+        ]
+      }
+    case 'erc20-decrease-allowance':
+      return {
+        protocol: 'ERC-20',
+        kind: 'allowance',
+        ...(clearsPermit2TokenAllowance(authorization)
+          ? { effect: 'revoke-permit2' as const }
+          : {}),
+        owner: summary.fields.from,
+        spender: authorization.spender,
+        signatureDeadline: 'On submission',
+        tokens: [
+          {
+            contractAddress: contract,
+            assetId: `${summary.chainId}/erc20:${contract.toLowerCase()}`,
+            ...tokenFields(contract, authorization.amountRaw, undefined),
+            unlimited: false
+          }
+        ]
+      }
+    case 'erc721-set-approval-for-all':
+      return {
+        protocol: 'ERC-721',
+        kind: 'allowance',
+        owner: summary.fields.from,
+        spender: authorization.operator,
+        signatureDeadline: 'On submission',
+        tokens: [
+          {
+            contractAddress: contract,
+            assetId: `${summary.chainId}/erc721:${contract.toLowerCase()}`,
+            symbol: null,
+            amount: authorization.approved
+              ? 'All token IDs'
+              : presentEvmRevocationLabel(options.rpcOrigin),
+            unlimited: authorization.approved
+          }
+        ]
+      }
+    case 'permit2-approve':
+      return {
+        protocol: 'Permit2',
+        kind: 'allowance',
+        owner: summary.fields.from,
+        spender: authorization.spender,
+        signatureDeadline:
+          authorization.expirationRaw === '0' ? 'On submission' : authorization.expirationRaw,
+        tokens: [
+          {
+            contractAddress: authorization.token,
+            assetId: `${summary.chainId}/erc20:${authorization.token.toLowerCase()}`,
+            ...tokenFields(
+              authorization.token,
+              authorization.amountRaw,
+              authorization.unlimited ? 'uint160' : undefined
+            ),
+            unlimited: authorization.unlimited,
+            ...(authorization.expirationRaw !== '0'
+              ? { expiration: authorization.expirationRaw }
+              : {})
+          }
+        ]
+      }
+    case 'permit2-lockdown':
+      return {
+        protocol: 'Permit2',
+        kind: 'allowance',
+        effect: 'lockdown',
+        owner: summary.fields.from,
+        spender: authorization.pairs.length === 1 ? authorization.pairs[0]!.spender : '',
+        signatureDeadline: 'On submission',
+        tokens: authorization.pairs.map(pair => ({
+          contractAddress: pair.token,
+          assetId: `${summary.chainId}/erc20:${pair.token.toLowerCase()}`,
+          ...tokenFields(pair.token, '0', undefined),
+          amount: 'Cleared',
+          unlimited: false
+        }))
+      }
+    default:
+      return assertNever(authorization)
+  }
+}
+
+function signedSimulationAmount(
+  direction: 'incoming' | 'outgoing',
+  amountRaw: string,
+  decimals?: number
+): string {
+  const magnitude =
+    decimals === undefined ? amountRaw : formatBaseUnitDecimalAmount(amountRaw, decimals)
+  return `${direction === 'incoming' ? '+' : '−'}${magnitude}`
+}
+
+function nativeSimulationCurrency(
+  currency: EvmReviewPresentationOptions['nativeCurrency']
+): { readonly symbol: string; readonly decimals: number } | undefined {
+  if (
+    currency === undefined ||
+    currency.symbol.trim() !== currency.symbol ||
+    currency.symbol.length === 0 ||
+    [...currency.symbol].length > 32 ||
+    !Number.isSafeInteger(currency.decimals) ||
+    currency.decimals < 0 ||
+    currency.decimals > 255
+  ) {
+    return undefined
+  }
+  return currency
+}
+
+function evmSimulationAssetChangeRows(
+  summary: EvmTransactionSummary,
+  options: EvmReviewPresentationOptions
+): readonly SigningSummaryReviewRow[] {
+  if (options.simulationTransfers === undefined) return []
+  const currency = nativeSimulationCurrency(options.nativeCurrency)
+  return aggregateEvmSimulationAssetChanges({
+    account: summary.fields.from,
+    tokenTransfers: options.simulationTransfers.tokenTransfers,
+    traceTransfers: options.simulationTransfers.traceTransfers,
+    tokens: options.tokenMetadata
+  }).map(change => {
+    if (change.kind === 'native') {
+      return reviewRow(
+        currency?.symbol ?? 'Native',
+        currency
+          ? `${signedSimulationAmount(change.direction, change.amountRaw, currency.decimals)} ${currency.symbol}`
+          : `${signedSimulationAmount(change.direction, change.amountRaw)} wei`,
+        { code: true }
+      )
+    }
+    if (change.verification === 'unverified') {
+      return reviewRow(
+        change.reportedName === undefined ? 'Unverified' : 'Self-reported',
+        change.reportedName === undefined
+          ? `${signedSimulationAmount(change.direction, change.amountRaw)}\n${change.contractAddress}`
+          : `${change.reportedName}\n${signedSimulationAmount(change.direction, change.amountRaw)}\n${change.contractAddress}`,
+        { code: true, breakAll: true, title: change.contractAddress }
+      )
+    }
+    if (change.verification === 'user-approved') {
+      return reviewRow(
+        'Self-reported',
+        `${change.symbol}\n${signedSimulationAmount(change.direction, change.amountRaw, change.decimals)} ${change.symbol}\n${change.contractAddress}`,
+        { code: true, breakAll: true, title: change.contractAddress }
+      )
+    }
+    return reviewRow(
+      change.symbol,
+      `${signedSimulationAmount(change.direction, change.amountRaw, change.decimals)} ${change.symbol}`,
+      { code: true, title: change.contractAddress }
+    )
+  })
+}
+
 export function evmTransactionReview(
   summary: EvmTransactionSummary,
   options: EvmReviewPresentationOptions = {}
 ): SigningSummaryReviewModel {
   const currency = options.nativeCurrency
+  const tokenAuthorization = evmOnChainTokenAuthorization(summary, options)
   const requestedTokenCallRows = evmRequestedTokenCallRows(summary, options)
+  const assetChangeRows = evmSimulationAssetChangeRows(summary, options)
   const amountRow = (label: string, raw: string) => {
     if (!currency) return reviewRow(label, `${raw} wei`, { code: true })
     const value = formatAmount(raw, currency.decimals)
-    const profile = label === 'Maximum fee' ? 'fee' : 'review'
+    const profile = label === 'Maximum fee' || label === 'L1 data fee' ? 'fee' : 'review'
     return reviewRow(
       label,
       `${profile === 'fee' ? formatFeeAmount(value) : formatReviewAmount(value).display} ${currency.symbol}`,
@@ -286,10 +768,29 @@ export function evmTransactionReview(
       }
     )
   }
+  const authorizationDescription =
+    tokenAuthorization?.effect === 'lockdown'
+      ? PERMIT2_LOCKDOWN_EFFECT
+      : tokenAuthorization?.effect === 'revoke-permit2'
+        ? PERMIT2_TOKEN_REVOKE_EFFECT
+        : undefined
   return completeReviewModel(summary, {
-    title: summary.fields.to === null ? 'Create contract' : 'Review EVM transaction',
-    ...(summary.fields.to === null ? { description: 'Deploys a new smart contract.' } : {}),
+    title:
+      tokenAuthorization?.effect === 'lockdown'
+        ? 'Clear Permit2 allowance'
+        : tokenAuthorization !== undefined
+          ? 'Token authorization'
+          : summary.fields.to === null
+            ? 'Create contract'
+            : 'Review EVM transaction',
+    ...(tokenAuthorization !== undefined ? { tokenAuthorization } : {}),
+    ...(authorizationDescription !== undefined
+      ? { description: authorizationDescription }
+      : summary.fields.to === null
+        ? { description: 'Deploys a new smart contract.' }
+        : {}),
     sections: [
+      ...(assetChangeRows.length > 0 ? [{ title: 'Asset changes', rows: assetChangeRows }] : []),
       {
         title: 'Transaction',
         rows: [
@@ -314,6 +815,9 @@ export function evmTransactionReview(
             summary.fields.valueWei
           ),
           amountRow('Maximum fee', summary.fields.maximumFeeWei),
+          ...(summary.fields.l1DataFeeWei !== undefined && BigInt(summary.fields.l1DataFeeWei) > 0n
+            ? [amountRow('L1 data fee', summary.fields.l1DataFeeWei)]
+            : []),
           ...(options.directContract ? [reviewRow('Execution', 'Public on-chain')] : []),
           reviewRow('Gas limit', summary.fields.gasLimit, { code: true }),
           reviewRow('Nonce', summary.fields.nonce, { code: true }),
@@ -339,9 +843,28 @@ export function evmTransactionReview(
           ...canonicalContentRows('Calldata', summary.fields.calldata),
           reviewRow('Access list entries', summary.fields.accessList.length)
         ]
-      }
+      },
+      ...untrustedRpcSection(options.rpcOrigin)
     ]
   })
+}
+
+function untrustedRpcSection(origin: EvmRpcOrigin | undefined) {
+  if (origin === undefined || origin === 'builtin') return []
+  const unknown = (label: 'Simulation' | 'Balance check' | 'Authorization check') =>
+    reviewRow(label, 'UNKNOWN')
+  return [
+    {
+      title: 'Network node',
+      rows: [
+        reviewRow('RPC', evmRpcOriginLabel(origin)),
+        unknown('Simulation'),
+        unknown('Balance check'),
+        unknown('Authorization check'),
+        reviewRow('Node', 'Unverified node')
+      ]
+    }
+  ]
 }
 
 export function evmPersonalMessageReview(
@@ -372,41 +895,348 @@ function permitTime(raw: string, expiration = false): string {
   }).format(new Date(Number(seconds) * 1_000))} UTC`
 }
 
-function evmTokenAuthorization(
+const SEAPORT_ITEM_TYPES = [
+  'Native token',
+  'ERC-20',
+  'ERC-721',
+  'ERC-1155',
+  'ERC-721 criteria',
+  'ERC-1155 criteria'
+]
+const SEAPORT_ORDER_TYPES = ['Full open', 'Partial open', 'Full restricted', 'Partial restricted']
+
+function sameAddress(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase()
+}
+
+function addressReviewRow(label: string, value: string, warning = false): SigningSummaryReviewRow {
+  return reviewRow(label, value, {
+    code: true,
+    breakAll: true,
+    ...(warning ? { tone: 'warning' as const } : {})
+  })
+}
+
+function labeledEnum(labels: readonly string[], value: number): string {
+  return labels[value] ?? `Unknown (${value})`
+}
+
+function domainNameClaim(
+  domain: EvmTypedDataValue
+): { readonly name?: string; readonly contract?: string } | undefined {
+  if (domain.kind !== 'struct') return undefined
+  const nameField = domain.fields.find(field => field.name === 'name')
+  const contractField = domain.fields.find(field => field.name === 'verifyingContract')
+  if (nameField?.value.kind !== 'scalar' || nameField.value.solidityType !== 'string') {
+    return undefined
+  }
+  const name = readDisplayText(nameField.value.value, MAXIMUM_REPORTED_NAME_CODE_POINTS)
+  const contract =
+    contractField?.value.kind === 'scalar' &&
+    contractField.value.solidityType === 'address' &&
+    TOKEN_ADDRESS_PATTERN.test(contractField.value.value)
+      ? contractField.value.value
+      : undefined
+  return {
+    ...(name === undefined ? {} : { name }),
+    ...(contract === undefined ? {} : { contract })
+  }
+}
+
+function domainNameForToken(
+  summary: EvmTypedDataSummary,
+  contractAddress: string
+): string | undefined {
+  const claim = domainNameClaim(summary.fields.domain)
+  if (!claim?.name || !claim.contract || !sameContractAddress(claim.contract, contractAddress)) {
+    return undefined
+  }
+  return claim.name
+}
+
+function labeledDomainRows(
   summary: EvmTypedDataSummary,
   options: EvmReviewPresentationOptions
+): readonly SigningSummaryReviewRow[] {
+  const rows = typedDataRows('Domain', summary.fields.domain)
+  const claim = domainNameClaim(summary.fields.domain)
+  if (!claim) return rows
+  const bundled = claim.contract ? bundledToken(options, claim.contract) : undefined
+  const matchesBundled =
+    claim.name !== undefined &&
+    bundled !== undefined &&
+    (claim.name === bundled.symbol || claim.name === bundled.name)
+  if (matchesBundled) return rows
+  const value = [
+    claim.name === undefined ? 'Self-reported' : `Self-reported · ${claim.name}`,
+    ...(claim.contract === undefined ? [] : [claim.contract])
+  ].join('\n')
+  return rows.map(row =>
+    row.label === 'Domain.name'
+      ? reviewRow('Domain.name', value, {
+          code: true,
+          ...(claim.contract === undefined ? {} : { breakAll: true })
+        })
+      : row
+  )
+}
+
+function evmTokenAuthorization(
+  summary: EvmTypedDataSummary,
+  options: EvmReviewPresentationOptions,
+  recognized: EvmTypedDataRecognition | null
 ): TokenAuthorizationReview | undefined {
-  const permit = decodeEvmPermitReview(summary)
-  if (!permit) return undefined
+  if (recognized?.kind === 'permit') {
+    const permit = recognized.permit
+    return {
+      protocol: permit.protocol,
+      kind: permit.kind,
+      owner: permit.owner,
+      spender: permit.spender,
+      signatureDeadline: permit.deadlineUnbounded
+        ? 'No expiry'
+        : permitTime(permit.signatureDeadlineRaw),
+      ...(permit.witnessReceivers ? { witnessReceivers: permit.witnessReceivers } : {}),
+      tokens: permit.tokens.map(token => {
+        const unlimitedUnit =
+          permit.kind === 'allowance'
+            ? unlimitedAllowanceUnit(token.amountRaw, token.amountBits)
+            : undefined
+        const formatted = presentTokenIdentity(
+          options,
+          token.contractAddress,
+          unlimitedUnit ? '0' : token.amountRaw,
+          domainNameForToken(summary, token.contractAddress)
+        )
+        return {
+          contractAddress: token.contractAddress,
+          assetId: `${summary.chainId}/erc20:${token.contractAddress.toLowerCase()}`,
+          symbol: formatted.symbol,
+          amount: unlimitedUnit ? 'Unlimited' : formatted.amount,
+          ...(formatted.selfReportedName === undefined
+            ? {}
+            : { selfReportedName: formatted.selfReportedName }),
+          unlimited: unlimitedUnit !== undefined,
+          ...(unlimitedUnit === undefined ? {} : { unlimitedUnit }),
+          ...(token.expirationRaw !== undefined
+            ? { expiration: permitTime(token.expirationRaw, true) }
+            : {})
+        }
+      })
+    }
+  }
+  if (recognized?.kind !== 'eip3009-transfer') return undefined
+  const transfer = recognized.transfer
+  const formatted = presentTokenIdentity(
+    options,
+    transfer.verifyingContract,
+    transfer.valueRaw,
+    domainNameForToken(summary, transfer.verifyingContract)
+  )
   return {
-    protocol: permit.protocol,
-    kind: permit.kind,
-    owner: permit.owner,
-    spender: permit.spender,
-    signatureDeadline: permitTime(permit.signatureDeadlineRaw),
-    tokens: permit.tokens.map(token => {
-      const metadata = options.tokenMetadata?.find(
-        candidate =>
-          candidate.contractAddress.toLowerCase() === token.contractAddress.toLowerCase() &&
-          Number.isInteger(candidate.decimals) &&
-          candidate.decimals >= 0 &&
-          candidate.decimals <= 255
-      )
-      return {
-        contractAddress: token.contractAddress,
-        assetId: `${summary.chainId}/erc20:${token.contractAddress.toLowerCase()}`,
-        symbol: metadata?.symbol ?? null,
-        amount: metadata
-          ? formatBaseUnitDecimalAmount(token.amountRaw, metadata.decimals)
-          : token.amountRaw,
-        unlimited:
-          permit.kind === 'allowance' &&
-          BigInt(token.amountRaw) === (1n << BigInt(token.amountBits)) - 1n,
-        ...(token.expirationRaw !== undefined
-          ? { expiration: permitTime(token.expirationRaw, true) }
-          : {})
+    protocol: 'EIP-3009',
+    kind: 'transfer',
+    owner: transfer.from,
+    spender: '',
+    recipient: transfer.to,
+    signatureDeadline: permitTime(transfer.validBeforeRaw),
+    validAfter: transfer.validAfterRaw === '0' ? 'Immediately' : permitTime(transfer.validAfterRaw),
+    submission:
+      transfer.variant === 'receive' ? 'Only the recipient can submit' : 'Relayers can submit',
+    tokens: [
+      {
+        contractAddress: transfer.verifyingContract,
+        assetId: `${summary.chainId}/erc20:${transfer.verifyingContract.toLowerCase()}`,
+        symbol: formatted.symbol,
+        amount: formatted.amount,
+        ...(formatted.selfReportedName === undefined
+          ? {}
+          : { selfReportedName: formatted.selfReportedName }),
+        unlimited: false
       }
-    })
+    ]
+  }
+}
+
+function seaportRows(order: EvmSeaportOrder): SigningSummaryReviewRow[] {
+  const rows: SigningSummaryReviewRow[] = [
+    addressReviewRow('Offerer', order.offerer),
+    addressReviewRow('Zone', order.zone),
+    reviewRow('Order type', labeledEnum(SEAPORT_ORDER_TYPES, order.orderType)),
+    reviewRow('Start', permitTime(order.startTimeRaw)),
+    reviewRow('End', permitTime(order.endTimeRaw))
+  ]
+  let offers = 0
+  let considerations = 0
+  for (const item of order.items) {
+    const index = item.side === 'offer' ? ++offers : ++considerations
+    const prefix = item.side === 'offer' ? `Offer ${index}` : `Consideration ${index}`
+    rows.push(
+      reviewRow(prefix, labeledEnum(SEAPORT_ITEM_TYPES, item.itemType)),
+      addressReviewRow(`${prefix} token`, item.token),
+      reviewRow(`${prefix} identifier`, item.identifier, { code: true, breakAll: true }),
+      reviewRow(
+        `${prefix} amount`,
+        item.startAmount === item.endAmount
+          ? item.startAmount
+          : `${item.startAmount} to ${item.endAmount}`,
+        { code: true, breakAll: true }
+      )
+    )
+    if (item.recipient) {
+      rows.push(
+        addressReviewRow(
+          `${prefix} recipient`,
+          item.recipient,
+          !sameAddress(item.recipient, order.offerer)
+        )
+      )
+    }
+  }
+  return rows
+}
+
+function blurRows(order: EvmBlurOrder): SigningSummaryReviewRow[] {
+  const rows: SigningSummaryReviewRow[] = [
+    reviewRow(
+      'Side',
+      order.side === 0 ? 'Buy' : order.side === 1 ? 'Sell' : `Unknown (${order.side})`
+    ),
+    addressReviewRow('Trader', order.trader),
+    addressReviewRow('Collection', order.collection),
+    reviewRow('Token ID', order.tokenId, { code: true, breakAll: true }),
+    reviewRow('Amount', order.amountRaw, { code: true, breakAll: true }),
+    addressReviewRow('Payment token', order.paymentToken),
+    reviewRow('Price', order.priceRaw, { code: true, breakAll: true }),
+    reviewRow('Listing time', permitTime(order.listingTimeRaw)),
+    reviewRow(
+      'Expiration',
+      order.expirationTimeRaw === '0' ? 'Oracle cancellation' : permitTime(order.expirationTimeRaw)
+    )
+  ]
+  for (const [index, fee] of order.fees.entries()) {
+    const prefix = `Fee ${index + 1}`
+    rows.push(
+      reviewRow(prefix, `${fee.rate} bps`),
+      addressReviewRow(`${prefix} recipient`, fee.recipient)
+    )
+  }
+  return rows
+}
+
+function receiverOrderRows(order: EvmReceiverOrder): SigningSummaryReviewRow[] {
+  const inch = order.protocol === '1inch'
+  const rows: SigningSummaryReviewRow[] = [
+    addressReviewRow(inch ? 'Maker' : 'Signing account', order.account),
+    addressReviewRow(inch ? 'Maker asset' : 'Sell token', order.sellToken),
+    reviewRow(inch ? 'Making amount' : 'Sell amount', order.sellAmountRaw, {
+      code: true,
+      breakAll: true
+    }),
+    addressReviewRow(inch ? 'Taker asset' : 'Buy token', order.buyToken),
+    reviewRow(inch ? 'Taking amount' : 'Buy amount', order.buyAmountRaw, {
+      code: true,
+      breakAll: true
+    }),
+    addressReviewRow(
+      'Receiver',
+      order.receiverIsDefault
+        ? `${inch ? 'Maker' : 'Signing account'} · ${order.account}`
+        : order.receiver,
+      !order.receiverIsDefault && !sameAddress(order.receiver, order.account)
+    )
+  ]
+  if (order.expiryRaw !== null) rows.push(reviewRow('Valid to', permitTime(order.expiryRaw)))
+  return rows
+}
+
+function safeRows(transaction: EvmSafeTx): SigningSummaryReviewRow[] {
+  return [
+    addressReviewRow('Safe', transaction.safe),
+    addressReviewRow('To', transaction.to),
+    reviewRow('Value', `${transaction.valueRaw} wei`, { code: true, breakAll: true }),
+    transaction.operation === 0
+      ? reviewRow('Operation', 'Call')
+      : reviewRow(
+          'Operation',
+          transaction.operation === 1 ? 'DelegateCall' : `Unknown (${transaction.operation})`,
+          { tone: 'warning' }
+        ),
+    addressReviewRow('Refund receiver', transaction.refundReceiver),
+    reviewRow('Nonce', transaction.nonce, { code: true })
+  ]
+}
+
+function recognizedSignatureRows(
+  recognized: EvmTypedDataRecognition | null
+): readonly SigningSummaryReviewRow[] {
+  switch (recognized?.kind) {
+    case 'seaport':
+      return seaportRows(recognized.order)
+    case 'blur':
+      return blurRows(recognized.order)
+    case 'receiver-order':
+      return receiverOrderRows(recognized.order)
+    case 'safe-tx':
+      return safeRows(recognized.transaction)
+    case 'eip3009-cancel':
+      return [
+        addressReviewRow('Token contract', recognized.cancel.verifyingContract),
+        addressReviewRow('Authorizer', recognized.cancel.authorizer),
+        reviewRow('Nonce', recognized.cancel.nonce, { code: true, breakAll: true })
+      ]
+    case 'permit':
+    case 'eip3009-transfer':
+    case undefined:
+      return []
+    default: {
+      const unsupported: never = recognized
+      return unsupported
+    }
+  }
+}
+
+function recognizedDescription(recognized: EvmTypedDataRecognition | null): string {
+  switch (recognized?.kind) {
+    case 'eip3009-cancel':
+      return 'This signature cancels one EIP-3009 transfer authorization.'
+    case 'seaport':
+      return 'This signature creates a Seaport order.'
+    case 'blur':
+      return 'This signature creates a Blur order.'
+    case 'receiver-order':
+      return recognized.order.protocol === '1inch'
+        ? 'This signature creates a 1inch limit order.'
+        : 'This signature creates a CoW Protocol order.'
+    case 'safe-tx':
+      return 'This signature authorizes a Safe transaction.'
+    default:
+      return 'This signature may authorize off-chain or on-chain actions.'
+  }
+}
+
+function recognizedTitle(
+  recognized: EvmTypedDataRecognition | null,
+  tokenAuthorization: TokenAuthorizationReview | undefined
+): string {
+  if (tokenAuthorization) {
+    return tokenAuthorization.kind === 'transfer'
+      ? 'Token transfer authorization'
+      : 'Token authorization'
+  }
+  switch (recognized?.kind) {
+    case 'eip3009-cancel':
+      return 'Cancel token authorization'
+    case 'seaport':
+      return 'Seaport order'
+    case 'blur':
+      return 'Blur order'
+    case 'receiver-order':
+      return recognized.order.protocol === '1inch' ? '1inch order' : 'CoW order'
+    case 'safe-tx':
+      return 'Safe transaction'
+    default:
+      return 'Sign typed data'
   }
 }
 
@@ -414,22 +1244,23 @@ export function evmTypedDataReview(
   summary: EvmTypedDataSummary,
   options: EvmReviewPresentationOptions = {}
 ): SigningSummaryReviewModel {
-  const tokenAuthorization = evmTokenAuthorization(summary, options)
+  const recognized = decodeEvmTypedDataRecognition(summary)
+  const tokenAuthorization = evmTokenAuthorization(summary, options, recognized)
+  const recognizedRows = recognizedSignatureRows(recognized)
   return completeReviewModel(summary, {
-    title: tokenAuthorization
-      ? tokenAuthorization.kind === 'transfer'
-        ? 'Token transfer authorization'
-        : 'Token authorization'
-      : 'Sign typed data',
+    title: recognizedTitle(recognized, tokenAuthorization),
     ...(tokenAuthorization
       ? { tokenAuthorization }
-      : { description: 'This signature may authorize off-chain or on-chain actions.' }),
+      : { description: recognizedDescription(recognized) }),
     sections: [
+      ...(recognizedRows.length > 0
+        ? [{ title: 'Recognized signature', rows: recognizedRows }]
+        : []),
       {
         title: 'Typed data',
         rows: [
           reviewRow('Primary type', summary.fields.primaryType, { code: true }),
-          ...typedDataRows('Domain', summary.fields.domain),
+          ...labeledDomainRows(summary, options),
           ...typedDataRows('Message', summary.fields.message),
           reviewRow('Digest', summary.fields.digestHex, { code: true, breakAll: true })
         ]
@@ -669,7 +1500,12 @@ export function nearTransactionReview(summary: NearTransactionSummary): SigningS
       },
       {
         title: `Actions (${summary.fields.actions.length})`,
-        rows: summary.fields.actions.flatMap(nearActionRows)
+        rows: summary.fields.actions.flatMap((action, index) =>
+          nearActionRows(action, index, {
+            signerId: summary.fields.signerId,
+            receiverId: summary.fields.receiverId
+          })
+        )
       }
     ]
   })

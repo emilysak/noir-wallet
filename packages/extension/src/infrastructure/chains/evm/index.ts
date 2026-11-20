@@ -16,6 +16,7 @@ import {
   type EvmBroadcastRpc,
   type EvmContractRpc,
   type EvmDAppReadRpc,
+  type EvmLogRpc,
   type EvmNonceQueueEndpointSelector,
   type EvmTransactionRpc
 } from './evm-rpc-client'
@@ -44,6 +45,7 @@ export function createConfiguredEvmRpcClient(
   EvmTransactionRpc &
   EvmBroadcastRpc &
   EvmDAppReadRpc &
+  EvmLogRpc &
   EvmNonceQueueEndpointSelector {
   const builtin = findBuiltinEvmNetworkConfig(network, configuredNetwork.chainId)
   const bundled = builtin ? getEvmRpcEndpointOptions(network, configuredNetwork.chainId) : []
@@ -100,7 +102,14 @@ export function createConfiguredEvmActivityHistorySource(
       if (!result || 'error' in result || 'incomplete' in result) {
         throw result && 'error' in result ? result.error : new Error('Missing Ankr history result')
       }
-      return { items: result.items, hasMore: result.hasMore ?? false }
+      return {
+        items: result.items,
+        hasMore: result.hasMore ?? false,
+        ...(result.plantedRecipients === undefined
+          ? {}
+          : { plantedRecipients: result.plantedRecipients }),
+        ...(result.plantedSenders === undefined ? {} : { plantedSenders: result.plantedSenders })
+      }
     }
     return createCachedEvmActivityHistorySource({
       chainId: config.chainId,
@@ -216,9 +225,12 @@ export {
   type EvmPortfolioCoordinatorOptions
 } from './evm-portfolio-coordinator'
 export {
+  EVM_SIMULATION_PREVIEW_TTL_MS,
   EVM_TRANSACTION_ERROR_CODES,
   EvmTransactionError,
   assertEvmTransferFresh,
+  evmSimulationPreviewExpiresAt,
+  simulatePreparedEvmTransaction,
   assertEvmSigningSummaryMatchesPrepared,
   buildEvmCancelTransaction,
   buildEvmContractCall,
@@ -228,6 +240,7 @@ export {
   estimateEvmContractCallFee,
   estimateEvmTransferFee,
   computeEvmSigningPayloadFingerprint,
+  evmPreparedMaximumFeeWei,
   createEvmSigningSummary,
   createEvmSigningPreparePayload,
   parseEvmContractCallIntent,

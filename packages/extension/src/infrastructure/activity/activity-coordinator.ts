@@ -1,6 +1,7 @@
 import {
   buildActivityReadModel,
   type ActivityItem,
+  type ActivityPlantedRecipient,
   type ActivityReadModel,
   type ActivityScope
 } from '@/core/activity'
@@ -38,6 +39,12 @@ export interface ActivityCoordinatorOptions {
     scope: ActivityScope,
     graphs: readonly TransactionGraph[]
   ) => Promise<readonly TransactionGraph[]>
+  readonly loadPlantedRecipients?: (
+    scope: ActivityScope
+  ) => Promise<readonly ActivityPlantedRecipient[]>
+  readonly loadPlantedSenders?: (
+    scope: ActivityScope
+  ) => Promise<readonly ActivityPlantedRecipient[]>
 }
 
 export interface ActivityReadOptions {
@@ -79,7 +86,11 @@ export class ActivityCoordinator {
     const localGraphs = this.options.filterLocalGraphs
       ? await this.options.filterLocalGraphs(scope, storedLocalGraphs)
       : storedLocalGraphs
-    const privateExecutionAddresses = await this.loadPrivateExecutionAddresses(scope, localGraphs)
+    const [privateExecutionAddresses, plantedRecipients, plantedSenders] = await Promise.all([
+      this.loadPrivateExecutionAddresses(scope, localGraphs),
+      this.loadPlantedRecipients(scope),
+      this.loadPlantedSenders(scope)
+    ])
     const destinationReceipts = new Map<string, Transaction[]>()
     for (const transaction of zcashTransactions) {
       if (transaction.type !== 'receive' || !transaction.txHash) continue
@@ -115,8 +126,38 @@ export class ActivityCoordinator {
       ]),
       privateExecutionAddresses,
       limit: options.protocolProvider ? confidentialLimit : 2_000,
-      hasMore
+      hasMore,
+      plantedRecipients,
+      plantedSenders
     })
+  }
+
+  private async loadPlantedRecipients(
+    scope: ActivityScope
+  ): Promise<readonly ActivityPlantedRecipient[]> {
+    return this.loadPlantedParties(scope, this.options.loadPlantedRecipients, 'recipient')
+  }
+
+  private async loadPlantedSenders(
+    scope: ActivityScope
+  ): Promise<readonly ActivityPlantedRecipient[]> {
+    return this.loadPlantedParties(scope, this.options.loadPlantedSenders, 'sender')
+  }
+
+  private async loadPlantedParties(
+    scope: ActivityScope,
+    load: ((scope: ActivityScope) => Promise<readonly ActivityPlantedRecipient[]>) | undefined,
+    label: string
+  ): Promise<readonly ActivityPlantedRecipient[]> {
+    try {
+      return (await load?.(scope)) ?? []
+    } catch (error) {
+      console.warn(
+        `[Activity] Planted ${label} lookup failed:`,
+        error instanceof Error ? error.name : 'UnknownError'
+      )
+      return []
+    }
   }
 
   private async loadSupplementalItems(

@@ -1,7 +1,10 @@
 import { test as it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { shouldAutoConnectDApp } from '../../../src/core/dapp/first-party-policy.ts'
+import {
+  shouldAutoConnectDApp,
+  shouldAutoConnectDAppForBuild
+} from '../../../src/core/dapp/first-party-policy.ts'
 
 const describe = it.describe
 
@@ -11,9 +14,21 @@ const handlerSource = readFileSync(
 )
 
 describe('zkNoir application integration', () => {
-  it('auto-connects only the exact first-party application origins', () => {
+  it('auto-connects only the exact first-party application origins for the build', () => {
+    const official = 'https://app.zknoir.com'
+    const staging = 'https://noirdevelop.refburrow.top'
+    assert.equal(shouldAutoConnectDApp(official), true)
+    assert.equal(shouldAutoConnectDApp(staging), true)
+    for (const buildChannel of ['development', 'beta']) {
+      assert.equal(shouldAutoConnectDAppForBuild(official, buildChannel), true)
+      assert.equal(shouldAutoConnectDAppForBuild(staging, buildChannel), true)
+    }
+    assert.equal(shouldAutoConnectDAppForBuild(official, 'production'), true)
+    assert.equal(shouldAutoConnectDAppForBuild(staging, 'production'), false)
+    assert.equal(shouldAutoConnectDAppForBuild(official, 'candidate'), true)
+    assert.equal(shouldAutoConnectDAppForBuild(staging, 'candidate'), false)
+
     for (const host of ['app.zknoir.com', 'noirdevelop.refburrow.top']) {
-      assert.equal(shouldAutoConnectDApp(`https://${host}`), true)
       for (const origin of [
         `http://${host}`,
         `https://evil.${host}`,
@@ -22,6 +37,9 @@ describe('zkNoir application integration', () => {
         `https://${host}/lending`
       ]) {
         assert.equal(shouldAutoConnectDApp(origin), false)
+        for (const buildChannel of ['development', 'beta', 'production']) {
+          assert.equal(shouldAutoConnectDAppForBuild(origin, buildChannel), false)
+        }
       }
     }
   })

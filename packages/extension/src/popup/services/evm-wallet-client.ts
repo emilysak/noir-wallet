@@ -181,6 +181,12 @@ export interface EvmWalletClient {
     expectedOwner: string,
     executionMode?: 'main' | 'private'
   ) => Promise<string>
+  readonly selectErc20Revoke: (
+    chainId: string,
+    token: string,
+    spender: string,
+    expectedOwner: string
+  ) => Promise<{ readonly method: 'approve' | 'decreaseAllowance'; readonly data: string }>
   readonly getTokenBalance: (request: {
     readonly chainId: string
     readonly token: string
@@ -281,15 +287,28 @@ function parseFeeEstimate(
   ]
   const hasAmountIndependent = Object.prototype.hasOwnProperty.call(record, 'amountIndependent')
   const hasFeeModel = Object.prototype.hasOwnProperty.call(record, 'transactionType')
+  const hasL1DataFee = Object.prototype.hasOwnProperty.call(record, 'l1DataFeeWei')
+  const hasPriorityWarning = Object.prototype.hasOwnProperty.call(record, 'priorityFeeElevated')
   assertExactKeys(
     record,
     [
       ...expectedKeys,
       ...(hasFeeModel ? ['transactionType', 'gasPriceWei'] : []),
-      ...(hasAmountIndependent ? ['amountIndependent'] : [])
+      ...(hasAmountIndependent ? ['amountIndependent'] : []),
+      ...(hasL1DataFee ? ['l1DataFeeWei'] : []),
+      ...(hasPriorityWarning ? ['priorityFeeElevated'] : [])
     ],
     'EVM fee estimate'
   )
+  if (
+    hasL1DataFee &&
+    (typeof record.l1DataFeeWei !== 'string' || !/^(0|[1-9][0-9]{0,77})$/.test(record.l1DataFeeWei))
+  ) {
+    throw new Error('Invalid EVM L1 data fee estimate')
+  }
+  if (hasPriorityWarning && record.priorityFeeElevated !== true) {
+    throw new Error('Invalid EVM priority fee warning')
+  }
   if (hasAmountIndependent && typeof record.amountIndependent !== 'boolean') {
     throw new Error('Invalid EVM amount-independent estimate')
   }
@@ -308,10 +327,11 @@ function parseFeeEstimate(
   }
   const gasLimit = BigInt(record.gasLimit as string)
   const maxFeePerGas = BigInt(record.maxFeePerGasWei as string)
+  const l1DataFeeWei = hasL1DataFee ? BigInt(record.l1DataFeeWei as string) : 0n
   if (
     gasLimit === 0n ||
     maxFeePerGas === 0n ||
-    gasLimit * maxFeePerGas !== BigInt(record.maximumFeeWei as string)
+    gasLimit * maxFeePerGas + l1DataFeeWei !== BigInt(record.maximumFeeWei as string)
   ) {
     throw new Error('Invalid EVM maximum fee estimate')
   }
@@ -1184,6 +1204,48 @@ export function createEvmWalletClient(sendMessage: EvmRuntimeMessenger): EvmWall
             throw new Error('Invalid EVM allowance response')
           }
           return value
+        }
+      )
+    },
+    selectErc20Revoke: async (
+      chainId: string,
+      token: string,
+      spender: string,
+      expectedOwner: string
+    ) => {
+      const parsedChainId = parseClientInput(() => parseChainId(chainId).id)
+      if (
+        !parsedChainId.startsWith('eip155:') ||
+        [token, spender, expectedOwner].some(value => !/^0x[0-9a-fA-F]{40}$/.test(value))
+      ) {
+        throw new EvmWalletClientError('invalid-request', 'Invalid EVM allowance request')
+      }
+      return send(
+        {
+          type: 'SELECT_EVM_ERC20_REVOKE',
+          chainId: parsedChainId,
+          token,
+          spender,
+          expectedOwner
+        },
+        value => {
+          if (!value || typeof value !== 'object') throw new Error('Invalid EVM revoke response')
+          const record = value as { method?: unknown; data?: unknown }
+          if (
+            (record.method !== 'approve' && record.method !== 'decreaseAllowance') ||
+            typeof record.data !== 'string' ||
+            !/^0x[0-9a-fA-F]{136}$/.test(record.data)
+          ) {
+            throw new Error('Invalid EVM revoke response')
+          }
+          const selector = record.data.slice(0, 10).toLowerCase()
+          if (
+            (record.method === 'approve' && selector !== '0x095ea7b3') ||
+            (record.method === 'decreaseAllowance' && selector !== '0xa457c2d7')
+          ) {
+            throw new Error('Invalid EVM revoke response')
+          }
+          return Object.freeze({ method: record.method, data: record.data })
         }
       )
     },

@@ -1,4 +1,5 @@
 import { parseAccountId } from '@/core/accounts/domain'
+import { parseAssetId } from '@/core/chains/registry'
 import {
   parseKeyDomainId,
   parseSigningSummary,
@@ -49,6 +50,12 @@ export interface AwaitingApprovalEvmTransfer extends PendingTransferBase {
   readonly externalSigner: EvmExternalSignerBinding | null
   readonly payloadFingerprint: string
   readonly expiresAt: number
+  readonly quotedSpend?: ConstraintAmount
+}
+
+interface ConstraintAmount {
+  readonly assetId: string
+  readonly amountRaw: string
 }
 
 export interface EvmExternalSignerBinding {
@@ -95,14 +102,34 @@ function readRecord(value: unknown, label: string): Record<string, unknown> {
 function assertExactKeys(
   value: Record<string, unknown>,
   required: readonly string[],
-  label: string
+  label: string,
+  optional: readonly string[] = []
 ): void {
+  const keys = Object.keys(value)
+  const allowed = new Set([...required, ...optional])
   if (
-    Object.keys(value).length !== required.length ||
-    !required.every(key => Object.prototype.hasOwnProperty.call(value, key))
+    keys.length < required.length ||
+    keys.length > required.length + optional.length ||
+    !required.every(key => Object.prototype.hasOwnProperty.call(value, key)) ||
+    keys.some(key => !allowed.has(key))
   ) {
     throw new Error(`${label} has invalid fields`)
   }
+}
+
+function parseQuotedSpend(value: unknown): ConstraintAmount {
+  const record = readRecord(value, 'Pending EVM quoted spend')
+  assertExactKeys(record, ['assetId', 'amountRaw'], 'Pending EVM quoted spend')
+  if (typeof record.assetId !== 'string' || typeof record.amountRaw !== 'string') {
+    throw new Error('Invalid pending EVM quoted spend')
+  }
+  if (!/^(0|[1-9][0-9]*)$/.test(record.amountRaw)) {
+    throw new Error('Invalid pending EVM quoted spend')
+  }
+  return Object.freeze({
+    assetId: parseAssetId(record.assetId).id,
+    amountRaw: record.amountRaw
+  })
 }
 
 function readTimestamp(value: unknown, label: string): number {
@@ -309,7 +336,8 @@ export function parsePendingEvmTransfer(value: unknown): PendingEvmTransfer {
         'payloadFingerprint',
         'expiresAt'
       ],
-      'Pending EVM transfer'
+      'Pending EVM transfer',
+      ['quotedSpend']
     )
     const fingerprint = record.payloadFingerprint
     if (typeof fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(fingerprint)) {
@@ -343,7 +371,10 @@ export function parsePendingEvmTransfer(value: unknown): PendingEvmTransfer {
       signingExecution,
       externalSigner,
       payloadFingerprint: fingerprint,
-      expiresAt: readTimestamp(record.expiresAt, 'pending EVM signing expiry')
+      expiresAt: readTimestamp(record.expiresAt, 'pending EVM signing expiry'),
+      ...(record.quotedSpend === undefined
+        ? {}
+        : { quotedSpend: parseQuotedSpend(record.quotedSpend) })
     })
     return record.phase === 'awaiting-external-signature'
       ? (parsed as AwaitingExternalSignatureEvmTransfer)

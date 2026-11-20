@@ -37,12 +37,21 @@ import type {
 } from './types'
 import type { Network } from '../../types'
 import { bytesToBase64, base64ToBytes, hexToBytes } from '../../lib/bytes'
-import { mapWasmAccountBalanceToZcashBalance, zeroZcashBalance } from '../wallet/balance-summary'
+import {
+  mapWasmAccountBalanceToZcashBalance,
+  zeroZcashBalance,
+  type WasmAccountBalanceSummary
+} from '../wallet/balance-summary'
 import { DEFAULT_EXPIRY_DELTA_BLOCKS } from '../../config/fee'
 import { fetchStandardMarginalFee } from '../../infrastructure/chains/rpc-registry-client'
 import { FeeQuoteRegistry, type FeeQuoteContext } from '../zcash/fee-quotes'
 import { resolveOneClickExpiryDeltaBlocks } from '../zcash/transaction-expiry'
 import { WALLET_CONFIG } from '../../config/wallet'
+import {
+  assertApprovedShieldAmount,
+  getShieldableTransparentBalance,
+  transparentShieldAmountZats
+} from '../zcash/shielding'
 import { runWithCommitmentTreeRecovery } from './commitment-tree-recovery'
 import { getSafeNewWalletBirthdayHeight } from '../wallet/birthday-height'
 import { parseTransferEstimate, parseTransferResult } from '../zcash/transfer-result'
@@ -334,6 +343,50 @@ async function getSummaryOrCached(
     lastSummaryCache.set(walletId, plain)
   }
   return plain
+}
+
+// A closed gate or a missing summary must not become a zero balance that authorizes shielding.
+async function requireFreshWalletSummary(
+  walletId: string,
+  w: WebWallet
+): Promise<PlainWalletSummary> {
+  if (summaryGateClosed.has(walletId)) {
+    throw new Error('Approved shield amount is unavailable. Review the shield request again.')
+  }
+  const plain = toPlainSummary(await w.get_wallet_summary())
+  if (!plain) {
+    throw new Error('Approved shield amount is unavailable. Review the shield request again.')
+  }
+  lastSummaryCache.set(walletId, plain)
+  return plain
+}
+
+function isWasmAccountBalance(value: unknown): value is WasmAccountBalanceSummary {
+  return typeof value === 'object' && value !== null
+}
+
+function readWasmAccountBalance(
+  summary: PlainWalletSummary | null,
+  accountId: number
+): ReturnType<typeof mapWasmAccountBalanceToZcashBalance> {
+  if (!summary) return zeroZcashBalance()
+  const balances = summary.account_balances
+  let accountBalance: unknown = null
+  if (Array.isArray(balances)) {
+    for (const entry of balances) {
+      if (Array.isArray(entry) && entry.length >= 2 && entry[0] === accountId) {
+        accountBalance = entry[1]
+        break
+      }
+    }
+  } else if (balances instanceof Map) {
+    accountBalance = balances.get(accountId)
+  } else if (typeof balances === 'object' && balances !== null) {
+    accountBalance = Reflect.get(balances, accountId)
+  }
+  return isWasmAccountBalance(accountBalance)
+    ? mapWasmAccountBalanceToZcashBalance(accountBalance)
+    : zeroZcashBalance()
 }
 
 async function getOneClickExpiryDeltaBlocks(walletId: string, wallet: WebWallet): Promise<number> {
@@ -1069,34 +1122,7 @@ self.addEventListener('message', async (event: MessageEvent<RPCRequest<any>>) =>
         result = await runForWallet(walletId, async () => {
           const w = getWallet(walletId)
           const summary = await getSummaryOrCached(walletId, w)
-          let balance = zeroZcashBalance()
-
-          if (summary) {
-            const balances = summary.account_balances
-
-            let accountBal: any = null
-
-            if (Array.isArray(balances)) {
-              for (const entry of balances) {
-                if (Array.isArray(entry) && entry.length >= 2) {
-                  const [accId, balance] = entry
-                  if (accId === accountId) {
-                    accountBal = balance
-                    break
-                  }
-                }
-              }
-            } else if (balances instanceof Map) {
-              accountBal = balances.get(accountId)
-            } else if (typeof balances === 'object' && balances !== null) {
-              accountBal = balances[accountId]
-            }
-
-            if (accountBal) {
-              balance = mapWasmAccountBalanceToZcashBalance(accountBal)
-            }
-          }
-          return balance
+          return readWasmAccountBalance(summary, accountId)
         })
         break
       }
@@ -1543,8 +1569,14 @@ self.addEventListener('message', async (event: MessageEvent<RPCRequest<any>>) =>
       }
 
       case 'transaction.oneclick_shield': {
-        const { walletId, accountIndex, seedPhrase, marginalFeeZats, feeQuoteId } =
-          payload as RPCSchema['transaction.oneclick_shield']['request']
+        const {
+          walletId,
+          accountIndex,
+          seedPhrase,
+          marginalFeeZats,
+          feeQuoteId,
+          approvedShieldAmountZats
+        } = payload as RPCSchema['transaction.oneclick_shield']['request']
         result = await runForWallet(walletId, async () => {
           const w = getWallet(walletId)
           const accountId = await resolveRequestedAccountId(walletId, w, undefined, accountIndex)
@@ -1552,6 +1584,16 @@ self.addEventListener('message', async (event: MessageEvent<RPCRequest<any>>) =>
           const resolvedSeedPhrase = resolveWalletMnemonic(walletId, seedPhrase)
 
           return runWithFreshCommitmentTrees(walletId, w, async () => {
+            const summary = await requireFreshWalletSummary(walletId, w)
+            if (approvedShieldAmountZats !== undefined) {
+              const currentAmount = getShieldableTransparentBalance(
+                readWasmAccountBalance(summary, accountId)
+              )
+              assertApprovedShieldAmount(
+                approvedShieldAmountZats,
+                transparentShieldAmountZats(currentAmount)
+              )
+            }
             const expiryDeltaBlocks = await getOneClickExpiryDeltaBlocks(walletId, w)
             const usk = mnemonic_to_spending_key(
               walletNetwork,

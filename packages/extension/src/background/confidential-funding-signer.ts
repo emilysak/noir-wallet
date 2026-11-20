@@ -1,11 +1,16 @@
 import type { ChainId } from '@/core/chains/domain'
 import { supportsEvmPrivateExecution } from '@/core/chains/evm'
 import type { ConfidentialSignedPayload } from '@/core/services/confidential-funding'
+import {
+  assertWithinConstraintBinding,
+  type ConstraintExecutionBinding
+} from '@/core/transactions/domain'
 import { parseEvmAccountBinding, type ActiveEvmPortfolioContext } from '@/infrastructure/chains/evm'
 import {
   assertEvmSigningSummaryMatchesPrepared,
   assertSignedEvmTransactionMatchesPrepared,
   createEvmSigningPreparePayload,
+  evmPreparedMaximumFeeWei,
   parsePreparedEvmTransfer,
   type PreparedEvmTransfer
 } from '@/infrastructure/chains/evm'
@@ -211,6 +216,7 @@ export class ConfidentialFundingSigner {
     readonly commandId: string
     readonly preparedTransfer: unknown
     readonly sourceDomain?: 'public' | 'private'
+    readonly constraint?: ConstraintExecutionBinding
   }): Promise<
     Readonly<{
       prepared: PreparedEvmTransfer
@@ -228,6 +234,20 @@ export class ConfidentialFundingSigner {
         prepared.addressIndex !== input.identity.addressIndex
       ) {
         throw new Error('Confidential funding deposit does not match the active Main account')
+      }
+      if (input.constraint) {
+        assertWithinConstraintBinding(
+          input.constraint,
+          {
+            spend: { assetId: prepared.assetId, amountRaw: prepared.amountRaw },
+            recipients: [{ chainId: prepared.chainId, address: prepared.recipient }],
+            fee: {
+              assetId: input.constraint.maxFee.assetId,
+              amountRaw: evmPreparedMaximumFeeWei(prepared)
+            }
+          },
+          Date.now()
+        )
       }
       const result = await this.signer.confirm(
         input.identity.context.chainAccount.scope.keyDomainId,

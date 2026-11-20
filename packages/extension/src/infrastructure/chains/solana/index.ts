@@ -53,6 +53,7 @@ export {
 } from './solana-transaction-builder'
 export {
   parseSolanaTransactionEnvelope,
+  solanaBytesParseAsTransaction,
   type ParsedSolanaTransactionEnvelope,
   type SolanaTransactionLookupReference
 } from './solana-transaction-codec'

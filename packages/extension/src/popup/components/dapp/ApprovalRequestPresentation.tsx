@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { ChainIcon } from '@/popup/components/common/ChainIcon'
+import { presentUntrustedRpcCheckValue } from '@/core/chains/evm-rpc-origin'
 import { cn } from '@/lib/utils'
 
 export type ApprovalRequestTone = 'standard' | 'caution' | 'blocked'
@@ -216,9 +217,10 @@ interface DAppNetworkCardProps {
   readonly network: string
   readonly chainId?: string
   readonly fee?: ReactNode
+  readonly rpcChecks?: readonly { readonly label: string; readonly value: string }[]
 }
 
-export function DAppNetworkCard({ chain, network, chainId, fee }: DAppNetworkCardProps) {
+export function DAppNetworkCard({ chain, network, chainId, fee, rpcChecks }: DAppNetworkCardProps) {
   return (
     <section aria-label="Network" className="space-y-3 rounded-2xl bg-card/70 p-4">
       <div className="flex items-center justify-between gap-3">
@@ -234,6 +236,15 @@ export function DAppNetworkCard({ chain, network, chainId, fee }: DAppNetworkCar
           <span className="truncate">{network}</span>
         </span>
       </div>
+      {rpcChecks?.map(row => {
+        const value = presentUntrustedRpcCheckValue(row.label, row.value)
+        return (
+          <div key={row.label} className="flex items-center justify-between gap-3">
+            <span className="text-sm text-muted">{row.label}</span>
+            <span className="text-right text-sm text-foreground/90">{value}</span>
+          </div>
+        )
+      })}
       {chainId && (
         <div className="flex items-center justify-between gap-3">
           <span className="text-sm text-muted">Chain ID</span>

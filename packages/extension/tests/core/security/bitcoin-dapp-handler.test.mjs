@@ -1,9 +1,12 @@
+import * as secp256k1 from '@bitcoinerlab/secp256k1'
 import { test } from 'node:test'
 import { expect } from '@playwright/test'
 
 import { BackgroundBitcoinDAppHandler } from '../../../src/background/bitcoin-dapp-handler.ts'
 import { BITCOIN_NETWORKS } from '../../../src/config/networks.ts'
-import { networks, payments, Psbt, Transaction } from 'bitcoinjs-lib'
+import { initEccLib, networks, payments, Psbt, Transaction } from 'bitcoinjs-lib'
+
+initEccLib(secp256k1)
 
 const address = 'bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu'
 const publicKey = `0x02${'22'.repeat(32)}`
@@ -22,6 +25,132 @@ const account = {
   },
   accountIndex: 0,
   keyDomainSource: { kind: 'software', mnemonicWordCount: 24 }
+}
+
+function keyPair(digit) {
+  const privateKey = Buffer.alloc(32)
+  privateKey[31] = digit
+  const publicKey = Buffer.from(secp256k1.pointFromScalar(privateKey, true))
+  const output = payments.p2wpkh({ pubkey: publicKey, network: networks.bitcoin }).output
+  if (!output) throw new Error('Unable to derive test Bitcoin output')
+  return { privateKey, publicKey, output }
+}
+
+const ownedKey = keyPair(1)
+const externalKey = keyPair(2)
+
+function twoInputPsbt() {
+  const psbt = new Psbt({ network: networks.bitcoin })
+  psbt.addInput({
+    hash: Buffer.alloc(32, 1),
+    index: 0,
+    witnessUtxo: { script: ownedKey.output, value: 1000 }
+  })
+  psbt.addInput({
+    hash: Buffer.alloc(32, 2),
+    index: 0,
+    witnessUtxo: { script: externalKey.output, value: 1000 }
+  })
+  psbt.addOutput({ script: ownedKey.output, value: 1500 })
+  return psbt
+}
+
+function psbtParts(psbt) {
+  return { hex: psbt.toHex(), base64: psbt.toBase64() }
+}
+
+function unsignedPsbt() {
+  return psbtParts(twoInputPsbt())
+}
+
+function withValidTargetSignature(psbtHex) {
+  const psbt = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  psbt.signInput(0, {
+    publicKey: ownedKey.publicKey,
+    sign: hash => Buffer.from(secp256k1.sign(hash, ownedKey.privateKey))
+  })
+  return psbtParts(psbt)
+}
+
+function withChangedOutput(psbtHex) {
+  const psbt = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  psbt.data.globalMap.unsignedTx.tx.outs[0].value = 1400
+  return psbtParts(psbt)
+}
+
+function withReversedInputs(psbtHex) {
+  const source = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  const reversed = new Psbt({ network: networks.bitcoin })
+  for (const index of [1, 0]) {
+    const txInput = source.txInputs[index]
+    reversed.addInput({
+      hash: txInput.hash,
+      index: txInput.index,
+      sequence: txInput.sequence,
+      witnessUtxo: source.data.inputs[index].witnessUtxo
+    })
+  }
+  const output = source.txOutputs[0]
+  reversed.addOutput({ script: output.script, value: output.value })
+  return psbtParts(reversed)
+}
+
+function withTapScriptSignature(psbtHex, inputIndex) {
+  const psbt = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  psbt.updateInput(inputIndex, {
+    tapScriptSig: [
+      {
+        pubkey: Buffer.alloc(32, 0x11),
+        signature: Buffer.alloc(64, 0x22),
+        leafHash: Buffer.alloc(32, 0x33)
+      }
+    ]
+  })
+  return psbtParts(psbt)
+}
+
+function withFinalScriptWitness(psbtHex, inputIndex) {
+  const psbt = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  psbt.updateInput(inputIndex, { finalScriptWitness: Buffer.from([0x00]) })
+  return psbtParts(psbt)
+}
+
+function derSignature(fill) {
+  return Buffer.concat([
+    Buffer.from('30440220', 'hex'),
+    Buffer.alloc(32, fill),
+    Buffer.from('0220', 'hex'),
+    Buffer.alloc(32, fill),
+    Buffer.from([0x01])
+  ])
+}
+
+function withPartialSignature(psbtHex, inputIndex, pubkeyFill, signatureFill) {
+  const psbt = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  psbt.updateInput(inputIndex, {
+    partialSig: [
+      {
+        pubkey: Buffer.from(`02${pubkeyFill.repeat(32)}`, 'hex'),
+        signature: derSignature(signatureFill)
+      }
+    ]
+  })
+  return { hex: psbt.toHex(), base64: psbt.toBase64() }
+}
+
+function withReplacedSignature(psbtHex, inputIndex) {
+  const psbt = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  const [current] = psbt.data.inputs[inputIndex].partialSig
+  const signature = Buffer.from(current.signature)
+  signature[10] ^= 1
+  current.signature = signature
+  return { hex: psbt.toHex(), base64: psbt.toBase64() }
+}
+
+function withTapKeySignature(psbtHex, inputIndex) {
+  const psbt = Psbt.fromHex(psbtHex, { network: networks.bitcoin })
+  psbt.updateInput(inputIndex, { tapKeySig: Buffer.alloc(64, 0x44) })
+  return { hex: psbt.toHex(), base64: psbt.toBase64() }
 }
 
 function signingSummary(kind) {
@@ -61,7 +190,7 @@ function signingSummary(kind) {
 }
 
 function harness(overrides = {}) {
-  const { approvalSelectedIds, ...optionOverrides } = overrides
+  const { approvalSelectedIds, signedPsbtBase64, ...optionOverrides } = overrides
   let authorization = null
   let unlocked = true
   const approvalCalls = []
@@ -103,8 +232,10 @@ function harness(overrides = {}) {
       return 1
     }
   }
+  let preparedPsbtBase64 = null
   const signer = {
     async prepare(_keyDomainId, payload) {
+      if (payload.kind === 'bitcoin-psbt') preparedPsbtBase64 = payload.psbt
       return {
         commandId: `signing-command:${payload.kind}`,
         chainId: payload.chainId,
@@ -119,7 +250,7 @@ function harness(overrides = {}) {
       if (commandId.endsWith('bitcoin-psbt')) {
         return {
           kind: 'signed-payload',
-          payload: { encoding: 'base64', value: 'cHNidP8A' },
+          payload: { encoding: 'base64', value: signedPsbtBase64 ?? preparedPsbtBase64 },
           transactionId: '22'.repeat(32)
         }
       }
@@ -687,15 +818,16 @@ test.describe('Background Bitcoin dApp handler', () => {
   })
 
   test('returns a signed non-finalized PSBT and rejects a mismatched account summary', async () => {
+    const psbtHex = withValidTargetSignature(unsignedPsbt().hex).hex
     const state = harness()
     await state.handler.request({ method: 'requestAccounts' }, 'https://dapp.example', {})
     await expect(
       state.handler.request(
-        { method: 'signPsbt', params: ['70736274ff00', { autoFinalized: false }] },
+        { method: 'signPsbt', params: [psbtHex, { autoFinalized: false }] },
         'https://dapp.example',
         {}
       )
-    ).resolves.toBe('70736274ff00')
+    ).resolves.toBe(psbtHex)
 
     const mismatched = harness({
       signer: {
@@ -730,7 +862,77 @@ test.describe('Background Bitcoin dApp handler', () => {
     expect(mismatched.cancelledCommands).toEqual(['signing-command:mismatch'])
   })
 
+  test('accepts a valid target-input signature and rejects changes outside those inputs', async () => {
+    const original = unsignedPsbt()
+    const targetSigned = withValidTargetSignature(original.hex)
+    const accepted = harness({ signedPsbtBase64: targetSigned.base64 })
+    await accepted.handler.request({ method: 'requestAccounts' }, 'https://dapp.example', {})
+    await expect(
+      accepted.handler.request(
+        { method: 'signPsbt', params: [original.hex, { autoFinalized: false }] },
+        'https://dapp.example',
+        {}
+      )
+    ).resolves.toBe(targetSigned.hex)
+
+    const externalSigned = withPartialSignature(original.hex, 1, '22', 0x22)
+    const preservedExternal = withValidTargetSignature(externalSigned.hex)
+    const preserved = harness({ signedPsbtBase64: preservedExternal.base64 })
+    await preserved.handler.request({ method: 'requestAccounts' }, 'https://dapp.example', {})
+    await expect(
+      preserved.handler.request(
+        { method: 'signPsbt', params: [externalSigned.hex, { autoFinalized: false }] },
+        'https://dapp.example',
+        {}
+      )
+    ).resolves.toBe(preservedExternal.hex)
+
+    for (const { request, tampered } of [
+      { request: original.hex, tampered: withPartialSignature(targetSigned.hex, 1, '33', 0x33) },
+      { request: externalSigned.hex, tampered: withReplacedSignature(externalSigned.hex, 1) },
+      { request: original.hex, tampered: withTapKeySignature(targetSigned.hex, 1) },
+      { request: original.hex, tampered: withTapScriptSignature(targetSigned.hex, 1) },
+      { request: original.hex, tampered: withFinalScriptWitness(targetSigned.hex, 1) }
+    ]) {
+      const state = harness({ signedPsbtBase64: tampered.base64 })
+      await state.handler.request({ method: 'requestAccounts' }, 'https://dapp.example', {})
+      await expect(
+        state.handler.request(
+          { method: 'signPsbt', params: [request, { autoFinalized: false }] },
+          'https://dapp.example',
+          {}
+        )
+      ).rejects.toThrow('Bitcoin PSBT signed a non-target input')
+    }
+
+    for (const tampered of [
+      withChangedOutput(targetSigned.hex),
+      withReversedInputs(original.hex)
+    ]) {
+      const state = harness({ signedPsbtBase64: tampered.base64 })
+      await state.handler.request({ method: 'requestAccounts' }, 'https://dapp.example', {})
+      await expect(
+        state.handler.request(
+          { method: 'signPsbt', params: [original.hex, { autoFinalized: false }] },
+          'https://dapp.example',
+          {}
+        )
+      ).rejects.toThrow('Bitcoin PSBT changed unapproved fields')
+    }
+
+    const unsignedResult = harness({ signedPsbtBase64: original.base64 })
+    await unsignedResult.handler.request({ method: 'requestAccounts' }, 'https://dapp.example', {})
+    await expect(
+      unsignedResult.handler.request(
+        { method: 'signPsbt', params: [original.hex, { autoFinalized: false }] },
+        'https://dapp.example',
+        {}
+      )
+    ).rejects.toThrow('Bitcoin PSBT target input signature is missing or invalid')
+  })
+
   test('signs a bounded PSBT batch sequentially and rejects incomplete PSBT broadcast', async () => {
+    const psbtHex = withValidTargetSignature(unsignedPsbt().hex).hex
     const state = harness()
     await state.handler.request({ method: 'requestAccounts' }, 'https://dapp.example', {})
     await expect(
@@ -738,14 +940,14 @@ test.describe('Background Bitcoin dApp handler', () => {
         {
           method: 'signPsbts',
           params: [
-            ['70736274ff00', '70736274ff00'],
+            [psbtHex, psbtHex],
             [{ autoFinalized: false }, { autoFinalized: false }]
           ]
         },
         'https://dapp.example',
         {}
       )
-    ).resolves.toEqual(['70736274ff00', '70736274ff00'])
+    ).resolves.toEqual([psbtHex, psbtHex])
     expect(state.approvalCalls.map(call => call.action)).toEqual([
       'bitcoinConnect',
       'bitcoinTransaction',

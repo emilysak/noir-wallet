@@ -81,7 +81,10 @@ interface SwapReviewViewProps {
       readonly label: 'Deposit address' | 'Contract'
       readonly address: string
     } | null
+    readonly inputs?: number
   } | null
+  /** Shown on the current review without blocking the next confirmation. */
+  notice?: string | null
   destinationDetails?: { readonly network: string; readonly chainIcon?: string }
   approvalDetails?: {
     readonly spender: string
@@ -139,6 +142,7 @@ export function SwapReviewView({
   sourceFeeFamily,
   onSourceFeeTierChange,
   sourceTransferDetails,
+  notice,
   destinationDetails,
   approvalDetails,
   hasSigningReview,
@@ -357,6 +361,11 @@ export function SwapReviewView({
                       </span>
                     </DetailItem>
                   )}
+                  {sourceTransferDetails.inputs !== undefined && (
+                    <DetailItem label="Inputs">
+                      <span>{sourceTransferDetails.inputs}</span>
+                    </DetailItem>
+                  )}
                   {sourceTransferDetails.executionTarget && (
                     <DetailItem label={sourceTransferDetails.executionTarget.label}>
                       <span
@@ -426,6 +435,7 @@ export function SwapReviewView({
             className="mt-3 px-1"
           />
         )}
+        {!preparationError && notice && <InlineError message={notice} className="mt-3 px-1" />}
         {feeError && onRetryFee && (
           <InlineError
             message="Could not estimate network fee"

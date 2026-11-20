@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "type-check": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "test": "node scripts/run-tests.mjs",
+    "site-list:split": "node --experimental-strip-types scripts/split-site-list-entries.ts",
     "wallets:provision:evm": "node scripts/provision-evm-live-test-wallet.mjs",
     "wallets:provision:bitcoin": "node scripts/provision-bitcoin-live-test-wallet.mjs",
     "wallets:check": "node scripts/check-test-wallets.mjs",

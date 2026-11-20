@@ -11,6 +11,9 @@ import type {
 import type { LedgerSigningResume } from '@/infrastructure/keyring/multichain/ledger-signing-bridge'
 import type { NearSigningPreparePayload } from '@/infrastructure/keyring/multichain/signing-adapter-near'
 import {
+  assertWithinConstraintBinding,
+  isQuoteExecutionProtocol,
+  reviewedAmountAllows,
   type NearIntentsTransactionBinding,
   parseTransactionEventId,
   parseTransactionId,
@@ -162,6 +165,50 @@ function pendingSigning(pending: AwaitingApprovalNearTransfer): PreparedSigningC
   })
 }
 
+function nearPreparedRecipient(prepared: AwaitingApprovalNearTransfer['prepared']): string {
+  if ('kind' in prepared) return prepared.recipientId
+  return prepared.receiverId
+}
+
+function nearPreparedSpend(prepared: AwaitingApprovalNearTransfer['prepared']): {
+  assetId: string
+  amountRaw: string
+} {
+  if ('kind' in prepared) {
+    return { assetId: prepared.assetId, amountRaw: prepared.amountRaw }
+  }
+  return { assetId: `${prepared.chainId}/slip44:397`, amountRaw: prepared.depositYocto }
+}
+
+function assertNearQuoteConstraint(
+  graph: TransactionGraph,
+  pending: AwaitingApprovalNearTransfer,
+  now: number
+): void {
+  const intent = graph.root.intent
+  const protocol = intent?.protocol
+  if (!intent?.primaryAmount || !intent.feeLimit || !intent.recipient || !protocol) {
+    throw new Error('Approved spend changed. Review the transaction again.')
+  }
+  assertWithinConstraintBinding(
+    {
+      kind: 'constraint',
+      maxSpend: intent.primaryAmount,
+      recipients: [intent.recipient],
+      maxFee: intent.feeLimit,
+      expiresAt: Math.min(pending.expiresAt, protocol.expiresAt)
+    },
+    {
+      spend: nearPreparedSpend(pending.prepared),
+      recipients: [
+        { chainId: pending.prepared.chainId, address: nearPreparedRecipient(pending.prepared) }
+      ],
+      fee: { assetId: intent.feeLimit.assetId, amountRaw: pending.prepared.maximumFeeYocto }
+    },
+    now
+  )
+}
+
 export class NearTransferOrchestrator {
   private readonly repository: TransactionRepository
   private readonly pendingStore: NearPendingTransferStore
@@ -176,6 +223,7 @@ export class NearTransferOrchestrator {
     graph: TransactionGraph,
     recovered: boolean
   ) => Promise<void> | void
+  private readonly rebuiltQuoteSources = new Set<string>()
 
   constructor(options: NearTransferOrchestratorOptions) {
     this.repository = options.repository
@@ -371,38 +419,51 @@ export class NearTransferOrchestrator {
       await this.failAwaitingApproval(pending, input.signal)
       throw new Error('Pending NEAR transfer integrity check failed')
     }
+    let approval = pending
+    if (await this.nearNonceIsStale(pending, input.signal)) {
+      const rebuilt = await this.rebuildStaleQuoteSource(pending, currentGraph, input.signal)
+      if (rebuilt) approval = rebuilt
+    }
+    if (isQuoteExecutionProtocol(currentGraph.root.intent?.protocol?.provider)) {
+      try {
+        assertNearQuoteConstraint(currentGraph, approval, this.timestamp())
+      } catch (error) {
+        await this.failAwaitingApproval(approval, input.signal)
+        throw error
+      }
+    }
 
-    let graph = this.transitionReviewGraph(pending, currentGraph, 'approved')
+    let graph = this.transitionReviewGraph(approval, currentGraph, 'approved')
     try {
-      await this.pendingStore.put(pending, graph)
+      await this.pendingStore.put(approval, graph)
     } catch {
-      await this.failAwaitingApproval(pending, input.signal)
+      await this.failAwaitingApproval(approval, input.signal)
       throw new Error('Approved NEAR signing request could not be persisted')
     }
     let signed: SigningResult
     try {
       signed = await this.signer.confirm(
-        pending.scope.keyDomainId,
-        pending.signingCommandId,
+        approval.scope.keyDomainId,
+        approval.signingCommandId,
         input.signal,
         undefined,
-        pending.signingExecution,
-        pending.signingExecution?.kind === 'external'
+        approval.signingExecution,
+        approval.signingExecution?.kind === 'external'
           ? {
-              accountId: pending.scope.accountId,
+              accountId: approval.scope.accountId,
               payload: {
                 kind: 'near-transaction',
-                chainId: parseChainId(pending.prepared.chainId).id,
-                accountIndex: pending.prepared.transaction.accountIndex,
-                transaction: { ...pending.prepared.transaction }
+                chainId: parseChainId(approval.prepared.chainId).id,
+                accountIndex: approval.prepared.transaction.accountIndex,
+                transaction: { ...approval.prepared.transaction }
               },
-              prepared: pendingSigning(pending)
+              prepared: pendingSigning(approval)
             }
           : undefined
       )
     } catch (error) {
       if (isUnrecoverableSigningError(error)) {
-        await this.failAwaitingApproval(pending, input.signal)
+        await this.failAwaitingApproval(approval, input.signal)
       }
       throw error
     }
@@ -411,28 +472,28 @@ export class NearTransferOrchestrator {
       signed.payload.encoding !== 'base64' ||
       signed.transactionId === undefined
     ) {
-      await this.failConsumedSigning(pending)
+      await this.failConsumedSigning(approval)
       throw new Error('Signed NEAR transaction failed integrity validation')
     }
     const signedPending: SignedPendingNearTransfer = Object.freeze({
       schemaVersion: 1,
       phase: 'signed',
-      transactionId: pending.transactionId,
-      segmentId: pending.segmentId,
-      scope: pending.scope,
+      transactionId: approval.transactionId,
+      segmentId: approval.segmentId,
+      scope: approval.scope,
       transactionBase64: signed.payload.value,
       transactionHash: signed.transactionId,
-      signerId: pending.prepared.signerId,
+      signerId: approval.prepared.signerId,
       signedAt: this.timestamp()
     })
     try {
-      graph = this.transitionReviewGraph(pending, graph, 'signed', {
+      graph = this.transitionReviewGraph(approval, graph, 'signed', {
         transactionHash: signedPending.transactionHash,
-        externalReference: `near-blockhash:${pending.prepared.transaction.blockHash}`
+        externalReference: `near-blockhash:${approval.prepared.transaction.blockHash}`
       })
       await this.pendingStore.put(signedPending, graph)
     } catch {
-      await this.failConsumedSigning(pending)
+      await this.failConsumedSigning(approval)
       throw new Error('Signed NEAR transaction could not be persisted')
     }
     graph = await this.persistSignedGraph(signedPending, graph)
@@ -560,6 +621,101 @@ export class NearTransferOrchestrator {
     return pending.length
   }
 
+  private async nearNonceIsStale(
+    pending: AwaitingApprovalNearTransfer,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    const accessKey = await this.rpc.getAccessKey(
+      pending.prepared.signerId,
+      pending.prepared.publicKey,
+      signal
+    )
+    if (!accessKey) return false
+    try {
+      return BigInt(pending.prepared.transaction.nonce) <= BigInt(accessKey.nonce)
+    } catch {
+      return false
+    }
+  }
+
+  private async rebuildStaleQuoteSource(
+    pending: AwaitingApprovalNearTransfer,
+    graph: TransactionGraph,
+    signal?: AbortSignal
+  ): Promise<AwaitingApprovalNearTransfer | null> {
+    const protocol = graph.root.intent?.protocol
+    if (!isQuoteExecutionProtocol(protocol?.provider)) return null
+    if (this.rebuiltQuoteSources.has(pending.transactionId)) return null
+    this.rebuiltQuoteSources.add(pending.transactionId)
+    const current = pending.prepared
+    const prepared =
+      'kind' in current && current.kind === 'token'
+        ? await prepareNearTokenTransfer({
+            chainId: current.chainId,
+            accountIndex: current.accountIndex,
+            assetId: current.assetId,
+            signerId: current.signerId,
+            publicKey: current.publicKey,
+            recipientId: current.recipientId,
+            contractId: current.contractId,
+            amountRaw: current.amountRaw,
+            rpc: this.rpc,
+            signal
+          })
+        : !('kind' in current)
+          ? await prepareNearNativeTransfer({
+              chainId: current.chainId,
+              accountIndex: current.accountIndex,
+              signerId: current.signerId,
+              publicKey: current.publicKey,
+              receiverId: current.receiverId,
+              depositYocto: current.depositYocto,
+              rpc: this.rpc,
+              signal
+            })
+          : null
+    if (!prepared) return null
+    const candidate: AwaitingApprovalNearTransfer = Object.freeze({ ...pending, prepared })
+    assertNearQuoteConstraint(graph, candidate, this.timestamp())
+    const signing = await this.signer.prepare(
+      pending.scope.keyDomainId,
+      Object.freeze({
+        kind: 'near-transaction' as const,
+        chainId: parseChainId(prepared.transaction.chainId).id,
+        accountIndex: prepared.transaction.accountIndex,
+        transaction: { ...prepared.transaction }
+      }),
+      signal
+    )
+    try {
+      await assertNearTransferSigningMatchesPrepared(prepared, signing)
+      if (signing.expiresAt <= this.timestamp()) {
+        throw new Error('NEAR signing request expired during preparation')
+      }
+    } catch (error) {
+      await this.cancelSigning(pending.scope.keyDomainId, signing.commandId, signal).catch(() => {})
+      throw error
+    }
+    if (signing.summary.schema !== 'near.transaction.v1') {
+      await this.cancelSigning(pending.scope.keyDomainId, signing.commandId, signal).catch(() => {})
+      throw new Error('NEAR signing request expired during preparation')
+    }
+    const signingSummary = signing.summary
+    await this.cancelSigning(pending.scope.keyDomainId, pending.signingCommandId, signal).catch(
+      () => {}
+    )
+    const next: AwaitingApprovalNearTransfer = Object.freeze({
+      ...candidate,
+      signingSummary,
+      signingCommandId: signing.commandId,
+      signingExecution: signing.execution,
+      payloadFingerprint: signing.payloadFingerprint.digestHex,
+      expiresAt: Math.min(pending.expiresAt, signing.expiresAt)
+    })
+    await this.pendingStore.put(next, graph)
+    return next
+  }
+
   private async failAwaitingApproval(
     pending: AwaitingApprovalNearTransfer,
     signal?: AbortSignal
@@ -640,7 +796,9 @@ export class NearTransferOrchestrator {
         intent.primaryAmount?.assetId === primaryAssetId &&
         intent.primaryAmount.amountRaw === primaryAmountRaw &&
         intent.feeLimit?.assetId === `${pending.prepared.chainId}/slip44:397` &&
-        intent.feeLimit.amountRaw === pending.prepared.maximumFeeYocto &&
+        (isQuoteExecutionProtocol(intent.protocol?.provider)
+          ? reviewedAmountAllows(pending.prepared.maximumFeeYocto, intent.feeLimit.amountRaw)
+          : intent.feeLimit.amountRaw === pending.prepared.maximumFeeYocto) &&
         intent.sender?.chainId === pending.prepared.chainId &&
         intent.sender.address === pending.prepared.signerId &&
         intent.recipient?.chainId === pending.prepared.chainId &&

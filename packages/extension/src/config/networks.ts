@@ -185,6 +185,7 @@ export interface EvmNetworkConfig {
   readonly historyApiUrl?: string
   readonly explorerUrl: string
   readonly usdcContract?: `0x${string}`
+  readonly executionFee?: 'op-stack'
 }
 
 interface DefaultEvmNetworkConfig extends EvmNetworkConfig {
@@ -264,7 +265,8 @@ export const BUILTIN_EVM_NETWORKS = Object.freeze({
         slip44Reference: '60'
       },
       explorerUrl: 'https://base.blockscout.com',
-      usdcContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+      usdcContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+      executionFee: 'op-stack'
     }),
     defineNetwork({
       networkMode: 'mainnet',
@@ -280,7 +282,8 @@ export const BUILTIN_EVM_NETWORKS = Object.freeze({
         slip44Reference: '60'
       },
       explorerUrl: 'https://optimistic.etherscan.io',
-      usdcContract: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85'
+      usdcContract: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
+      executionFee: 'op-stack'
     }),
     defineNetwork({
       networkMode: 'mainnet',
@@ -453,7 +456,8 @@ export const BUILTIN_EVM_NETWORKS = Object.freeze({
         slip44Reference: '60'
       },
       explorerUrl: 'https://sepolia.basescan.org',
-      usdcContract: '0x036CbD53842c5426634e7929541eC2318f3dCF7e'
+      usdcContract: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+      executionFee: 'op-stack'
     }),
     defineNetwork({
       networkMode: 'testnet',
@@ -469,7 +473,8 @@ export const BUILTIN_EVM_NETWORKS = Object.freeze({
         slip44Reference: '60'
       },
       explorerUrl: 'https://sepolia-optimism.etherscan.io',
-      usdcContract: '0x5fd84259d66Cd46123540766Be93DFE6D43130D7'
+      usdcContract: '0x5fd84259d66Cd46123540766Be93DFE6D43130D7',
+      executionFee: 'op-stack'
     }),
     defineNetwork({
       networkMode: 'testnet',
@@ -534,6 +539,21 @@ export const EVM_NETWORKS = Object.freeze({
 
 export function getEvmNetworkConfigs(network: Network): readonly EvmNetworkConfig[] {
   return BUILTIN_EVM_NETWORKS[network]
+}
+
+function usesOpStackExecutionFee(config: { readonly chainId: string }): boolean {
+  return 'executionFee' in config && config.executionFee === 'op-stack'
+}
+
+export function isOpStackExecutionFee(chainId: string): boolean {
+  return (
+    BUILTIN_EVM_NETWORKS.mainnet.some(
+      config => config.chainId === chainId && usesOpStackExecutionFee(config)
+    ) ||
+    BUILTIN_EVM_NETWORKS.testnet.some(
+      config => config.chainId === chainId && usesOpStackExecutionFee(config)
+    )
+  )
 }
 
 export function findBuiltinEvmNetworkConfig(

@@ -11,6 +11,7 @@ import {
   assertExactKeys,
   assertOpaqueContentReview,
   assertReviewIssuesAllowed,
+  requireBlockedReview,
   readArray,
   readBase58,
   readBoolean,
@@ -361,6 +362,9 @@ function parseSolanaTransaction(envelope: ParsedSigningSummaryEnvelope): SolanaT
     (simulationStatus === 'failed') !== hasSimulationIssue
   ) {
     throw new Error('Solana simulation review does not match its status')
+  }
+  if (simulationStatus === 'failed') {
+    requireBlockedReview(envelope.review, 'simulation-failed')
   }
   const limits = instructions.filter(
     instruction =>

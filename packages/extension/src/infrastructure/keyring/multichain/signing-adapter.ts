@@ -5,6 +5,7 @@ import type {
   SigningResult
 } from '@/core/keyring/ports/signing'
 import { parseSigningSummary } from '@/core/keyring/domain/signing-summary-validation'
+import { evmContractCallReviewIssues } from '@/infrastructure/chains/evm/evm-contract-call-classification'
 import type {
   CanonicalContent,
   EvmTypedDataValue,
@@ -111,12 +112,18 @@ export type ParsedSigningPreparePayload =
       readonly chainId: ChainId
       readonly addressIndex: number
       readonly transaction: EvmTransaction
+      readonly l1DataFeeWei?: string
+      readonly suggestedFeePerGasWei?: string | null
+      readonly priorityFeeElevated?: boolean
     }
   | {
       readonly kind: 'evm-transaction'
       readonly chainId: ChainId
       readonly addressIndex: number
       readonly transaction: EvmTransaction
+      readonly l1DataFeeWei?: string
+      readonly suggestedFeePerGasWei?: string | null
+      readonly priorityFeeElevated?: boolean
     }
   | {
       readonly kind: 'pea-evm-personal-message'
@@ -290,6 +297,26 @@ function readCanonicalBase64(value: unknown, label: string, maximum: number): st
   return parsed
 }
 
+function parseEvmNetworkFeeAnnotation(record: UnknownRecord): {
+  readonly l1DataFeeWei?: string
+  readonly suggestedFeePerGasWei?: string | null
+  readonly priorityFeeElevated?: boolean
+} {
+  const present = ['l1DataFeeWei', 'suggestedFeePerGasWei', 'priorityFeeElevated'].filter(key =>
+    Object.prototype.hasOwnProperty.call(record, key)
+  )
+  if (present.length === 0) return {}
+  if (present.length !== 3) throw new Error('EVM priority fee warning is incomplete')
+  return Object.freeze({
+    l1DataFeeWei: readUnsignedDecimal(record.l1DataFeeWei, 'l1DataFeeWei'),
+    suggestedFeePerGasWei:
+      record.suggestedFeePerGasWei === null
+        ? null
+        : readUnsignedDecimal(record.suggestedFeePerGasWei, 'suggestedFeePerGasWei'),
+    priorityFeeElevated: readBoolean(record.priorityFeeElevated, 'priorityFeeElevated')
+  })
+}
+
 export function parseSigningPreparePayload(value: unknown): ParsedSigningPreparePayload {
   const record = readRecord(value, 'signing.prepare payload')
   if (record.kind === 'solana-transaction' || record.kind === 'solana-message') {
@@ -313,17 +340,24 @@ export function parseSigningPreparePayload(value: unknown): ParsedSigningPrepare
     'signing.prepare kind'
   )
   if (kind === 'evm-transaction' || kind === 'pea-evm-transaction') {
-    assertExactKeys(record, ['kind', 'chainId', 'addressIndex', 'transaction'], [], 'payload')
+    assertExactKeys(
+      record,
+      ['kind', 'chainId', 'addressIndex', 'transaction'],
+      ['l1DataFeeWei', 'suggestedFeePerGasWei', 'priorityFeeElevated'],
+      'payload'
+    )
     const chainId = parseChainId(record.chainId, 'eip155')
     const transaction = parseEvmTransaction(record.transaction)
     if (transaction.chainId !== chainId.slice('eip155:'.length)) {
       throw new Error('EVM transaction chain ID does not match the selected chain')
     }
+    const networkFee = parseEvmNetworkFeeAnnotation(record)
     return Object.freeze({
       kind,
       chainId,
       addressIndex: readSafeInteger(record.addressIndex, 'addressIndex', MAX_BIP32_INDEX),
-      transaction
+      transaction,
+      ...networkFee
     })
   }
   if (kind === 'evm-personal-message' || kind === 'pea-evm-personal-message') {
@@ -503,10 +537,12 @@ async function adaptEvmTransaction(
   )
   const transaction = payload.transaction
   const calldataBytes = decodeHex(transaction.input)
-  const maximumFeeWei =
+  const executionFeeWei =
     transaction.type === 'eip1559'
       ? (BigInt(transaction.gasLimit) * BigInt(transaction.maxFeePerGas)).toString()
       : (BigInt(transaction.gasLimit) * BigInt(transaction.gasPrice)).toString()
+  const l1DataFeeWei = payload.l1DataFeeWei ?? '0'
+  const maximumFeeWei = (BigInt(executionFeeWei) + BigInt(l1DataFeeWei)).toString()
   if (
     rawSummary.transactionType !== transaction.type ||
     rawSummary.chainId !== payload.chainId ||
@@ -514,7 +550,7 @@ async function adaptEvmTransaction(
     !evmAddressesMatch(rawSummary.to, transaction.to) ||
     rawSummary.valueWei !== transaction.value ||
     rawSummary.gasLimit !== transaction.gasLimit ||
-    rawSummary.maximumFeeWei !== maximumFeeWei ||
+    rawSummary.maximumFeeWei !== executionFeeWei ||
     rawSummary.calldataBytes !== calldataBytes.byteLength
   ) {
     throw new Error('Prepared EVM transaction summary does not match its input')
@@ -527,7 +563,7 @@ async function adaptEvmTransaction(
   const issues: SigningReviewIssue[] = []
   if (transaction.to === null) issues.push(Object.freeze({ code: 'contract-creation' }))
   if (transaction.to !== null && calldataBytes.byteLength > 0) {
-    issues.push(Object.freeze({ code: 'unrecognized-call' }))
+    issues.push(...evmContractCallReviewIssues(transaction.input, transaction.to))
   }
   const summary = parseSigningSummary(
     {
@@ -543,6 +579,13 @@ async function adaptEvmTransaction(
         valueWei: transaction.value,
         gasLimit: transaction.gasLimit,
         maximumFeeWei,
+        ...(payload.l1DataFeeWei === undefined
+          ? {}
+          : {
+              l1DataFeeWei: payload.l1DataFeeWei,
+              suggestedFeePerGasWei: payload.suggestedFeePerGasWei ?? null,
+              priorityFeeElevated: payload.priorityFeeElevated === true
+            }),
         gasPriceWei: transaction.type === 'eip1559' ? null : transaction.gasPrice,
         maxFeePerGasWei: transaction.type === 'eip1559' ? transaction.maxFeePerGas : null,
         maxPriorityFeePerGasWei:

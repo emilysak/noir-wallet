@@ -8,29 +8,36 @@ import {
   type CustomEvmNetwork
 } from './chain-endpoint-settings'
 import { resolvePersistedNetworkChainEndpointSettings } from '@/lib/wallet-settings-storage'
+import { resolveEvmRpcOrigin, type EvmRpcOrigin } from './evm-rpc-origin'
 
 export const CUSTOM_EVM_NETWORKS_ENABLED = true
 
 export interface EvmRuntimeNetworkConfig extends EvmNetworkConfig {
   readonly source: 'builtin' | 'custom'
+  readonly rpcOrigin: EvmRpcOrigin
+}
+
+type ClassifiedEvmNetworkConfig = EvmNetworkConfig & {
+  readonly source: 'builtin' | 'custom'
 }
 
 function applyOverride(
-  config: EvmRuntimeNetworkConfig,
+  config: ClassifiedEvmNetworkConfig,
   settings: ChainEndpointSettings
 ): EvmRuntimeNetworkConfig {
   const override = findChainEndpointOverride(settings, config.chainId)
   return Object.freeze({
     ...config,
     ...(override?.rpc === undefined ? {} : { rpcUrl: override.rpc.url }),
-    ...(override?.explorer === undefined ? {} : { explorerUrl: override.explorer.baseUrl })
+    ...(override?.explorer === undefined ? {} : { explorerUrl: override.explorer.baseUrl }),
+    rpcOrigin: resolveEvmRpcOrigin(config.networkMode, settings, config.chainId)
   })
 }
 
 function customNetworkConfig(
   networkMode: Network,
   network: CustomEvmNetwork
-): EvmRuntimeNetworkConfig {
+): ClassifiedEvmNetworkConfig {
   return Object.freeze({
     networkMode,
     chainId: network.chainId,

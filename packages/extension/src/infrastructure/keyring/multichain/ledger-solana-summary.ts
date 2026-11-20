@@ -140,7 +140,11 @@ export async function buildLedgerSolanaSummary(
     chainId,
     operation: 'transaction' as const,
     review: {
-      level: issues.length === 0 ? ('standard' as const) : ('caution' as const),
+      level: issues.some(issue => issue.code === 'simulation-failed')
+        ? ('blocked' as const)
+        : issues.length === 0
+          ? ('standard' as const)
+          : ('caution' as const),
       issues
     },
     fields: {

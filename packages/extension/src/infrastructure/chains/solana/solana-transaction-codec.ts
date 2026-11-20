@@ -123,17 +123,35 @@ function parseMessage(message: Uint8Array): ParsedSolanaTransactionEnvelope {
   })
 }
 
-export function parseSolanaTransactionEnvelope(
-  transactionBase64: string
-): ParsedSolanaTransactionEnvelope {
-  const transaction = parseCanonicalBase64(
-    transactionBase64,
-    MAXIMUM_TRANSACTION_BYTES,
-    'Solana transaction'
-  )
+function parseTransactionBytes(transaction: Uint8Array): ParsedSolanaTransactionEnvelope {
   const cursor = { offset: 0 }
   const signatureCount = readShortVector(transaction, cursor, 'signature count')
   readBytes(transaction, cursor, signatureCount * SIGNATURE_BYTES, 'signatures')
   if (cursor.offset === transaction.byteLength) throw new Error('Solana transaction has no message')
   return parseMessage(transaction.subarray(cursor.offset))
+}
+
+export function parseSolanaTransactionEnvelope(
+  transactionBase64: string
+): ParsedSolanaTransactionEnvelope {
+  return parseTransactionBytes(
+    parseCanonicalBase64(transactionBase64, MAXIMUM_TRANSACTION_BYTES, 'Solana transaction')
+  )
+}
+
+// Raw ed25519 over these bytes is a Solana transaction signature when the
+// bytes are a serialized transaction or the message that transaction signs.
+export function solanaBytesParseAsTransaction(bytes: Uint8Array): boolean {
+  if (bytes.byteLength === 0 || bytes.byteLength > MAXIMUM_TRANSACTION_BYTES) return false
+  try {
+    parseTransactionBytes(bytes)
+    return true
+  } catch {
+    try {
+      parseMessage(bytes)
+      return true
+    } catch {
+      return false
+    }
+  }
 }

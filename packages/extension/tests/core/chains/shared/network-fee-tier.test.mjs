@@ -10,6 +10,7 @@ import { bitcoinFeeTargetBlocks } from '../../../../src/infrastructure/chains/bi
 import {
   deriveEvmFeeTierQuote,
   formatEvmPriorityFeeGwei,
+  isPriorityFeeElevated,
   parseEvmFeeSelection,
   parseEvmPriorityFeeGwei
 } from '../../../../src/infrastructure/chains/evm/evm-fee-tier.ts'
@@ -92,4 +93,16 @@ test('rejects malformed, zero, over-precise, and excessive custom priority fees'
       suggestedPriorityFeePerGas: 1_000_000_000n
     })
   ).toThrow(/base fee/i)
+})
+
+test('warns when a priority fee is far above the suggestion or above 200 Gwei', () => {
+  const gwei = 1_000_000_000n
+  expect(isPriorityFeeElevated(gwei, gwei)).toBe(false)
+  expect(isPriorityFeeElevated((gwei * 3n) / 2n, gwei)).toBe(false)
+  expect(isPriorityFeeElevated(10n * gwei, gwei)).toBe(false)
+  expect(isPriorityFeeElevated(10n * gwei + 1n, gwei)).toBe(true)
+  expect(isPriorityFeeElevated(gwei, 0n)).toBe(false)
+  expect(isPriorityFeeElevated(gwei + 1n, 0n)).toBe(true)
+  expect(isPriorityFeeElevated(200n * gwei, 200n * gwei)).toBe(false)
+  expect(isPriorityFeeElevated(200n * gwei + 1n, 200n * gwei)).toBe(true)
 })

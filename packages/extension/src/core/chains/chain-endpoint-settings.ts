@@ -33,6 +33,8 @@ export interface SavedChainRpcEndpoint {
   readonly rpc: CustomChainRpcEndpoint
 }
 
+export type CustomEvmNetworkAddedBy = 'user' | 'dapp'
+
 export interface CustomEvmNetwork {
   readonly chainId: `eip155:${string}`
   readonly numericChainId: number
@@ -44,6 +46,8 @@ export interface CustomEvmNetwork {
   }>
   readonly rpc: CustomChainRpcEndpoint
   readonly explorer?: CustomChainExplorer
+  /** Absent on networks saved before RPC origin was recorded. */
+  readonly addedBy?: CustomEvmNetworkAddedBy
 }
 
 export interface ChainEndpointSettings {
@@ -78,7 +82,8 @@ export function getChainEndpointRuntimeKey(settings: ChainEndpointSettings): str
       chainId: network.chainId,
       displayName: network.displayName,
       nativeCurrency: network.nativeCurrency,
-      rpc: network.rpc
+      rpc: network.rpc,
+      ...(network.addedBy === undefined ? {} : { addedBy: network.addedBy })
     })),
     rpcOverrides: settings.overrides.flatMap(override =>
       override.rpc ? [{ chainId: override.chainId, rpc: override.rpc }] : []
@@ -267,7 +272,7 @@ export function parseCustomEvmNetwork(value: unknown): CustomEvmNetwork {
   assertKeys(
     value,
     ['chainId', 'numericChainId', 'displayName', 'nativeCurrency', 'rpc'],
-    ['explorer'],
+    ['explorer', 'addedBy'],
     'Custom EVM network'
   )
   const identity = parseEvmChainId(value.chainId)
@@ -292,8 +297,15 @@ export function parseCustomEvmNetwork(value: unknown): CustomEvmNetwork {
       decimals: value.nativeCurrency.decimals as number
     }),
     rpc: parseRpcEndpoint(value.rpc, 'evm-json-rpc'),
-    ...(value.explorer === undefined ? {} : { explorer: parseExplorer(value.explorer) })
+    ...(value.explorer === undefined ? {} : { explorer: parseExplorer(value.explorer) }),
+    ...parseAddedBy(value.addedBy)
   })
+}
+
+function parseAddedBy(value: unknown): { readonly addedBy?: CustomEvmNetworkAddedBy } {
+  if (value === undefined) return {}
+  if (value === 'user' || value === 'dapp') return { addedBy: value }
+  throw new Error('Invalid custom EVM network source')
 }
 
 export function parseChainEndpointSettings(value: unknown): ChainEndpointSettings {
