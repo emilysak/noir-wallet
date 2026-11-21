@@ -70,7 +70,8 @@ export function useShieldBalances({
       })) ?? null,
     [freshAssets]
   )
-  const sessionChecking = active && enabled && autoRecoveringKey === scopeKey
+  const sessionPending = active && enabled && autoRecoveringKey === scopeKey
+  const sessionChecking = sessionPending && !balances
   const needsSessionCheck = active && enabled && authorizeOnMount
   const sessionReady = !needsSessionCheck || sessionReadyKey === scopeKey
 
@@ -107,8 +108,12 @@ export function useShieldBalances({
       if (!force && balances) return Promise.resolve(true)
       const requestKey = scopeKey
       if (inFlight.current?.key === requestKey) return inFlight.current.promise
+      const hasFreshBalances = balances !== null
+      // Cached fresh balances already unlock Move. Keep probing the session,
+      // but do not hold the button in a loading state for that refresh.
+      const revealConnecting = !automatic || !hasFreshBalances
       const request = (async () => {
-        setConnecting(true)
+        if (revealConnecting) setConnecting(true)
         setError(null)
         setErrorCode(null)
         lastErrorCode.current = null
@@ -137,7 +142,9 @@ export function useShieldBalances({
           }
           return false
         } finally {
-          if (currentKey.current === requestKey && currentActive.current) setConnecting(false)
+          if (revealConnecting && currentKey.current === requestKey && currentActive.current) {
+            setConnecting(false)
+          }
         }
       })()
       inFlight.current = { key: requestKey, promise: request }
@@ -180,18 +187,19 @@ export function useShieldBalances({
       return
     autoAttemptedKey.current = scopeKey
     let cancelled = false
-    let started = false
+    let finished = false
     let retryTimer: number | null = null
     let retries = 0
     const stop = () => {
       cancelled = true
-      if (!started && autoAttemptedKey.current === scopeKey) autoAttemptedKey.current = null
+      if (!finished && autoAttemptedKey.current === scopeKey) autoAttemptedKey.current = null
       if (retryTimer !== null) window.clearTimeout(retryTimer)
       if (cancelAutoRecovery.current === stop) cancelAutoRecovery.current = null
       setAutoRecoveringKey(current => (current === scopeKey ? null : current))
     }
     const finish = () => {
       if (currentKey.current === scopeKey) setSessionReadyKey(scopeKey)
+      finished = true
       stop()
     }
     cancelAutoRecovery.current = stop
@@ -224,7 +232,6 @@ export function useShieldBalances({
     }
     queueMicrotask(() => {
       if (cancelled) return
-      started = true
       setAutoRecoveringKey(scopeKey)
       void attempt(false)
     })
@@ -239,8 +246,8 @@ export function useShieldBalances({
     settled,
     sessionReady,
     connecting: connecting || sessionChecking,
-    error: sessionChecking ? null : error,
-    errorCode: sessionChecking ? null : errorCode,
+    error: sessionPending ? null : error,
+    errorCode: sessionPending ? null : errorCode,
     readBalanceErrorCode,
     refreshBalances
   }

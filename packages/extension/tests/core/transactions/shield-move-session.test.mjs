@@ -3,6 +3,7 @@ import { expect } from '@playwright/test'
 
 import { clusterNetworkFeeRequest } from '../../../src/popup/services/shield-transfer.ts'
 import {
+  moveRequiresShieldBalance,
   nextShieldSessionProbe,
   shouldProbeShieldSession
 } from '../../../src/popup/services/shield-session-check.ts'
@@ -14,6 +15,30 @@ const readyProbe = {
   authorizeOnMount: true,
   attempted: false
 }
+
+test('a direct Shield deposit does not wait for a Shield balance', () => {
+  expect(moveRequiresShieldBalance({ from: 'public', to: 'shield', method: 'directly' })).toBe(
+    false
+  )
+  expect(moveRequiresShieldBalance({ from: 'private', to: 'shield', method: 'directly' })).toBe(
+    false
+  )
+  expect(moveRequiresShieldBalance({ from: 'shield', to: 'public', method: 'directly' })).toBe(
+    true
+  )
+  expect(moveRequiresShieldBalance({ from: 'shield', to: 'private', method: 'directly' })).toBe(
+    true
+  )
+  expect(moveRequiresShieldBalance({ from: 'public', to: 'private', method: 'cluster' })).toBe(
+    true
+  )
+  expect(moveRequiresShieldBalance({ from: 'private', to: 'public', method: 'cluster' })).toBe(
+    true
+  )
+  expect(moveRequiresShieldBalance({ from: 'public', to: 'private', method: 'directly' })).toBe(
+    false
+  )
+})
 
 test('fresh Shield balances still require a session probe', () => {
   expect(shouldProbeShieldSession({ ...readyProbe, hasFreshBalances: true })).toBe(true)

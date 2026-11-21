@@ -1,4 +1,6 @@
 import type { ConfidentialBalanceErrorCode } from '@/popup/services/confidential-funding-client'
+import type { TransferDomain } from '@/popup/services/private-balance-transfer'
+import { isClusterTransferRoute } from '@/popup/services/shield-transfer'
 
 export type ShieldSessionProbeStep = 'done' | 'authorize' | 'retry' | 'stop'
 
@@ -26,6 +28,23 @@ export function shouldProbeShieldSession(
     input.settled &&
     input.authorizeOnMount &&
     !input.attempted
+  )
+}
+
+/**
+ * A direct deposit spends the public or private balance. Confirm signs in later.
+ * Withdrawals and Cluster quotes read a Shield balance first.
+ */
+export function moveRequiresShieldBalance(
+  input: Readonly<{
+    from: TransferDomain
+    to: TransferDomain
+    method: 'cluster' | 'directly'
+  }>
+): boolean {
+  return (
+    input.from === 'shield' ||
+    (input.method === 'cluster' && isClusterTransferRoute(input.from, input.to))
   )
 }
 

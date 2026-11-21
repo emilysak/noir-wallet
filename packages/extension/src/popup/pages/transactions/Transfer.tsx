@@ -99,7 +99,10 @@ import {
   shieldPortfolioBalances,
   shieldQuoteFeeRaw
 } from '@/popup/services/shield-transfer'
-import { nextShieldSessionProbe } from '@/popup/services/shield-session-check'
+import {
+  moveRequiresShieldBalance,
+  nextShieldSessionProbe
+} from '@/popup/services/shield-session-check'
 import { TransactionReviewView } from '@/popup/components/transaction/TransactionReviewView'
 import { supportsSolanaPrivateExecution } from '@/core/chains/solana'
 import { SendTransferForm } from './SendTransferForm'
@@ -464,12 +467,12 @@ function TransferForm() {
   const canLoadShield =
     getPrivateTransferChainIds(activeAccount, currentNetwork === 'mainnet').length > 0
   const shieldBalanceKey = `${currentNetwork}:${effective?.walletId ?? ''}:${effective?.accountId ?? ''}`
+  const shieldBalanceRequired = moveRequiresShieldBalance({ from, to, method })
   const {
     balances: shieldBalances,
     connecting: shieldConnecting,
     error: shieldBalanceError,
     errorCode: shieldBalanceErrorCode,
-    sessionReady: shieldSessionReady,
     readBalanceErrorCode: readShieldBalanceErrorCode,
     refreshBalances: loadShieldBalances
   } = useShieldBalances({
@@ -481,8 +484,7 @@ function TransferForm() {
       : null,
     refreshPortfolio,
     readProjection: readLatestPortfolio,
-    authorizeOnMount:
-      from === 'shield' || (method === 'cluster' && isClusterTransferRoute(from, to))
+    authorizeOnMount: shieldBalanceRequired
   })
   const [shieldConnection, setShieldConnection] = useState<
     'checking' | 'connected' | 'required' | 'busy'
@@ -591,14 +593,10 @@ function TransferForm() {
   }, [canLoadShield, accountLoading, effective?.walletId, effective?.accountId])
 
   useEffect(() => {
-    if (!shieldSessionReady) {
-      setShieldConnection(current => (current === 'connected' ? 'checking' : current))
-      return
-    }
-    if (shieldBalanceError || shieldConnecting || !shieldBalances) return
+    if (!shieldBalances) return
     setShieldConnection('connected')
     setShieldError(null)
-  }, [shieldBalanceError, shieldBalances, shieldConnecting, shieldSessionReady])
+  }, [shieldBalances])
 
   useEffect(() => {
     if (!shieldBalanceError) return
@@ -1515,7 +1513,7 @@ function TransferForm() {
     managedAsset &&
     (from !== 'shield' || (destination && targetAddress)) &&
     effective &&
-    shieldConnection === 'connected' &&
+    (!shieldBalanceRequired || shieldConnection === 'connected') &&
     shieldSourceRaw !== null &&
     !tokenFeeBalanceError &&
     (!maxSelected || amount === currentAmount) &&
@@ -1543,7 +1541,6 @@ function TransferForm() {
     setDomainPicker(side)
   }
   const review = () => {
-    debugger
     if (!canReview || !selected || !mainAddress) return
     const wallet = useWalletStore.getState()
     if (
@@ -1647,7 +1644,7 @@ function TransferForm() {
   const maxDisabled = fundingRoute
     ? (!eligible && !externalClusterPair) ||
       !managedAsset ||
-      shieldConnection !== 'connected' ||
+      (shieldBalanceRequired && shieldConnection !== 'connected') ||
       !shieldAvailable ||
       BigInt(shieldAvailable.amountRaw) === 0n ||
       (externalClusterPair &&
@@ -1715,7 +1712,6 @@ function TransferForm() {
     feeSelection: EvmFeeSelection = evmMoveFee,
     replacingReview = false
   ): Promise<boolean> => {
-    debugger
     if (
       (!replacingReview && !canReviewShield) ||
       !selected ||
@@ -2563,6 +2559,7 @@ function TransferForm() {
           isLoading={
             preparingShield ||
             (fundingRoute &&
+              shieldBalanceRequired &&
               (shieldConnecting ||
                 shieldConnection === 'checking' ||
                 shieldConnection === 'busy')) ||
