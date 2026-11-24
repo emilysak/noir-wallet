@@ -15,7 +15,7 @@ import { TokenPicker, chainTitle } from './token-picker'
 const sdk = new NoirShieldSDK()
 const LAYER = 'near-confidential' as const
 
-type Busy = 'idle' | 'connect' | 'quote' | 'submit' | 'status' | 'wait'
+type Busy = 'idle' | 'connect' | 'catalog' | 'quote' | 'submit' | 'status' | 'wait'
 type DestinationKind = 'public' | 'confidential'
 
 function describe(error: unknown): string {
@@ -53,7 +53,7 @@ export default function App() {
   const [timeoutMs, setTimeoutMs] = useState('30000')
   const [output, setOutput] = useState('Connect a Noir Wallet build that includes Shield requests.')
   const [failed, setFailed] = useState(false)
-  const [catalogNote, setCatalogNote] = useState('Connect to load chains and tokens.')
+  const [catalogNote, setCatalogNote] = useState('Load all chains or all tokens.')
   const [catalogFailed, setCatalogFailed] = useState(false)
   const [balances, setBalances] = useState<readonly ShieldBalance[]>([])
   const [balanceNote, setBalanceNote] = useState('Connect to refresh Shield balances.')
@@ -74,58 +74,59 @@ export default function App() {
   }, [refreshWallet])
 
   useEffect(() => {
-    if (!connected) {
-      setChains([])
-      setTokens([])
-      setCatalogFailed(false)
-      setCatalogNote('Connect to load chains and tokens.')
-      return
-    }
-    let cancelled = false
+    if (connected) return
+    setChains([])
+    setTokens([])
     setCatalogFailed(false)
-    setCatalogNote('Loading chains and tokens...')
-    const query = {
-      layer: LAYER,
-      action
-    } as const
-    void (async () => {
-      try {
-        const [nextChains, nextTokens] = await Promise.all([
-          sdk.getSupportedChains(query),
-          sdk.getSupportedTokens(query)
-        ])
-        if (cancelled) return
-        setChains(nextChains)
-        setTokens(nextTokens)
-        const selected = nextTokens.find(
-          token => token.chainId === chainIdRef.current && token.assetId === assetIdRef.current
-        )
-        const pick = selected ?? nextTokens[0]
-        if (pick && !selected) {
-          setChainId(pick.chainId)
-          setAssetId(pick.assetId)
-        }
-        if (action === 'transfer') {
-          const knownChain = nextChains.some(
-            chain => chain.chainId === destinationChainIdRef.current
-          )
-          const sourceChain = pick?.chainId ?? nextChains[0]?.chainId
-          if (!knownChain && sourceChain) setDestinationChainId(sourceChain)
-        }
-        setCatalogFailed(false)
-        setCatalogNote(`${nextChains.length} chains · ${nextTokens.length} tokens`)
-      } catch (error) {
-        if (cancelled) return
-        setChains([])
-        setTokens([])
-        setCatalogFailed(true)
-        setCatalogNote(describe(error))
+    setCatalogNote('Load all chains or all tokens.')
+  }, [connected])
+
+  const catalogQuery = useCallback(() => ({ layer: LAYER, action }) as const, [action])
+
+  const loadAllChains = useCallback(async () => {
+    try {
+      // The wallet returns the full chain catalog. Destination chains on this page are narrowed locally by token symbol.
+      const nextChains = await sdk.getSupportedChains(catalogQuery())
+      setChains(nextChains)
+      setCatalogFailed(false)
+      setCatalogNote(`${nextChains.length} chains`)
+      if (
+        action === 'transfer' &&
+        nextChains.length > 0 &&
+        !nextChains.some(chain => chain.chainId === destinationChainIdRef.current)
+      ) {
+        setDestinationChainId(nextChains[0].chainId)
       }
-    })()
-    return () => {
-      cancelled = true
+      return nextChains
+    } catch (error) {
+      setCatalogFailed(true)
+      setCatalogNote(describe(error))
+      throw error
     }
-  }, [connected, action])
+  }, [action, catalogQuery])
+
+  const loadAllTokens = useCallback(async () => {
+    try {
+      // The wallet returns the full token catalog. Destination chains on this page are narrowed locally by token symbol.
+      const nextTokens = await sdk.getSupportedTokens(catalogQuery())
+      setTokens(nextTokens)
+      const selected = nextTokens.find(
+        token => token.chainId === chainIdRef.current && token.assetId === assetIdRef.current
+      )
+      const pick = selected ?? nextTokens[0]
+      if (pick && !selected) {
+        setChainId(pick.chainId)
+        setAssetId(pick.assetId)
+      }
+      setCatalogFailed(false)
+      setCatalogNote(`${nextTokens.length} tokens`)
+      return nextTokens
+    } catch (error) {
+      setCatalogFailed(true)
+      setCatalogNote(describe(error))
+      throw error
+    }
+  }, [catalogQuery])
 
   const refreshShieldBalances = useCallback(async () => {
     setBalanceFailed(false)
@@ -256,6 +257,24 @@ export default function App() {
         <section className="card">
           <h2>Catalog</h2>
           <p className={catalogFailed ? 'hint error' : 'hint'}>{catalogNote}</p>
+          <div className="row">
+            <button
+              className="btn btn-secondary"
+              type="button"
+              disabled={locked}
+              onClick={() => void run('catalog', loadAllChains)}
+            >
+              Load all chains
+            </button>
+            <button
+              className="btn btn-secondary"
+              type="button"
+              disabled={locked}
+              onClick={() => void run('catalog', loadAllTokens)}
+            >
+              Load all tokens
+            </button>
+          </div>
           <div className="fields">
             <div className="field">
               <span>Action</span>

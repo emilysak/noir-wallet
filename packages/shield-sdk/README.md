@@ -56,6 +56,18 @@ const restored = await shieldSdk.getTransactionStatus({
   layer: 'near-confidential',
   operationId: receive.id
 })
+
+const chains = await shieldSdk.getSupportedChains({
+  layer: 'near-confidential',
+  action: 'receive'
+})
+
+const tokens = await shieldSdk.getSupportedTokens({
+  layer: 'near-confidential',
+  action: 'receive'
+})
 ```
+
+`getSupportedChains()` returns `{ chainId, name }`. `getSupportedTokens()` returns `{ chainId, assetId, symbol, decimals }`. Both return the wallet's full Shield catalog for that action. Optional `destinationKind`, `sourceChainId`, and `destinationChainId` are accepted and do not narrow the list. Filter a destination chain in the app to one that lists the same token.
 
 `wait({ signal, timeoutMs })` only ends the client wait. A timeout or abort does not mark the operation failed and does not submit it again. Amounts are decimal strings. The token is a chain plus an asset id. `56`, `eip155:56`, and canonical hex all normalize to `eip155:56`. A transfer destination names a chain and a recipient. The wallet settles that same token on the destination chain.
